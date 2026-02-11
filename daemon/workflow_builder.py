@@ -107,7 +107,7 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
     "96": {
         "class_type": "UNETLoader",
         "inputs": {
-            "unet_name": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+            "unet_name": "wan2.2_i2v_low_noise_14B_fp16.safetensors",
             "weight_dtype": "default",
         },
     },
