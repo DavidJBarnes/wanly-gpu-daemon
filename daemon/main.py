@@ -6,6 +6,7 @@ import socket
 from daemon.comfyui_client import ComfyUIClient
 from daemon.config import settings
 from daemon.executor import execute_segment
+from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.registry_client import RegistryClient
 
@@ -130,6 +131,15 @@ async def run():
         "Starting daemon: friendly_name=%s, registry=%s, queue=%s",
         settings.friendly_name, settings.registry_url, settings.queue_url,
     )
+
+    # Check and install required ComfyUI custom nodes
+    nodes_ok = await check_and_install_nodes(comfyui)
+    if not nodes_ok:
+        logger.error("Required custom nodes are missing or could not be installed. Exiting.")
+        await comfyui.close()
+        await registry.close()
+        await queue.close()
+        return
 
     worker_id = await register_with_retry(
         registry,
