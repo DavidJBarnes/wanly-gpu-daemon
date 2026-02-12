@@ -29,6 +29,7 @@ CUSTOM_NODE_PACKAGES: dict[str, dict] = {
     "comfyui-reactor-node": {
         "repo": "https://github.com/Gourieff/comfyui-reactor-node",
         "nodes": ["ReActorFaceSwapOpt", "ReActorOptions"],
+        "alt_dirs": ["comfyui-reactor", "ComfyUI-ReActor-NSFW"],
     },
 }
 
@@ -95,6 +96,16 @@ async def check_and_install_nodes(comfyui_client) -> bool:
         pkg_dir = custom_nodes_dir / pkg_name
         if pkg_dir.is_dir():
             logger.info("✓ %s — already installed", pkg_name)
+            continue
+
+        # Check alternate directory names (e.g. comfyui-reactor vs comfyui-reactor-node)
+        alt_found = False
+        for alt in pkg_info.get("alt_dirs", []):
+            if (custom_nodes_dir / alt).is_dir():
+                logger.info("✓ %s — found as %s", pkg_name, alt)
+                alt_found = True
+                break
+        if alt_found:
             continue
 
         logger.warning("✗ %s — not found, installing...", pkg_name)
