@@ -49,7 +49,17 @@ async def _run(cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
 async def _git_clone(repo_url: str, target_dir: Path) -> bool:
     """Clone a git repo into target_dir. Returns True on success."""
     logger.info("Cloning %s → %s", repo_url, target_dir)
-    rc, output = await _run(["git", "clone", "--depth", "1", repo_url, str(target_dir)])
+    # GIT_TERMINAL_PROMPT=0 prevents git from hanging on credential prompts
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    proc = await asyncio.create_subprocess_exec(
+        "git", "clone", "--depth", "1", repo_url, str(target_dir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    stdout, _ = await proc.communicate()
+    rc = proc.returncode
+    output = stdout.decode(errors="replace").strip()
     if rc != 0:
         logger.error("git clone failed (rc=%d): %s", rc, output)
         return False
