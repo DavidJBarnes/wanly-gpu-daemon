@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     friendly_name: str = "gpu-worker-1"
     heartbeat_interval: int = 30
     comfyui_url: str = "http://localhost:8188"
+    comfyui_api_key: str = ""  # Bearer token for ComfyUI auth (RunPod sets this)
     comfyui_path: str = ""  # Path to ComfyUI installation (for custom node management)
     queue_url: str = "http://localhost:8001"
     poll_interval: int = 5

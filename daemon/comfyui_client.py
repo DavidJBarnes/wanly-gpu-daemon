@@ -23,9 +23,13 @@ class ComfyUIExecutionError(Exception):
 
 
 class ComfyUIClient:
-    def __init__(self, base_url: str | None = None):
+    def __init__(self, base_url: str | None = None, api_key: str | None = None):
         self.base_url = (base_url or settings.comfyui_url).rstrip("/")
-        self.http = httpx.AsyncClient(base_url=self.base_url, timeout=30)
+        self.api_key = api_key or settings.comfyui_api_key
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        self.http = httpx.AsyncClient(base_url=self.base_url, timeout=30, headers=headers)
 
     async def check_health(self) -> bool:
         """Check if ComfyUI is running via GET /system_stats."""
@@ -72,6 +76,8 @@ class ComfyUIClient:
     async def monitor_execution(self, prompt_id: str, client_id: str) -> dict[str, Any]:
         """Monitor workflow execution via WebSocket. Returns output data from 'executed' messages."""
         ws_url = f"ws://{self.base_url.replace('http://', '').replace('https://', '')}/ws?clientId={client_id}"
+        if self.api_key:
+            ws_url += f"&token={self.api_key}"
         outputs: dict[str, Any] = {}
         current_node = None
         last_progress_pct = -1
