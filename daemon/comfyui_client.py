@@ -35,6 +35,18 @@ class ComfyUIClient:
         except Exception:
             return False
 
+    async def check_queue_busy(self) -> bool:
+        """Check if ComfyUI has an active prompt via GET /queue."""
+        try:
+            resp = await self.http.get("/queue")
+            if resp.status_code != 200:
+                return False
+            data = resp.json()
+            running = data.get("queue_running", [])
+            return len(running) > 0
+        except Exception:
+            return False
+
     async def upload_image(self, data: bytes, filename: str) -> str:
         """Upload an image to ComfyUI's input folder. Returns the stored filename."""
         resp = await self.http.post(
@@ -61,9 +73,10 @@ class ComfyUIClient:
         """Monitor workflow execution via WebSocket. Returns output data from 'executed' messages."""
         ws_url = f"ws://{self.base_url.replace('http://', '').replace('https://', '')}/ws?clientId={client_id}"
         outputs: dict[str, Any] = {}
+        current_node = None
+        last_progress_pct = -1
 
         async with websockets.connect(ws_url) as ws:
-            logger.info("WebSocket connected, monitoring prompt_id=%s", prompt_id)
             async for raw_message in ws:
                 if isinstance(raw_message, bytes):
                     continue  # Skip binary preview frames
@@ -77,19 +90,28 @@ class ComfyUIClient:
                     continue
 
                 if msg_type == "execution_start":
-                    logger.info("Execution started")
+                    logger.info("       ComfyUI execution started")
 
                 elif msg_type == "executing":
                     node = msg_data.get("node")
                     if node is None:
-                        logger.info("All nodes executed")
+                        logger.info("       All nodes executed")
                     else:
-                        logger.debug("Executing node %s", node)
+                        current_node = node
+                        last_progress_pct = -1
 
                 elif msg_type == "progress":
                     value = msg_data.get("value", 0)
                     max_val = msg_data.get("max", 0)
-                    logger.info("Progress: %d/%d", value, max_val)
+                    if max_val > 0:
+                        pct = int(value / max_val * 100)
+                        # Only log at 0%, 25%, 50%, 75%, 100% to reduce noise
+                        for threshold in (0, 25, 50, 75, 100):
+                            if pct >= threshold > last_progress_pct:
+                                node_label = f" (node {current_node})" if current_node else ""
+                                logger.info("       Step %d/%d (%d%%)%s", value, max_val, pct, node_label)
+                                last_progress_pct = threshold
+                                break
 
                 elif msg_type == "executed":
                     node_id = msg_data.get("node")
@@ -98,7 +120,7 @@ class ComfyUIClient:
                         outputs[node_id] = output
 
                 elif msg_type == "execution_success":
-                    logger.info("Execution completed successfully")
+                    logger.info("       ComfyUI execution complete")
                     break
 
                 elif msg_type == "execution_error":

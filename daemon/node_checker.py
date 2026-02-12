@@ -105,14 +105,14 @@ async def check_and_install_nodes(comfyui_client) -> bool:
     for pkg_name, pkg_info in CUSTOM_NODE_PACKAGES.items():
         pkg_dir = custom_nodes_dir / pkg_name
         if pkg_dir.is_dir():
-            logger.info("✓ %s — already installed", pkg_name)
+            logger.debug("Node %s: installed", pkg_name)
             continue
 
         # Check alternate directory names (e.g. comfyui-reactor vs comfyui-reactor-node)
         alt_found = False
         for alt in pkg_info.get("alt_dirs", []):
             if (custom_nodes_dir / alt).is_dir():
-                logger.info("✓ %s — found as %s", pkg_name, alt)
+                logger.debug("Node %s: found as %s", pkg_name, alt)
                 alt_found = True
                 break
         if alt_found:

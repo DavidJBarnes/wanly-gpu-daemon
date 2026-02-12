@@ -10,7 +10,13 @@ from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.registry_client import RegistryClient
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Suppress noisy httpx request-level logging (every /system_stats ping)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +54,8 @@ async def register_with_retry(client, *, friendly_name, hostname, ip_address, co
 
 async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event):
     """Send heartbeats to the registry every heartbeat_interval seconds."""
+    beat_count = 0
+    last_comfyui_state = None
     while not shutdown_event.is_set():
         try:
             await asyncio.wait_for(
@@ -60,15 +68,25 @@ async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event):
             break
 
         comfyui_running = await comfyui.check_health()
+        comfyui_busy = await comfyui.check_queue_busy() if comfyui_running else False
         try:
             await registry.heartbeat(worker_id, comfyui_running)
-            logger.info("Heartbeat sent (comfyui_running=%s)", comfyui_running)
+            beat_count += 1
+            # Log state changes immediately, otherwise only every 5th beat
+            state = (comfyui_running, comfyui_busy)
+            if state != last_comfyui_state:
+                status_str = "offline" if not comfyui_running else ("busy" if comfyui_busy else "idle")
+                logger.info("ComfyUI: %s", status_str)
+                last_comfyui_state = state
+            elif beat_count % 5 == 0:
+                logger.debug("Heartbeat OK (beat #%d)", beat_count)
         except Exception as e:
-            logger.error("Failed to send heartbeat: %s", e)
+            logger.error("Heartbeat failed: %s", e)
 
 
 async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, executing_event):
     """Poll the queue for segments and execute them one at a time."""
+    poll_count = 0
     while not shutdown_event.is_set():
         try:
             await asyncio.wait_for(
@@ -83,16 +101,16 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, exe
         try:
             segment = await queue.claim_next(worker_id)
         except Exception as e:
-            logger.error("Failed to poll queue: %s", e)
+            logger.error("Poll failed: %s", e)
             continue
 
+        poll_count += 1
         if segment is None:
+            if poll_count == 1 or poll_count % 60 == 0:
+                logger.info("Waiting for work... (polled %d times)", poll_count)
             continue
 
-        logger.info(
-            "Claimed segment %s (job=%s, index=%d, prompt=%s)",
-            segment.id, segment.job_id, segment.index, segment.prompt[:60],
-        )
+        poll_count = 0
 
         executing_event.set()
         try:
@@ -127,9 +145,11 @@ async def run():
     ip_address = get_ip_address()
     comfyui_running = await comfyui.check_health()
 
-    logger.info(
-        "Starting daemon: friendly_name=%s, registry=%s, queue=%s",
-        settings.friendly_name, settings.registry_url, settings.queue_url,
+    logger.info("=== Wanly GPU Daemon ===")
+    logger.info("Worker: %s | ComfyUI: %s | API: %s",
+        settings.friendly_name,
+        "running" if comfyui_running else "NOT RUNNING",
+        settings.queue_url,
     )
 
     # Check and install required ComfyUI custom nodes

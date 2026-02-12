@@ -38,13 +38,12 @@ async def ensure_loras_available(
 
             local_path = os.path.join(lora_dir, filename)
             if os.path.exists(local_path):
-                logger.debug("LoRA %s already cached: %s", label, filename)
+                logger.info("       %s: %s (cached)", label, filename)
                 continue
 
-            logger.info("Downloading LoRA %s: %s", label, filename)
+            logger.info("       %s: downloading %s...", label, filename)
             data = await queue.download_file(s3_uri)
             with open(local_path, "wb") as f:
                 f.write(data)
-            logger.info(
-                "Saved LoRA %s: %s (%d bytes)", label, filename, len(data)
-            )
+            mb = len(data) / (1024 * 1024)
+            logger.info("       %s: %s saved (%.1f MB)", label, filename, mb)

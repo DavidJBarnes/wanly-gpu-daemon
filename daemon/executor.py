@@ -115,9 +115,12 @@ async def execute_segment(
     queue: QueueClient,
 ) -> None:
     """Execute a single segment end-to-end."""
+    lora_names = ", ".join(l.high_file or l.low_file or "?" for l in (segment.loras or []))
     logger.info(
-        "Executing segment %s (job=%s, index=%d)",
-        segment.id, segment.job_id, segment.index,
+        "=== Segment %d (job %s) === prompt: %s%s",
+        segment.index, str(segment.job_id)[:8],
+        segment.prompt[:80],
+        f" | loras: {lora_names}" if lora_names else "",
     )
 
     # Report processing status
@@ -127,52 +130,63 @@ async def execute_segment(
     )
 
     try:
-        # 1. Resolve start image (download via API if S3 path, upload to ComfyUI)
+        # Step 1: Resolve start image
+        logger.info("[1/7] Downloading start image...")
         start_image_filename = await _resolve_start_image(segment, comfyui, queue)
+        if start_image_filename:
+            logger.info("[1/7] Start image ready: %s", start_image_filename)
+        else:
+            logger.info("[1/7] No start image (text-to-video)")
 
-        # 1b. Resolve faceswap image similarly
+        # Step 1b: Resolve faceswap image
         faceswap_comfyui_filename = await _resolve_faceswap_image(segment, comfyui, queue)
-
-        # Temporarily override faceswap_image with ComfyUI-local filename for workflow building
         if faceswap_comfyui_filename:
+            logger.info("[1/7] Faceswap image ready: %s", faceswap_comfyui_filename)
             segment = segment.model_copy(update={"faceswap_image": faceswap_comfyui_filename})
 
-        # 1c. Ensure LoRA files are available locally
+        # Step 2: Ensure LoRA files
         if segment.loras:
+            logger.info("[2/7] Syncing LoRA files...")
             await ensure_loras_available(segment.loras, queue)
+            logger.info("[2/7] LoRAs ready")
+        else:
+            logger.info("[2/7] No LoRAs")
 
-        # 2. Build workflow
+        # Step 3: Build workflow
+        logger.info("[3/7] Building workflow...")
         workflow = build_workflow(segment, start_image_filename=start_image_filename)
+        logger.info("[3/7] Workflow built (%d nodes)", len(workflow))
 
-        # 3. Submit workflow
+        # Step 4: Submit to ComfyUI
+        logger.info("[4/7] Submitting to ComfyUI...")
         prompt_id, client_id = await comfyui.submit_workflow(workflow)
+        logger.info("[4/7] Submitted (prompt_id=%s)", prompt_id[:8])
 
-        # 4. Monitor via WebSocket
+        # Step 5: Wait for ComfyUI execution
+        logger.info("[5/7] Waiting for ComfyUI execution...")
         await comfyui.monitor_execution(prompt_id, client_id)
 
-        # 5. Get history for output filenames
+        # Step 6: Download output
+        logger.info("[6/7] Downloading output video...")
         history = await comfyui.get_history(prompt_id)
         video_info = comfyui.find_video_output(history)
         if not video_info:
             raise RuntimeError("No video output found in ComfyUI history")
 
-        # 6. Download video from ComfyUI
-        logger.info("Downloading video: %s", video_info["filename"])
         video_data = await comfyui.download_output(
             filename=video_info["filename"],
             subfolder=video_info.get("subfolder", ""),
             output_type=video_info.get("type", "output"),
         )
+        video_mb = len(video_data) / (1024 * 1024)
+        logger.info("[6/7] Video downloaded: %s (%.1f MB)", video_info["filename"], video_mb)
 
-        # 7. Extract last frame
-        logger.info("Extracting last frame")
+        # Step 7: Extract last frame + upload
+        logger.info("[7/7] Extracting last frame and uploading...")
         last_frame_data = await _extract_last_frame(video_data)
-
-        # 8. Upload via API (API stores in S3 and marks segment completed)
-        logger.info("Uploading output via API")
         await queue.upload_segment_output(segment.id, video_data, last_frame_data)
 
-        logger.info("Segment %s completed", segment.id)
+        logger.info("=== Segment %d complete ===", segment.index)
 
     except ComfyUIExecutionError as e:
         error_msg = f"ComfyUI error: {e}"
