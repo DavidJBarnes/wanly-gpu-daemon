@@ -184,8 +184,7 @@ async def execute_segment(
         last_frame_data = await _extract_last_frame(video_data)
         await queue.upload_segment_output(segment.id, video_data, last_frame_data)
 
-        await progress.log("[7/7] Upload complete")
-        logger.info("=== Segment %d complete ===", segment.index)
+        logger.info("[7/7] Upload complete — segment %d done", segment.index)
 
     except ComfyUIExecutionError as e:
         error_msg = f"ComfyUI error: {e}"
