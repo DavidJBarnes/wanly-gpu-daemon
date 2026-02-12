@@ -18,7 +18,8 @@ class QueueClient:
     async def claim_next(self, worker_id: uuid.UUID) -> Optional[SegmentClaim]:
         """Claim the next available segment. Returns None if no work available."""
         resp = await self.client.get(
-            "/segments/next", params={"worker_id": str(worker_id)}
+            "/segments/next",
+            params={"worker_id": str(worker_id), "worker_name": settings.friendly_name},
         )
         resp.raise_for_status()
         data = resp.json()
