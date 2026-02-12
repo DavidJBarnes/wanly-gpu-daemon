@@ -98,6 +98,13 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, exe
         if shutdown_event.is_set():
             break
 
+        # Don't claim work if ComfyUI isn't running
+        if not await comfyui.check_health():
+            if poll_count == 0 or poll_count % 60 == 0:
+                logger.warning("ComfyUI offline — skipping poll")
+            poll_count += 1
+            continue
+
         try:
             segment = await queue.claim_next(worker_id)
         except Exception as e:
