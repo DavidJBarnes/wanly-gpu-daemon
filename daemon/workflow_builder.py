@@ -332,7 +332,7 @@ def build_workflow(segment: SegmentClaim, start_image_filename: str | None = Non
 
     # User LoRAs
     if segment.loras:
-        _add_user_loras(workflow, segment.loras)
+        _add_user_loras(workflow, [l.model_dump() for l in segment.loras])
 
     # Face swap
     faceswap = segment.faceswap_enabled and segment.faceswap_image

@@ -19,6 +19,7 @@ import os
 import tempfile
 
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
+from daemon.lora_sync import ensure_loras_available
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
 from daemon.workflow_builder import build_workflow
@@ -135,6 +136,10 @@ async def execute_segment(
         # Temporarily override faceswap_image with ComfyUI-local filename for workflow building
         if faceswap_comfyui_filename:
             segment = segment.model_copy(update={"faceswap_image": faceswap_comfyui_filename})
+
+        # 1c. Ensure LoRA files are available locally
+        if segment.loras:
+            await ensure_loras_available(segment.loras, queue)
 
         # 2. Build workflow
         workflow = build_workflow(segment, start_image_filename=start_image_filename)

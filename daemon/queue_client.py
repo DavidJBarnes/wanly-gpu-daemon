@@ -53,8 +53,9 @@ class QueueClient:
 
     async def download_file(self, s3_path: str) -> bytes:
         """Download a file from S3 via the API proxy."""
+        timeout = 600 if ".safetensors" in s3_path else 60
         resp = await self.client.get(
-            "/files", params={"path": s3_path}, timeout=60
+            "/files", params={"path": s3_path}, timeout=timeout
         )
         resp.raise_for_status()
         return resp.content

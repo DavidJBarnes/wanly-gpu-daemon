@@ -4,6 +4,18 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
+class LoraItem(BaseModel):
+    """A resolved LoRA with S3 URIs for file sync."""
+
+    lora_id: Optional[str] = None
+    high_file: Optional[str] = None
+    high_s3_uri: Optional[str] = None
+    high_weight: float = 1.0
+    low_file: Optional[str] = None
+    low_s3_uri: Optional[str] = None
+    low_weight: float = 1.0
+
+
 class SegmentClaim(BaseModel):
     """Mirrors wanly-api SegmentClaimResponse."""
 
@@ -13,7 +25,7 @@ class SegmentClaim(BaseModel):
     prompt: str
     duration_seconds: float
     start_image: Optional[str] = None
-    loras: Optional[list[Any]] = None
+    loras: Optional[list[LoraItem]] = None
     faceswap_enabled: bool
     faceswap_method: Optional[str] = None
     faceswap_source_type: Optional[str] = None
