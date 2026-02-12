@@ -27,9 +27,9 @@ CUSTOM_NODE_PACKAGES: dict[str, dict] = {
         "nodes": ["VHS_VideoCombine"],
     },
     "comfyui-reactor-node": {
-        "repo": "https://github.com/Gourieff/comfyui-reactor-node",
+        "repo": "https://github.com/Gourieff/ComfyUI-ReActor",
         "nodes": ["ReActorFaceSwapOpt", "ReActorOptions"],
-        "alt_dirs": ["comfyui-reactor", "ComfyUI-ReActor-NSFW"],
+        "alt_dirs": ["comfyui-reactor", "ComfyUI-ReActor", "ComfyUI-ReActor-NSFW"],
     },
 }
 
