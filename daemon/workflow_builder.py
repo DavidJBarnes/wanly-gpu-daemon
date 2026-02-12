@@ -8,6 +8,7 @@ import copy
 import logging
 from typing import Any
 
+from daemon.config import settings
 from daemon.schemas import SegmentClaim
 
 logger = logging.getLogger(__name__)
@@ -310,6 +311,14 @@ def build_workflow(segment: SegmentClaim, start_image_filename: str | None = Non
     """
     gen = _calculate_generation_params(segment.fps, segment.duration_seconds)
     workflow = copy.deepcopy(WAN_I2V_API_WORKFLOW)
+
+    # Inject model filenames from config
+    workflow["84"]["inputs"]["clip_name"] = settings.clip_model
+    workflow["90"]["inputs"]["vae_name"] = settings.vae_model
+    workflow["95"]["inputs"]["unet_name"] = settings.unet_high_model
+    workflow["96"]["inputs"]["unet_name"] = settings.unet_low_model
+    workflow["101"]["inputs"]["lora_name"] = settings.lightx2v_lora_high
+    workflow["102"]["inputs"]["lora_name"] = settings.lightx2v_lora_low
 
     # Positive prompt
     workflow["93"]["inputs"]["text"] = segment.prompt
