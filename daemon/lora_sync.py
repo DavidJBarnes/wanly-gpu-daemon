@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 def _loras_dir() -> str:
-    """Return the ComfyUI loras directory path."""
-    return os.path.join(settings.comfyui_path, "models", "loras")
+    """Return the ComfyUI loras directory path (wan2.2 subdirectory)."""
+    return os.path.join(settings.comfyui_path, "models", "loras", "wan2.2")
 
 
 async def ensure_loras_available(
