@@ -20,6 +20,7 @@ import tempfile
 
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
 from daemon.lora_sync import ensure_loras_available
+from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
 from daemon.workflow_builder import build_workflow
@@ -123,51 +124,48 @@ async def execute_segment(
         f" | loras: {lora_names}" if lora_names else "",
     )
 
-    # Report processing status
-    await queue.update_segment(
-        segment.id,
-        SegmentResult(status="processing"),
-    )
+    progress = ProgressLog(segment.id, queue)
 
     try:
         # Step 1: Resolve start image
-        logger.info("[1/7] Downloading start image...")
+        await progress.log("[1/7] Downloading start image...")
         start_image_filename = await _resolve_start_image(segment, comfyui, queue)
         if start_image_filename:
-            logger.info("[1/7] Start image ready: %s", start_image_filename)
+            await progress.log(f"[1/7] Start image ready: {start_image_filename}")
         else:
-            logger.info("[1/7] No start image (text-to-video)")
+            await progress.log("[1/7] No start image (text-to-video)")
 
         # Step 1b: Resolve faceswap image
         faceswap_comfyui_filename = await _resolve_faceswap_image(segment, comfyui, queue)
         if faceswap_comfyui_filename:
-            logger.info("[1/7] Faceswap image ready: %s", faceswap_comfyui_filename)
+            await progress.log(f"[1/7] Faceswap image ready: {faceswap_comfyui_filename}")
             segment = segment.model_copy(update={"faceswap_image": faceswap_comfyui_filename})
 
         # Step 2: Ensure LoRA files
         if segment.loras:
-            logger.info("[2/7] Syncing LoRA files...")
+            await progress.log("[2/7] Syncing LoRA files...")
             await ensure_loras_available(segment.loras, queue)
-            logger.info("[2/7] LoRAs ready")
+            await progress.log("[2/7] LoRAs ready")
         else:
-            logger.info("[2/7] No LoRAs")
+            await progress.log("[2/7] No LoRAs")
 
         # Step 3: Build workflow
-        logger.info("[3/7] Building workflow...")
+        await progress.log("[3/7] Building workflow...")
         workflow = build_workflow(segment, start_image_filename=start_image_filename)
-        logger.info("[3/7] Workflow built (%d nodes)", len(workflow))
+        await progress.log(f"[3/7] Workflow built ({len(workflow)} nodes)")
 
         # Step 4: Submit to ComfyUI
-        logger.info("[4/7] Submitting to ComfyUI...")
+        await progress.log("[4/7] Submitting to ComfyUI...")
         prompt_id, client_id = await comfyui.submit_workflow(workflow)
-        logger.info("[4/7] Submitted (prompt_id=%s)", prompt_id[:8])
+        await progress.log(f"[4/7] Submitted (prompt_id={prompt_id[:8]})")
 
         # Step 5: Wait for ComfyUI execution
-        logger.info("[5/7] Waiting for ComfyUI execution...")
+        await progress.log("[5/7] Waiting for ComfyUI execution...")
         await comfyui.monitor_execution(prompt_id, client_id)
+        await progress.log("[5/7] Execution complete")
 
         # Step 6: Download output
-        logger.info("[6/7] Downloading output video...")
+        await progress.log("[6/7] Downloading output video...")
         history = await comfyui.get_history(prompt_id)
         video_info = comfyui.find_video_output(history)
         if not video_info:
@@ -179,13 +177,14 @@ async def execute_segment(
             output_type=video_info.get("type", "output"),
         )
         video_mb = len(video_data) / (1024 * 1024)
-        logger.info("[6/7] Video downloaded: %s (%.1f MB)", video_info["filename"], video_mb)
+        await progress.log(f"[6/7] Video downloaded: {video_info['filename']} ({video_mb:.1f} MB)")
 
         # Step 7: Extract last frame + upload
-        logger.info("[7/7] Extracting last frame and uploading...")
+        await progress.log("[7/7] Extracting last frame and uploading...")
         last_frame_data = await _extract_last_frame(video_data)
         await queue.upload_segment_output(segment.id, video_data, last_frame_data)
 
+        await progress.log("[7/7] Upload complete")
         logger.info("=== Segment %d complete ===", segment.index)
 
     except ComfyUIExecutionError as e:
@@ -197,7 +196,7 @@ async def execute_segment(
             logger.error("Traceback:\n%s", e.traceback)
         await queue.update_segment(
             segment.id,
-            SegmentResult(status="failed", error_message=error_msg[:2000]),
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
         )
 
     except Exception as e:
@@ -205,5 +204,5 @@ async def execute_segment(
         logger.exception("Segment %s failed", segment.id)
         await queue.update_segment(
             segment.id,
-            SegmentResult(status="failed", error_message=error_msg[:2000]),
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
         )

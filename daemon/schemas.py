@@ -45,3 +45,4 @@ class SegmentResult(BaseModel):
     output_path: Optional[str] = None
     last_frame_path: Optional[str] = None
     error_message: Optional[str] = None
+    progress_log: Optional[str] = None
