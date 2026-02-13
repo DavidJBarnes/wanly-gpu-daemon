@@ -2,10 +2,12 @@ import asyncio
 import logging
 import signal
 import socket
+import sys
 
 from daemon.comfyui_client import ComfyUIClient
 from daemon.config import settings
 from daemon.executor import execute_segment
+from daemon.model_validator import cleanup_partial_downloads, validate_models
 from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.registry_client import RegistryClient
@@ -27,6 +29,29 @@ def get_ip_address() -> str:
             return s.getsockname()[0]
         except Exception:
             return "127.0.0.1"
+
+
+def _log_system_info(system_info: dict | None) -> None:
+    """Log GPU/VRAM/RAM info from ComfyUI system stats."""
+    if not system_info:
+        logger.warning("Could not retrieve ComfyUI system info")
+        return
+
+    devices = system_info.get("devices", [])
+    for dev in devices:
+        name = dev.get("name", "unknown")
+        vram_total = dev.get("vram_total", 0)
+        vram_free = dev.get("vram_free", 0)
+        vram_total_gb = vram_total / (1024**3) if vram_total else 0
+        vram_free_gb = vram_free / (1024**3) if vram_free else 0
+        logger.info("GPU: %s — VRAM: %.1f GB total, %.1f GB free", name, vram_total_gb, vram_free_gb)
+
+    system = system_info.get("system", {})
+    ram = system.get("ram", {})
+    ram_total = ram.get("total", 0)
+    ram_free = ram.get("free", 0)
+    if ram_total:
+        logger.info("RAM: %.1f GB total, %.1f GB free", ram_total / (1024**3), ram_free / (1024**3))
 
 
 async def register_with_retry(client, *, friendly_name, hostname, ip_address, comfyui_running, shutdown_event):
@@ -153,10 +178,15 @@ async def run():
     comfyui_running = await comfyui.check_health()
 
     logger.info("=== Wanly GPU Daemon ===")
-    logger.info("Worker: %s | ComfyUI: %s | API: %s",
+    logger.info("Python %s | Worker: %s | ComfyUI: %s | API: %s",
+        sys.version.split()[0],
         settings.friendly_name,
         "running" if comfyui_running else "NOT RUNNING",
         settings.queue_url,
+    )
+    logger.info("Models: clip=%s vae=%s unet_high=%s unet_low=%s",
+        settings.clip_model, settings.vae_model,
+        settings.unet_high_model, settings.unet_low_model,
     )
 
     # Check and install required ComfyUI custom nodes
@@ -167,6 +197,24 @@ async def run():
         await registry.close()
         await queue.close()
         return
+
+    # Pre-flight: clean up partial downloads
+    cleaned = cleanup_partial_downloads(settings.comfyui_path)
+    if cleaned:
+        logger.info("Cleaned %d partial download(s)", cleaned)
+
+    # Pre-flight: validate all required models
+    models_ok = await validate_models(comfyui)
+    if not models_ok:
+        logger.error("Model validation failed. Exiting.")
+        await comfyui.close()
+        await registry.close()
+        await queue.close()
+        return
+
+    # Log GPU/VRAM info
+    system_info = await comfyui.get_system_info()
+    _log_system_info(system_info)
 
     worker_id = await register_with_retry(
         registry,

@@ -11,6 +11,8 @@ from daemon.config import settings
 
 logger = logging.getLogger(__name__)
 
+EXECUTION_TIMEOUT = 1800  # 30 minutes
+
 
 class ComfyUIExecutionError(Exception):
     """Raised when ComfyUI reports an execution error."""
@@ -51,6 +53,17 @@ class ComfyUIClient:
         except Exception:
             return False
 
+    async def get_system_info(self) -> dict | None:
+        """Get system stats from ComfyUI (VRAM, RAM). Best-effort, returns None on failure."""
+        try:
+            resp = await self.http.get("/system_stats")
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            return data
+        except Exception:
+            return None
+
     async def upload_image(self, data: bytes, filename: str) -> str:
         """Upload an image to ComfyUI's input folder. Returns the stored filename."""
         resp = await self.http.post(
@@ -76,7 +89,23 @@ class ComfyUIClient:
         return prompt_id, client_id
 
     async def monitor_execution(self, prompt_id: str, client_id: str) -> dict[str, Any]:
-        """Monitor workflow execution via WebSocket. Returns output data from 'executed' messages."""
+        """Monitor workflow execution via WebSocket with a timeout.
+
+        Returns output data from 'executed' messages.
+        Raises ComfyUIExecutionError on timeout or execution failure.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._monitor_ws(prompt_id, client_id),
+                timeout=EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise ComfyUIExecutionError(
+                f"Execution timed out after {EXECUTION_TIMEOUT}s"
+            )
+
+    async def _monitor_ws(self, prompt_id: str, client_id: str) -> dict[str, Any]:
+        """Inner WebSocket monitoring loop."""
         ws_url = f"ws://{self.base_url.replace('http://', '').replace('https://', '')}/ws?clientId={client_id}"
         if self.api_key:
             ws_url += f"&token={self.api_key}"

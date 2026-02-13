@@ -10,6 +10,16 @@ from daemon.schemas import SegmentClaim, SegmentResult
 logger = logging.getLogger(__name__)
 
 
+def _raise_with_details(resp: httpx.Response, context: str) -> None:
+    """Log HTTP error details before raising."""
+    try:
+        body = resp.text[:500]
+    except Exception:
+        body = "<unreadable>"
+    logger.error("%s — HTTP %d: %s", context, resp.status_code, body)
+    resp.raise_for_status()
+
+
 class QueueClient:
     def __init__(self):
         self.base_url = settings.queue_url
@@ -21,7 +31,8 @@ class QueueClient:
             "/segments/next",
             params={"worker_id": str(worker_id), "worker_name": settings.friendly_name},
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            _raise_with_details(resp, "claim_next")
         data = resp.json()
         if data is None:
             return None
@@ -35,7 +46,8 @@ class QueueClient:
             f"/segments/{segment_id}",
             json=result.model_dump(exclude_none=True),
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            _raise_with_details(resp, f"update_segment {segment_id}")
 
     async def upload_segment_output(
         self, segment_id: uuid.UUID, video_data: bytes, last_frame_data: bytes
@@ -49,7 +61,8 @@ class QueueClient:
             },
             timeout=300,  # Large uploads may take a while
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            _raise_with_details(resp, f"upload_segment_output {segment_id}")
         logger.info("Uploaded segment output via API for %s", segment_id)
 
     async def download_file(self, s3_path: str) -> bytes:
@@ -58,7 +71,8 @@ class QueueClient:
         resp = await self.client.get(
             "/files", params={"path": s3_path}, timeout=timeout
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            _raise_with_details(resp, f"download_file {s3_path}")
         return resp.content
 
     async def close(self):

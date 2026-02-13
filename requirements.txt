@@ -1,4 +1,6 @@
 httpx
+Pillow
 pydantic-settings
 python-dotenv
+pyyaml
 websockets
