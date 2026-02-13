@@ -67,7 +67,9 @@ class ComfyUIClient:
         client_id = str(uuid.uuid4())
         payload = {"prompt": workflow, "client_id": client_id}
         resp = await self.http.post("/prompt", json=payload)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            logger.error("ComfyUI rejected workflow (%d): %s", resp.status_code, resp.text)
+            resp.raise_for_status()
         result = resp.json()
         prompt_id = result["prompt_id"]
         logger.info("Submitted workflow, prompt_id=%s", prompt_id)
