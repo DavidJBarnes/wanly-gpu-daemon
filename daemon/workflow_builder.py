@@ -247,6 +247,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
                 "source_faces_index": "0",
                 "detect_gender_source": "no",
                 "console_log_level": 1,
+                "restore_swapped_only": True,
             },
             "_meta": {"title": "ReActor Options"},
         }
