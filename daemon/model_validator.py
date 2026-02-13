@@ -21,14 +21,16 @@ MIN_SIZES = {
     "loras": 100 * 1024 * 1024,      # 100 MB
 }
 
-# Map config setting names → (ComfyUI loader node, model subfolder, min size key)
+# Map config setting names → (ComfyUI loader node, subfolder search list, min size key)
+# Multiple subfolders because ComfyUI searches several dirs per model type
+# (e.g. CLIPLoader searches both clip/ and text_encoders/)
 MODEL_CHECKS = [
-    ("clip_model",          "CLIPLoader",           "clip",  "clip",  MIN_SIZES["clip"]),
-    ("vae_model",           "VAELoader",            "vae",   "vae",   MIN_SIZES["vae"]),
-    ("unet_high_model",     "UNETLoader",           "diffusion_models", "unet", MIN_SIZES["unet"]),
-    ("unet_low_model",      "UNETLoader",           "diffusion_models", "unet", MIN_SIZES["unet"]),
-    ("lightx2v_lora_high",  "LoraLoaderModelOnly",  "loras", "loras", MIN_SIZES["loras"]),
-    ("lightx2v_lora_low",   "LoraLoaderModelOnly",  "loras", "loras", MIN_SIZES["loras"]),
+    ("clip_model",          "CLIPLoader",           ["clip", "text_encoders"],  MIN_SIZES["clip"]),
+    ("vae_model",           "VAELoader",            ["vae"],                    MIN_SIZES["vae"]),
+    ("unet_high_model",     "UNETLoader",           ["diffusion_models", "unet"], MIN_SIZES["unet"]),
+    ("unet_low_model",      "UNETLoader",           ["diffusion_models", "unet"], MIN_SIZES["unet"]),
+    ("lightx2v_lora_high",  "LoraLoaderModelOnly",  ["loras"],                  MIN_SIZES["loras"]),
+    ("lightx2v_lora_low",   "LoraLoaderModelOnly",  ["loras"],                  MIN_SIZES["loras"]),
 ]
 
 PARTIAL_EXTENSIONS = {".aria2", ".tmp", ".part"}
@@ -68,12 +70,13 @@ def _get_model_search_paths(comfyui_path: str, subfolder: str) -> list[str]:
     return paths
 
 
-def _find_model_file(comfyui_path: str, subfolder: str, filename: str) -> str | None:
+def _find_model_file(comfyui_path: str, subfolders: list[str], filename: str) -> str | None:
     """Search all model paths for a file, return full path or None."""
-    for search_dir in _get_model_search_paths(comfyui_path, subfolder):
-        candidate = os.path.join(search_dir, filename)
-        if os.path.isfile(candidate):
-            return candidate
+    for subfolder in subfolders:
+        for search_dir in _get_model_search_paths(comfyui_path, subfolder):
+            candidate = os.path.join(search_dir, filename)
+            if os.path.isfile(candidate):
+                return candidate
     return None
 
 
@@ -93,7 +96,7 @@ async def validate_models(comfyui_client) -> bool:
         resp = await comfyui_client.http.get("/object_info", timeout=30)
         if resp.status_code == 200:
             object_info = resp.json()
-            for _setting, loader_node, _subfolder, _size_key, _min_size in MODEL_CHECKS:
+            for _setting, loader_node, _subfolders, _min_size in MODEL_CHECKS:
                 node_info = object_info.get(loader_node, {})
                 inputs = node_info.get("input", {}).get("required", {})
                 # Model filename is typically the first input parameter
@@ -107,7 +110,7 @@ async def validate_models(comfyui_client) -> bool:
     all_ok = True
     logger.info("--- Model validation ---")
 
-    for setting_name, loader_node, subfolder, size_key, min_size in MODEL_CHECKS:
+    for setting_name, loader_node, subfolders, min_size in MODEL_CHECKS:
         filename = getattr(settings, setting_name)
         if not filename:
             continue
@@ -120,8 +123,12 @@ async def validate_models(comfyui_client) -> bool:
             continue
 
         # Find on disk and check size
-        file_path = _find_model_file(comfyui_path, subfolder, filename)
+        file_path = _find_model_file(comfyui_path, subfolders, filename)
         if not file_path:
+            if known_models and filename in known_models:
+                # ComfyUI knows about it but we can't locate the file — trust ComfyUI
+                logger.info("  OK %s=%s (found in ComfyUI, disk path unknown)", setting_name, filename)
+                continue
             logger.error("  MISSING %s=%s — file not found on disk", setting_name, filename)
             all_ok = False
             continue
