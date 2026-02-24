@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     comfyui_url: str = "http://localhost:8188"
     comfyui_api_key: str = ""  # Bearer token for ComfyUI auth (RunPod sets this)
     comfyui_path: str = ""  # Path to ComfyUI installation (for custom node management)
+    lora_cache_dir: str = ""  # Override LoRA download dir (e.g. /workspace/models/loras for persistence)
     queue_url: str = "http://localhost:8001"
     poll_interval: int = 5
 
