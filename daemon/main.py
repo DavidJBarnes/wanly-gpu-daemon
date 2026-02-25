@@ -131,6 +131,13 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, exe
             poll_count += 1
             continue
 
+        # Don't claim work if ComfyUI is already processing (e.g. leftover from previous daemon run)
+        if await comfyui.check_queue_busy():
+            if poll_count == 0 or poll_count % 60 == 0:
+                logger.info("ComfyUI queue busy — waiting for current job to finish")
+            poll_count += 1
+            continue
+
         try:
             segment = await queue.claim_next(worker_id)
         except Exception as e:
