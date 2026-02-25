@@ -301,7 +301,11 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
         logger.info("Added FaceFusion face swap nodes")
 
 
-def build_workflow(segment: SegmentClaim, start_image_filename: str | None = None) -> dict:
+def build_workflow(
+    segment: SegmentClaim,
+    start_image_filename: str | None = None,
+    initial_reference_image_filename: str | None = None,
+) -> dict:
     """Build a complete ComfyUI workflow from segment parameters.
 
     Args:
@@ -309,6 +313,10 @@ def build_workflow(segment: SegmentClaim, start_image_filename: str | None = Non
         start_image_filename: The ComfyUI-local filename of the start image
             (already uploaded). If None, the LoadImage node (97) is removed
             for text-to-video generation.
+        initial_reference_image_filename: The ComfyUI-local filename of the
+            job's original input image for PainterLongVideo identity anchoring.
+            When provided (segment > 0), node 98 is swapped from WanImageToVideo
+            to PainterLongVideo with dual-reference inputs.
     """
     gen = _calculate_generation_params(segment.fps, segment.duration_seconds)
     workflow = copy.deepcopy(WAN_I2V_API_WORKFLOW)
@@ -339,6 +347,38 @@ def build_workflow(segment: SegmentClaim, start_image_filename: str | None = Non
         # Text-to-video: remove LoadImage and disconnect from WanImageToVideo
         del workflow["97"]
         del workflow["98"]["inputs"]["start_image"]
+
+    # PainterLongVideo swap for identity anchoring on segment > 0
+    if initial_reference_image_filename and start_image_filename:
+        # Node 300: load original input image (identity anchor)
+        workflow["300"] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": initial_reference_image_filename},
+            "_meta": {"title": "Initial Reference Image"},
+        }
+        # Replace WanImageToVideo with PainterLongVideo
+        workflow["98"] = {
+            "class_type": "PainterLongVideo",
+            "inputs": {
+                "positive": ["93", 0],
+                "negative": ["89", 0],
+                "vae": ["90", 0],
+                "width": segment.width,
+                "height": segment.height,
+                "length": gen["wan_frames"],
+                "batch_size": 1,
+                "previous_video": ["97", 0],
+                "motion_frames": 3,
+                "motion_amplitude": 1.15,
+                "initial_reference_image": ["300", 0],
+            },
+            "_meta": {"title": "PainterLongVideo Identity Anchor"},
+        }
+        logger.info(
+            "Swapped to PainterLongVideo (segment %d, ref=%s)",
+            segment.index,
+            initial_reference_image_filename,
+        )
 
     # User LoRAs
     if segment.loras:
