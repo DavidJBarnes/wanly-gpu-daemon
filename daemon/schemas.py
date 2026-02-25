@@ -32,6 +32,7 @@ class SegmentClaim(BaseModel):
     faceswap_image: Optional[str] = None
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
+    initial_reference_image: Optional[str] = None
     width: int
     height: int
     fps: int

@@ -189,7 +189,24 @@ async def execute_segment(
         else:
             await progress.log("[1/7] No start image (text-to-video)")
 
-        # Step 1b: Resolve faceswap image
+        # Step 1b: Resolve initial reference image (identity anchor for PainterLongVideo)
+        initial_ref_filename = None
+        if segment.initial_reference_image and segment.index > 0:
+            ref_image = segment.initial_reference_image
+            if ref_image.startswith("s3://"):
+                logger.info("Downloading initial reference image via API: %s", ref_image)
+                ref_data = await _download_with_retry(
+                    lambda: queue.download_file(ref_image), "initial_reference_image"
+                )
+                _validate_image_data(ref_data, "initial_reference_image")
+                ext = os.path.splitext(ref_image)[1] or ".png"
+                ref_filename = f"initial_ref_{segment.id}{ext}"
+                initial_ref_filename = await comfyui.upload_image(ref_data, ref_filename)
+                await progress.log(f"[1/7] Initial reference image ready: {initial_ref_filename}")
+            else:
+                initial_ref_filename = ref_image
+
+        # Step 1c: Resolve faceswap image
         faceswap_comfyui_filename = await _resolve_faceswap_image(segment, comfyui, queue)
         if faceswap_comfyui_filename:
             await progress.log(f"[1/7] Faceswap image ready: {faceswap_comfyui_filename}")
@@ -209,7 +226,11 @@ async def execute_segment(
         # Step 3: Build workflow
         t0 = time.monotonic()
         await progress.log("[3/7] Building workflow...")
-        workflow = build_workflow(segment, start_image_filename=start_image_filename)
+        workflow = build_workflow(
+            segment,
+            start_image_filename=start_image_filename,
+            initial_reference_image_filename=initial_ref_filename,
+        )
         await progress.log(f"[3/7] Workflow built ({len(workflow)} nodes)")
         step_times.append(("build", time.monotonic() - t0))
 
