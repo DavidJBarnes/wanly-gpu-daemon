@@ -188,6 +188,9 @@ async def run():
         settings.clip_model, settings.vae_model,
         settings.unet_high_model, settings.unet_low_model,
     )
+    logger.info("LightX2V strengths: high=%.1f low=%.1f",
+        settings.lightx2v_strength_high, settings.lightx2v_strength_low,
+    )
 
     # Check and install required ComfyUI custom nodes
     nodes_ok = await check_and_install_nodes(comfyui)
