@@ -166,9 +166,9 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
 
 
 def _calculate_generation_params(target_fps: int, duration_sec: float, speed: float = 1.0) -> dict[str, Any]:
-    adjusted_duration = duration_sec / speed
+    adjusted_duration = duration_sec / max(speed, 0.25)
     rife_multiplier = target_fps // GENERATION_FPS
-    wan_frames = int(adjusted_duration * GENERATION_FPS) + 1
+    wan_frames = max(int(adjusted_duration * GENERATION_FPS) + 1, 5)
     return {
         "wan_frames": wan_frames,
         "rife_multiplier": rife_multiplier,
