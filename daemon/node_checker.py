@@ -31,6 +31,10 @@ CUSTOM_NODE_PACKAGES: dict[str, dict] = {
         "nodes": ["ReActorFaceSwapOpt", "ReActorOptions"],
         "alt_dirs": ["comfyui-reactor", "ComfyUI-ReActor", "ComfyUI-ReActor-NSFW"],
     },
+    "ComfyUI-PainterLongVideo": {
+        "repo": "https://github.com/princepainter/ComfyUI-PainterLongVideo",
+        "nodes": ["PainterLongVideo"],
+    },
 }
 
 
