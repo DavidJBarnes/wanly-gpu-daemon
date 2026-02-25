@@ -356,6 +356,22 @@ def build_workflow(
             "inputs": {"image": initial_reference_image_filename},
             "_meta": {"title": "Initial Reference Image"},
         }
+        # Node 301: CLIP Vision model loader
+        workflow["301"] = {
+            "class_type": "CLIPVisionLoader",
+            "inputs": {"clip_name": settings.clip_vision_model},
+            "_meta": {"title": "CLIP Vision Loader"},
+        }
+        # Node 302: Encode reference image with CLIP Vision
+        workflow["302"] = {
+            "class_type": "CLIPVisionEncode",
+            "inputs": {
+                "clip_vision": ["301", 0],
+                "image": ["300", 0],
+                "crop": "center",
+            },
+            "_meta": {"title": "CLIP Vision Encode Reference"},
+        }
         # Replace WanImageToVideo with PainterLongVideo
         workflow["98"] = {
             "class_type": "PainterLongVideo",
@@ -368,16 +384,19 @@ def build_workflow(
                 "length": gen["wan_frames"],
                 "batch_size": 1,
                 "previous_video": ["97", 0],
-                "motion_frames": 3,
-                "motion_amplitude": 1.15,
+                "motion_frames": 5,
+                "motion_amplitude": 1.3,
                 "initial_reference_image": ["300", 0],
+                "clip_vision_output": ["302", 0],
+                "start_image": ["97", 0],
             },
             "_meta": {"title": "PainterLongVideo Identity Anchor"},
         }
         logger.info(
-            "Swapped to PainterLongVideo (segment %d, ref=%s)",
+            "Swapped to PainterLongVideo (segment %d, ref=%s, clip_vision=%s)",
             segment.index,
             initial_reference_image_filename,
+            settings.clip_vision_model,
         )
 
     # User LoRAs
