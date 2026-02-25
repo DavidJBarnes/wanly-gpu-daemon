@@ -24,6 +24,7 @@ class SegmentClaim(BaseModel):
     index: int
     prompt: str
     duration_seconds: float
+    speed: float = 1.0
     start_image: Optional[str] = None
     loras: Optional[list[LoraItem]] = None
     faceswap_enabled: bool
