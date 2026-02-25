@@ -18,7 +18,13 @@ PARTIAL_EXTENSIONS = (".aria2", ".tmp", ".part")
 
 
 def _loras_dir() -> str:
-    """Return the ComfyUI loras directory path."""
+    """Return the LoRA download directory path.
+
+    Uses ``lora_cache_dir`` when set (e.g. a persistent volume on RunPod),
+    otherwise falls back to ``comfyui_path/models/loras``.
+    """
+    if settings.lora_cache_dir:
+        return settings.lora_cache_dir
     return os.path.join(settings.comfyui_path, "models", "loras")
 
 
