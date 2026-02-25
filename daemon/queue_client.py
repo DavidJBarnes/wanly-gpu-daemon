@@ -67,7 +67,8 @@ class QueueClient:
 
     async def download_file(self, s3_path: str) -> bytes:
         """Download a file from S3 via the API proxy."""
-        timeout = 600 if ".safetensors" in s3_path else 60
+        large = s3_path.endswith(".safetensors") or s3_path.endswith(".pth")
+        timeout = 600 if large else 60
         resp = await self.client.get(
             "/files", params={"path": s3_path}, timeout=timeout
         )

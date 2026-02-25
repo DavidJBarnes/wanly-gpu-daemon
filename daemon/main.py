@@ -11,6 +11,7 @@ from daemon.model_validator import cleanup_partial_downloads, validate_models
 from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.registry_client import RegistryClient
+from daemon.resource_sync import sync_resources
 
 logging.basicConfig(
     level=logging.INFO,
@@ -193,6 +194,15 @@ async def run():
     nodes_ok = await check_and_install_nodes(comfyui)
     if not nodes_ok:
         logger.error("Required custom nodes are missing or could not be installed. Exiting.")
+        await comfyui.close()
+        await registry.close()
+        await queue.close()
+        return
+
+    # Pre-flight: sync required resources (model weights for custom nodes)
+    resources_ok = await sync_resources(queue)
+    if not resources_ok:
+        logger.error("Resource sync failed. Exiting.")
         await comfyui.close()
         await registry.close()
         await queue.close()
