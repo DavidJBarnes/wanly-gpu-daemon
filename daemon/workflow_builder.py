@@ -165,9 +165,10 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
 }
 
 
-def _calculate_generation_params(target_fps: int, duration_sec: float) -> dict[str, Any]:
+def _calculate_generation_params(target_fps: int, duration_sec: float, speed: float = 1.0) -> dict[str, Any]:
+    adjusted_duration = duration_sec / speed
     rife_multiplier = target_fps // GENERATION_FPS
-    wan_frames = int(duration_sec * GENERATION_FPS) + 1
+    wan_frames = int(adjusted_duration * GENERATION_FPS) + 1
     return {
         "wan_frames": wan_frames,
         "rife_multiplier": rife_multiplier,
@@ -318,7 +319,7 @@ def build_workflow(
             When provided (segment > 0), node 98 is swapped from WanImageToVideo
             to PainterLongVideo with dual-reference inputs.
     """
-    gen = _calculate_generation_params(segment.fps, segment.duration_seconds)
+    gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
     workflow = copy.deepcopy(WAN_I2V_API_WORKFLOW)
 
     # Inject model filenames from config
@@ -447,12 +448,13 @@ def build_workflow(
     }
 
     logger.info(
-        "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, seed=%d, faceswap=%s",
+        "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, speed=%.1fx, seed=%d, faceswap=%s",
         segment.width,
         segment.height,
         gen["wan_frames"],
         GENERATION_FPS,
         rife_multiplier,
+        segment.speed,
         segment.seed,
         faceswap,
     )
