@@ -6,6 +6,7 @@ dynamic node injection for LoRAs, face swap, RIFE interpolation, and video outpu
 
 import copy
 import logging
+import math
 from typing import Any
 
 from daemon.config import settings
@@ -166,9 +167,14 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
 
 
 def _calculate_generation_params(target_fps: int, duration_sec: float, speed: float = 1.0) -> dict[str, Any]:
-    adjusted_duration = duration_sec / max(speed, 0.25)
-    rife_multiplier = target_fps // GENERATION_FPS
-    wan_frames = max(int(adjusted_duration * GENERATION_FPS) + 1, 5)
+    speed = max(speed, 0.25)
+    # RIFE multiplier scales with speed: speed=1x → 2x RIFE, speed=2x → 4x RIFE.
+    # Fewer native frames + higher RIFE maintains output duration.
+    base_rife = target_fps // GENERATION_FPS  # 2 for 30fps, 4 for 60fps
+    rife_multiplier = max(math.ceil(base_rife * speed), 1)
+    # Derive wan_frames to hit target duration with this RIFE multiplier.
+    target_output_frames = int(duration_sec * target_fps)
+    wan_frames = max(math.ceil(target_output_frames / rife_multiplier), 5)
     return {
         "wan_frames": wan_frames,
         "rife_multiplier": rife_multiplier,
