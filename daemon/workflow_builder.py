@@ -226,7 +226,11 @@ def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
 
 
 def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
-    """Add face swap nodes (188 LoadImage + 183 FaceSwap)."""
+    """Add face swap nodes (188 LoadImage + 183 FaceSwap).
+
+    Faceswap runs AFTER RIFE interpolation, so input_image/target_image
+    references node 200 (RIFE output) instead of node 87 (VAEDecode).
+    """
     # Node 188: load face source image
     workflow["188"] = {
         "class_type": "LoadImage",
@@ -261,7 +265,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
                 "face_restore_model": "codeformer-v0.1.0.pth",
                 "face_restore_visibility": 1.0,
                 "codeformer_weight": 0.8,
-                "input_image": ["87", 0],
+                "input_image": ["200", 0],
                 "source_image": ["188", 0],
                 "options": ["189", 0],
             },
@@ -272,7 +276,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
         # FaceFusion (default)
         facefusion_inputs: dict[str, Any] = {
             "source_images": ["188", 0],
-            "target_image": ["87", 0],
+            "target_image": ["200", 0],
             "api_token": "-1",
             "face_swapper_model": "inswapper_128",
             "face_detector_model": "retinaface",
@@ -406,14 +410,10 @@ def build_workflow(
     if segment.loras:
         _add_user_loras(workflow, [l.model_dump() for l in segment.loras])
 
-    # Face swap
-    faceswap = segment.faceswap_enabled and segment.faceswap_image
-    if faceswap:
-        _add_faceswap(workflow, segment)
-
-    # RIFE frame interpolation
+    # RIFE frame interpolation (always before faceswap so it gets the full
+    # multi-frame video from VAEDecode — faceswap can drop frames via its
+    # NSFW filter which would leave RIFE with < 2 frames and crash)
     rife_multiplier = gen["rife_multiplier"]
-    rife_input = ["183", 0] if faceswap else ["87", 0]
     workflow["200"] = {
         "class_type": "RIFE VFI",
         "inputs": {
@@ -423,12 +423,18 @@ def build_workflow(
             "fast_mode": True,
             "ensemble": True,
             "scale_factor": 1,
-            "frames": rife_input,
+            "frames": ["87", 0],
         },
         "_meta": {"title": f"RIFE {rife_multiplier}x Interpolation"},
     }
 
-    # VHS_VideoCombine output
+    # Face swap (after RIFE so it processes interpolated frames)
+    faceswap = segment.faceswap_enabled and segment.faceswap_image
+    if faceswap:
+        _add_faceswap(workflow, segment)
+
+    # VHS_VideoCombine output — takes faceswap output if enabled, else RIFE
+    video_input = ["183", 0] if faceswap else ["200", 0]
     workflow["186"] = {
         "class_type": "VHS_VideoCombine",
         "inputs": {
@@ -442,7 +448,7 @@ def build_workflow(
             "trim_to_audio": False,
             "pingpong": False,
             "save_output": True,
-            "images": ["200", 0],
+            "images": video_input,
         },
         "_meta": {"title": "Video Combine"},
     }
