@@ -78,7 +78,7 @@ async def register_with_retry(client, *, friendly_name, hostname, ip_address, co
     return None
 
 
-async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event):
+async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event, drain_event):
     """Send heartbeats to the registry every heartbeat_interval seconds."""
     beat_count = 0
     last_comfyui_state = None
@@ -96,8 +96,14 @@ async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event):
         comfyui_running = await comfyui.check_health()
         comfyui_busy = await comfyui.check_queue_busy() if comfyui_running else False
         try:
-            await registry.heartbeat(worker_id, comfyui_running)
+            data = await registry.heartbeat(worker_id, comfyui_running)
             beat_count += 1
+
+            # Check if registry signals drain
+            if data.get("status") == "draining" and not drain_event.is_set():
+                logger.info("Drain requested by registry — will stop after current work")
+                drain_event.set()
+
             # Log state changes immediately, otherwise only every 5th beat
             state = (comfyui_running, comfyui_busy)
             if state != last_comfyui_state:
@@ -110,7 +116,7 @@ async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event):
             logger.error("Heartbeat failed: %s", e)
 
 
-async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, executing_event):
+async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, executing_event, drain_event):
     """Poll the queue for segments and execute them one at a time."""
     poll_count = 0
     while not shutdown_event.is_set():
@@ -122,6 +128,12 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, exe
             pass
 
         if shutdown_event.is_set():
+            break
+
+        # If draining and not executing, trigger shutdown
+        if drain_event.is_set():
+            logger.info("Drain active and no work in progress — shutting down")
+            shutdown_event.set()
             break
 
         # Don't claim work if ComfyUI isn't running
@@ -164,10 +176,38 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, exe
             logger.exception("Unexpected error executing segment %s", segment.id)
         finally:
             executing_event.clear()
-            try:
-                await registry.update_status(worker_id, "online-idle")
-            except Exception as e:
-                logger.error("Failed to update status to idle: %s", e)
+            # If draining, don't go back to idle — shut down
+            if drain_event.is_set():
+                logger.info("Drain active — segment finished, shutting down")
+                shutdown_event.set()
+            else:
+                try:
+                    await registry.update_status(worker_id, "online-idle")
+                except Exception as e:
+                    logger.error("Failed to update status to idle: %s", e)
+
+
+async def _stop_runpod_pod():
+    """Call RunPod API to stop this pod (if running on RunPod)."""
+    import httpx as _httpx
+
+    pod_id = settings.runpod_pod_id
+    api_key = settings.runpod_api_key
+    if not pod_id or not api_key:
+        return
+
+    logger.info("Stopping RunPod pod %s ...", pod_id)
+    query = f'mutation {{ podStop(input: {{podId: "{pod_id}"}}) {{ id desiredStatus }} }}'
+    try:
+        async with _httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.runpod.io/graphql?api_key={api_key}",
+                json={"query": query},
+            )
+            resp.raise_for_status()
+            logger.info("RunPod stop response: %s", resp.text)
+    except Exception as e:
+        logger.error("Failed to stop RunPod pod: %s", e)
 
 
 async def run():
@@ -176,6 +216,7 @@ async def run():
     queue = QueueClient()
     shutdown_event = asyncio.Event()
     executing_event = asyncio.Event()
+    drain_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -254,10 +295,10 @@ async def run():
 
     try:
         heartbeat_task = asyncio.create_task(
-            heartbeat_loop(registry, comfyui, worker_id, shutdown_event)
+            heartbeat_loop(registry, comfyui, worker_id, shutdown_event, drain_event)
         )
         job_task = asyncio.create_task(
-            job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, executing_event)
+            job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, executing_event, drain_event)
         )
 
         await asyncio.gather(heartbeat_task, job_task)
@@ -279,6 +320,11 @@ async def run():
             logger.info("Deregistered successfully")
         except Exception as e:
             logger.error("Failed to deregister: %s", e)
+
+        # If draining on RunPod, stop the pod
+        if drain_event.is_set():
+            await _stop_runpod_pod()
+
         await registry.close()
         await queue.close()
         await comfyui.close()
