@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     lightx2v_strength_low: float = 1.0  # Strength for low noise lightx2v LoRA (community range: 1.0–2.0)
     clip_vision_model: str = "clip_vision_h.safetensors"
 
+    # RunPod auto-stop (set by RunPod environment + user config)
+    runpod_pod_id: str | None = None
+    runpod_api_key: str | None = None
+
     model_config = {"env_file": ".env"}
 
 

@@ -29,12 +29,13 @@ class RegistryClient:
         resp.raise_for_status()
         return uuid.UUID(resp.json()["id"])
 
-    async def heartbeat(self, worker_id: uuid.UUID, comfyui_running: bool):
+    async def heartbeat(self, worker_id: uuid.UUID, comfyui_running: bool) -> dict:
         resp = await self.client.post(
             f"/workers/{worker_id}/heartbeat",
             json={"comfyui_running": comfyui_running},
         )
         resp.raise_for_status()
+        return resp.json()
 
     async def update_status(self, worker_id: uuid.UUID, status: str):
         resp = await self.client.patch(
