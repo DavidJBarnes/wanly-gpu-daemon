@@ -168,17 +168,17 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
 
 def _calculate_generation_params(target_fps: int, duration_sec: float, speed: float = 1.0) -> dict[str, Any]:
     speed = max(speed, 0.25)
-    # RIFE multiplier scales with speed: speed=1x → 2x RIFE, speed=2x → 4x RIFE.
-    # Fewer native frames + higher RIFE maintains output duration.
-    base_rife = target_fps // GENERATION_FPS  # 2 for 30fps, 4 for 60fps
-    rife_multiplier = max(math.ceil(base_rife * speed), 1)
-    # Derive wan_frames to hit target duration with this RIFE multiplier.
-    target_output_frames = int(duration_sec * target_fps)
-    wan_frames = max(math.ceil(target_output_frames / rife_multiplier), 5)
+    # More speed = more WAN frames = more motion packed into the same duration.
+    wan_frames = max(math.ceil(duration_sec * GENERATION_FPS * speed), 5)
+    # RIFE smoothing based on target fps (2x for 30fps, 4x for 60fps).
+    rife_multiplier = max(target_fps // GENERATION_FPS, 1)
+    total_frames = wan_frames * rife_multiplier
+    # Output fps adjusts so all frames fit into the requested duration.
+    output_fps = round(total_frames / duration_sec)
     return {
         "wan_frames": wan_frames,
         "rife_multiplier": rife_multiplier,
-        "output_fps": target_fps,
+        "output_fps": output_fps,
     }
 
 
