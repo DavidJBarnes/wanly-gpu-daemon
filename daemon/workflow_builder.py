@@ -338,9 +338,9 @@ def build_workflow(
     workflow["95"]["inputs"]["unet_name"] = settings.unet_high_model
     workflow["96"]["inputs"]["unet_name"] = settings.unet_low_model
     workflow["101"]["inputs"]["lora_name"] = settings.lightx2v_lora_high
-    workflow["101"]["inputs"]["strength_model"] = settings.lightx2v_strength_high
+    workflow["101"]["inputs"]["strength_model"] = segment.lightx2v_strength_high if segment.lightx2v_strength_high is not None else settings.lightx2v_strength_high
     workflow["102"]["inputs"]["lora_name"] = settings.lightx2v_lora_low
-    workflow["102"]["inputs"]["strength_model"] = settings.lightx2v_strength_low
+    workflow["102"]["inputs"]["strength_model"] = segment.lightx2v_strength_low if segment.lightx2v_strength_low is not None else settings.lightx2v_strength_low
 
     # Positive prompt
     workflow["93"]["inputs"]["text"] = segment.prompt
