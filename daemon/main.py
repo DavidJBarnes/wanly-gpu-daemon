@@ -56,29 +56,30 @@ def _log_system_info(system_info: dict | None) -> None:
 
 
 async def register_with_retry(client, *, friendly_name, hostname, ip_address, comfyui_running, shutdown_event):
-    """Attempt to register with the registry, retrying every 10s until success or shutdown."""
+    """Attempt to register with the registry, retrying every 10s until success or shutdown.
+    Returns (worker_id, friendly_name) — friendly_name may differ from config if renamed via console."""
     attempt = 0
     while not shutdown_event.is_set():
         attempt += 1
         try:
-            worker_id = await client.register(
+            worker_id, registered_name = await client.register(
                 friendly_name=friendly_name,
                 hostname=hostname,
                 ip_address=ip_address,
                 comfyui_running=comfyui_running,
             )
-            logger.info("Registered as %s (id=%s)", friendly_name, worker_id)
-            return worker_id
+            logger.info("Registered as %s (id=%s)", registered_name, worker_id)
+            return worker_id, registered_name
         except Exception as e:
             logger.error("Failed to register with registry at %s (attempt %d): %s", settings.registry_url, attempt, e)
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=10)
             except asyncio.TimeoutError:
                 pass
-    return None
+    return None, None
 
 
-async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event, drain_event):
+async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event):
     """Send heartbeats to the registry every heartbeat_interval seconds."""
     beat_count = 0
     last_comfyui_state = None
@@ -99,6 +100,12 @@ async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event, drain_eve
             data = await registry.heartbeat(worker_id, comfyui_running)
             beat_count += 1
 
+            # Pick up renames from the registry
+            new_name = data.get("friendly_name")
+            if new_name and new_name != friendly_name_ref[0]:
+                logger.info("Friendly name updated: %s → %s", friendly_name_ref[0], new_name)
+                friendly_name_ref[0] = new_name
+
             # Check if registry signals drain
             if data.get("status") == "draining" and not drain_event.is_set():
                 logger.info("Drain requested by registry — will stop after current work")
@@ -116,7 +123,7 @@ async def heartbeat_loop(registry, comfyui, worker_id, shutdown_event, drain_eve
             logger.error("Heartbeat failed: %s", e)
 
 
-async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, executing_event, drain_event):
+async def job_poll_loop(registry, comfyui, queue, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event):
     """Poll the queue for segments and execute them one at a time."""
     poll_count = 0
     while not shutdown_event.is_set():
@@ -151,7 +158,7 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, exe
             continue
 
         try:
-            segment = await queue.claim_next(worker_id)
+            segment = await queue.claim_next(worker_id, friendly_name_ref[0])
         except Exception as e:
             logger.error("Poll failed: %s", e)
             continue
@@ -277,7 +284,7 @@ async def run():
     system_info = await comfyui.get_system_info()
     _log_system_info(system_info)
 
-    worker_id = await register_with_retry(
+    worker_id, registered_name = await register_with_retry(
         registry,
         friendly_name=settings.friendly_name,
         hostname=hostname,
@@ -293,12 +300,15 @@ async def run():
         await comfyui.close()
         return
 
+    # Mutable ref so heartbeat can update the name and poll loop sees it
+    friendly_name_ref = [registered_name]
+
     try:
         heartbeat_task = asyncio.create_task(
-            heartbeat_loop(registry, comfyui, worker_id, shutdown_event, drain_event)
+            heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event)
         )
         job_task = asyncio.create_task(
-            job_poll_loop(registry, comfyui, queue, worker_id, shutdown_event, executing_event, drain_event)
+            job_poll_loop(registry, comfyui, queue, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event)
         )
 
         await asyncio.gather(heartbeat_task, job_task)
