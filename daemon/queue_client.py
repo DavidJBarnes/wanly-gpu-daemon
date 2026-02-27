@@ -25,11 +25,11 @@ class QueueClient:
         self.base_url = settings.queue_url
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10)
 
-    async def claim_next(self, worker_id: uuid.UUID) -> Optional[SegmentClaim]:
+    async def claim_next(self, worker_id: uuid.UUID, worker_name: str | None = None) -> Optional[SegmentClaim]:
         """Claim the next available segment. Returns None if no work available."""
         resp = await self.client.get(
             "/segments/next",
-            params={"worker_id": str(worker_id), "worker_name": settings.friendly_name},
+            params={"worker_id": str(worker_id), "worker_name": worker_name or settings.friendly_name},
         )
         if not resp.is_success:
             _raise_with_details(resp, "claim_next")

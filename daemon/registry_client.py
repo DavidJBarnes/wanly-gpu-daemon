@@ -16,7 +16,7 @@ class RegistryClient:
         hostname: str,
         ip_address: str,
         comfyui_running: bool,
-    ) -> uuid.UUID:
+    ) -> tuple[uuid.UUID, str]:
         resp = await self.client.post(
             "/workers",
             json={
@@ -27,9 +27,11 @@ class RegistryClient:
             },
         )
         resp.raise_for_status()
-        return uuid.UUID(resp.json()["id"])
+        data = resp.json()
+        return uuid.UUID(data["id"]), data["friendly_name"]
 
     async def heartbeat(self, worker_id: uuid.UUID, comfyui_running: bool) -> dict:
+        """Send heartbeat. Returns full worker data including current friendly_name."""
         resp = await self.client.post(
             f"/workers/{worker_id}/heartbeat",
             json={"comfyui_running": comfyui_running},
