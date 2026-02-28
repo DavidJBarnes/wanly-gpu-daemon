@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import signal
 import socket
 import sys
@@ -96,8 +97,28 @@ async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdo
 
         comfyui_running = await comfyui.check_health()
         comfyui_busy = await comfyui.check_queue_busy() if comfyui_running else False
+
+        # Collect GPU stats from ComfyUI
+        gpu_stats = None
+        if comfyui_running:
+            try:
+                info = await comfyui.get_system_info()
+                if info and info.get("devices"):
+                    d = info["devices"][0]
+                    vram_total = d.get("vram_total", 0)
+                    vram_free = d.get("vram_free", 0)
+                    gpu_stats = {
+                        "vram_used_mb": round((vram_total - vram_free) / 1048576),
+                        "vram_total_mb": round(vram_total / 1048576),
+                        "gpu_name": d.get("name", ""),
+                        "torch_vram_used_mb": round(d.get("torch_vram_total", 0) / 1048576),
+                        "torch_vram_free_mb": round(d.get("torch_vram_free", 0) / 1048576),
+                    }
+            except Exception:
+                pass
+
         try:
-            data = await registry.heartbeat(worker_id, comfyui_running)
+            data = await registry.heartbeat(worker_id, comfyui_running, gpu_stats)
             beat_count += 1
 
             # Pick up renames from the registry
@@ -182,6 +203,21 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, friendly_name_ref, 
         except Exception as e:
             logger.exception("Unexpected error executing segment %s", segment.id)
         finally:
+            # Log VRAM usage after each segment to spot memory leaks
+            try:
+                info = await comfyui.get_system_info()
+                if info:
+                    devices = info.get("devices", [])
+                    if devices:
+                        d = devices[0]
+                        vram_used = d.get("vram_total", 0) - d.get("vram_free", 0)
+                        vram_total = d.get("vram_total", 0)
+                        if vram_total > 0:
+                            logger.info("VRAM: %.0f / %.0f MiB (%.0f%%)",
+                                vram_used / 1048576, vram_total / 1048576,
+                                vram_used / vram_total * 100)
+            except Exception:
+                pass
             executing_event.clear()
             # If draining, don't go back to idle — shut down
             if drain_event.is_set():
@@ -217,7 +253,30 @@ async def _stop_runpod_pod():
         logger.error("Failed to stop RunPod pod: %s", e)
 
 
+def kill_stale_daemons():
+    """Kill any existing daemon.main processes from previous runs."""
+    my_pid = os.getpid()
+    killed = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == my_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace")
+            if "daemon.main" in cmdline and "python" in cmdline.lower():
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+        except (OSError, PermissionError):
+            continue
+    if killed:
+        logger.info("Killed %d stale daemon process(es): %s", len(killed), killed)
+
+
 async def run():
+    kill_stale_daemons()
     registry = RegistryClient()
     comfyui = ComfyUIClient()
     queue = QueueClient()
@@ -247,6 +306,13 @@ async def run():
     logger.info("LightX2V strengths: high=%.1f low=%.1f",
         settings.lightx2v_strength_high, settings.lightx2v_strength_low,
     )
+
+    # Clear any orphaned ComfyUI queue items from previous daemon runs
+    if comfyui_running:
+        if await comfyui.clear_queue():
+            logger.info("Cleared ComfyUI queue")
+        else:
+            logger.warning("Failed to clear ComfyUI queue")
 
     # Check and install required ComfyUI custom nodes
     nodes_ok = await check_and_install_nodes(comfyui)
