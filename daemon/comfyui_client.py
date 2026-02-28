@@ -12,6 +12,7 @@ from daemon.config import settings
 logger = logging.getLogger(__name__)
 
 EXECUTION_TIMEOUT = 1800  # 30 minutes
+PROGRESS_TIMEOUT = 300  # 5 minutes without any progress = stuck
 
 
 class ComfyUIExecutionError(Exception):
@@ -50,6 +51,14 @@ class ComfyUIClient:
             data = resp.json()
             running = data.get("queue_running", [])
             return len(running) > 0
+        except Exception:
+            return False
+
+    async def clear_queue(self) -> bool:
+        """Clear any pending/running items from ComfyUI's queue."""
+        try:
+            resp = await self.http.post("/queue", json={"clear": True})
+            return resp.status_code == 200
         except Exception:
             return False
 
@@ -105,16 +114,29 @@ class ComfyUIClient:
             )
 
     async def _monitor_ws(self, prompt_id: str, client_id: str) -> dict[str, Any]:
-        """Inner WebSocket monitoring loop."""
+        """Inner WebSocket monitoring loop with progress-based timeout."""
         ws_url = f"ws://{self.base_url.replace('http://', '').replace('https://', '')}/ws?clientId={client_id}"
         if self.api_key:
             ws_url += f"&token={self.api_key}"
         outputs: dict[str, Any] = {}
         current_node = None
         last_progress_pct = -1
+        last_activity = asyncio.get_event_loop().time()
 
         async with websockets.connect(ws_url) as ws:
-            async for raw_message in ws:
+            while True:
+                remaining = PROGRESS_TIMEOUT - (asyncio.get_event_loop().time() - last_activity)
+                if remaining <= 0:
+                    raise ComfyUIExecutionError(
+                        f"No progress from ComfyUI for {PROGRESS_TIMEOUT}s — execution appears stuck"
+                    )
+                try:
+                    raw_message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    raise ComfyUIExecutionError(
+                        f"No progress from ComfyUI for {PROGRESS_TIMEOUT}s — execution appears stuck"
+                    )
+
                 if isinstance(raw_message, bytes):
                     continue  # Skip binary preview frames
 
@@ -128,6 +150,7 @@ class ComfyUIClient:
 
                 if msg_type == "execution_start":
                     logger.info("       ComfyUI execution started")
+                    last_activity = asyncio.get_event_loop().time()
 
                 elif msg_type == "executing":
                     node = msg_data.get("node")
@@ -136,8 +159,10 @@ class ComfyUIClient:
                     else:
                         current_node = node
                         last_progress_pct = -1
+                    last_activity = asyncio.get_event_loop().time()
 
                 elif msg_type == "progress":
+                    last_activity = asyncio.get_event_loop().time()
                     value = msg_data.get("value", 0)
                     max_val = msg_data.get("max", 0)
                     if max_val > 0:
@@ -155,6 +180,7 @@ class ComfyUIClient:
                     output = msg_data.get("output", {})
                     if output:
                         outputs[node_id] = output
+                    last_activity = asyncio.get_event_loop().time()
 
                 elif msg_type == "execution_success":
                     logger.info("       ComfyUI execution complete")

@@ -30,11 +30,19 @@ class RegistryClient:
         data = resp.json()
         return uuid.UUID(data["id"]), data["friendly_name"]
 
-    async def heartbeat(self, worker_id: uuid.UUID, comfyui_running: bool) -> dict:
+    async def heartbeat(
+        self,
+        worker_id: uuid.UUID,
+        comfyui_running: bool,
+        gpu_stats: dict | None = None,
+    ) -> dict:
         """Send heartbeat. Returns full worker data including current friendly_name."""
+        payload: dict = {"comfyui_running": comfyui_running}
+        if gpu_stats is not None:
+            payload["gpu_stats"] = gpu_stats
         resp = await self.client.post(
             f"/workers/{worker_id}/heartbeat",
-            json={"comfyui_running": comfyui_running},
+            json=payload,
         )
         resp.raise_for_status()
         return resp.json()
