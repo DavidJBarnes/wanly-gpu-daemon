@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     lightx2v_lora_low: str = "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
     lightx2v_strength_high: float = 2.0  # Strength for high noise lightx2v LoRA (community range: 1.0–5.6)
     lightx2v_strength_low: float = 1.0  # Strength for low noise lightx2v LoRA (community range: 1.0–2.0)
+    cfg_high: float = 1.0  # CFG for high noise KSampler (node 86)
+    cfg_low: float = 1.0  # CFG for low noise KSampler (node 85)
     clip_vision_model: str = "clip_vision_h.safetensors"
 
     # RunPod auto-stop (set by RunPod environment + user config)
