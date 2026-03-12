@@ -21,9 +21,14 @@ def _raise_with_details(resp: httpx.Response, context: str) -> None:
 
 
 class QueueClient:
+    """HTTP client for the wanly-api queue endpoints."""
+
     def __init__(self):
         self.base_url = settings.queue_url
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10)
+        headers = {}
+        if settings.queue_api_key:
+            headers["X-API-Key"] = settings.queue_api_key
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10, headers=headers)
 
     async def claim_next(self, worker_id: uuid.UUID, worker_name: str | None = None) -> Optional[SegmentClaim]:
         """Claim the next available segment. Returns None if no work available."""

@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     comfyui_path: str = ""  # Path to ComfyUI installation (for custom node management)
     lora_cache_dir: str = ""  # Override LoRA download dir (e.g. /workspace/models/loras for persistence)
     queue_url: str = "http://localhost:8001"
+    queue_api_key: str = ""
     poll_interval: int = 5
 
     # Model filenames (vary per GPU worker — override in .env)
