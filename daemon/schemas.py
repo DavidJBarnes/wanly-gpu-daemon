@@ -36,6 +36,8 @@ class SegmentClaim(BaseModel):
     initial_reference_image: Optional[str] = None
     lightx2v_strength_high: Optional[float] = None
     lightx2v_strength_low: Optional[float] = None
+    cfg_high: Optional[float] = None
+    cfg_low: Optional[float] = None
     width: int
     height: int
     fps: int

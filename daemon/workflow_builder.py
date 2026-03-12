@@ -343,6 +343,10 @@ def build_workflow(
     workflow["102"]["inputs"]["lora_name"] = settings.lightx2v_lora_low
     workflow["102"]["inputs"]["strength_model"] = segment.lightx2v_strength_low if segment.lightx2v_strength_low is not None else settings.lightx2v_strength_low
 
+    # CFG values for KSampler nodes
+    workflow["86"]["inputs"]["cfg"] = segment.cfg_high if segment.cfg_high is not None else settings.cfg_high
+    workflow["85"]["inputs"]["cfg"] = segment.cfg_low if segment.cfg_low is not None else settings.cfg_low
+
     # Positive prompt
     workflow["93"]["inputs"]["text"] = segment.prompt
 
