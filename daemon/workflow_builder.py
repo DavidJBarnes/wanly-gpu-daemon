@@ -347,6 +347,10 @@ def build_workflow(
     workflow["86"]["inputs"]["cfg"] = segment.cfg_high if segment.cfg_high is not None else settings.cfg_high
     workflow["85"]["inputs"]["cfg"] = segment.cfg_low if segment.cfg_low is not None else settings.cfg_low
 
+    # Negative prompt
+    if segment.negative_prompt is not None:
+        workflow["89"]["inputs"]["text"] = segment.negative_prompt
+
     # Positive prompt
     workflow["93"]["inputs"]["text"] = segment.prompt
 
