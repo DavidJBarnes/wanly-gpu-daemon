@@ -38,6 +38,7 @@ class SegmentClaim(BaseModel):
     lightx2v_strength_low: Optional[float] = None
     cfg_high: Optional[float] = None
     cfg_low: Optional[float] = None
+    negative_prompt: Optional[str] = None
     width: int
     height: int
     fps: int
