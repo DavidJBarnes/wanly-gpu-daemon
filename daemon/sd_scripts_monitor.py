@@ -127,6 +127,44 @@ def _parse_log_tail(log_path: str) -> dict:
     return result
 
 
+def _progress_from_cmdline_and_checkpoints(parts: list[str], output_name: str | None) -> dict:
+    """Estimate progress from cmdline args and saved checkpoint files.
+
+    Used when no log file is available (terminal-launched training).
+    Counts epoch checkpoint files in --output_dir to determine current_epoch.
+    """
+    result: dict = {}
+
+    max_epochs_str = _extract_cmdline_arg(parts, "--max_train_epochs")
+    if max_epochs_str and max_epochs_str.isdigit():
+        result["max_epochs"] = int(max_epochs_str)
+
+    output_dir = _extract_cmdline_arg(parts, "--output_dir")
+    if output_dir and output_name and os.path.isdir(output_dir):
+        # Checkpoint files look like: {output_name}-000001.safetensors
+        prefix = f"{output_name}-"
+        try:
+            epoch_nums = []
+            for f in os.listdir(output_dir):
+                if f.startswith(prefix) and f.endswith(".safetensors"):
+                    # Extract epoch number from filename
+                    num_part = f[len(prefix):].replace(".safetensors", "")
+                    if num_part.isdigit():
+                        epoch_nums.append(int(num_part))
+            if epoch_nums:
+                result["current_epoch"] = max(epoch_nums)
+        except OSError:
+            pass
+
+    # Calculate pct_complete from epochs
+    current_epoch = result.get("current_epoch", 0)
+    max_epochs = result.get("max_epochs", 0)
+    if max_epochs > 0:
+        result["pct_complete"] = round(current_epoch / max_epochs * 100, 2)
+
+    return result
+
+
 def check_training_active() -> dict | None:
     """Scan /proc for a running sd-scripts training process.
 
@@ -190,10 +228,9 @@ def check_training_active() -> dict | None:
             progress = _parse_log_tail(log_path)
             info.update(progress)
         else:
-            # Fall back to cmdline args for max_epochs if no log available
-            max_epochs_str = _extract_cmdline_arg(parts, "--max_train_epochs")
-            if max_epochs_str and max_epochs_str.isdigit():
-                info["max_epochs"] = int(max_epochs_str)
+            # No log file (terminal-launched training).
+            # Extract what we can from cmdline and checkpoint files.
+            info.update(_progress_from_cmdline_and_checkpoints(parts, output_name))
 
         return info
 
