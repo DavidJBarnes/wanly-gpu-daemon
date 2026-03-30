@@ -12,7 +12,9 @@ from daemon.model_validator import cleanup_partial_downloads, validate_models
 from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.registry_client import RegistryClient
+from daemon.gpu_stats import get_gpu_stats
 from daemon.resource_sync import sync_resources
+from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,27 +100,14 @@ async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdo
         comfyui_running = await comfyui.check_health()
         comfyui_busy = await comfyui.check_queue_busy() if comfyui_running else False
 
-        # Collect GPU stats from ComfyUI
-        gpu_stats = None
-        if comfyui_running:
-            try:
-                info = await comfyui.get_system_info()
-                if info and info.get("devices"):
-                    d = info["devices"][0]
-                    vram_total = d.get("vram_total", 0)
-                    vram_free = d.get("vram_free", 0)
-                    gpu_stats = {
-                        "vram_used_mb": round((vram_total - vram_free) / 1048576),
-                        "vram_total_mb": round(vram_total / 1048576),
-                        "gpu_name": d.get("name", ""),
-                        "torch_vram_used_mb": round(d.get("torch_vram_total", 0) / 1048576),
-                        "torch_vram_free_mb": round(d.get("torch_vram_free", 0) / 1048576),
-                    }
-            except Exception:
-                pass
+        # Collect GPU stats via nvidia-smi (works whether ComfyUI is running or not)
+        gpu_stats = get_gpu_stats()
+
+        # Collect sd-scripts training status
+        sd_scripts_status = get_sd_scripts_status()
 
         try:
-            data = await registry.heartbeat(worker_id, comfyui_running, gpu_stats)
+            data = await registry.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status)
             beat_count += 1
 
             # Pick up renames from the registry
@@ -305,6 +294,13 @@ async def run():
     )
     logger.info("LightX2V strengths: high=%.1f low=%.1f",
         settings.lightx2v_strength_high, settings.lightx2v_strength_low,
+    )
+
+    sd_status = get_sd_scripts_status()
+    logger.info("sd-scripts: installed=%s, training=%s%s",
+        sd_status["sd_scripts_installed"],
+        sd_status["sd_scripts_training"],
+        f" ({sd_status['sd_scripts_training_info']['output_name']})" if sd_status.get("sd_scripts_training_info") else "",
     )
 
     # Clear any orphaned ComfyUI queue items from previous daemon runs

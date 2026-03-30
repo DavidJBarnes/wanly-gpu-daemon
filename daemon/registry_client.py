@@ -35,11 +35,14 @@ class RegistryClient:
         worker_id: uuid.UUID,
         comfyui_running: bool,
         gpu_stats: dict | None = None,
+        sd_scripts_status: dict | None = None,
     ) -> dict:
         """Send heartbeat. Returns full worker data including current friendly_name."""
         payload: dict = {"comfyui_running": comfyui_running}
         if gpu_stats is not None:
             payload["gpu_stats"] = gpu_stats
+        if sd_scripts_status is not None:
+            payload["sd_scripts"] = sd_scripts_status
         resp = await self.client.post(
             f"/workers/{worker_id}/heartbeat",
             json=payload,
