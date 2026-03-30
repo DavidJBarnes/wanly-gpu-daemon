@@ -127,18 +127,21 @@ def check_training_active() -> dict | None:
         if "compile_worker" in cmdline or "accelerate" in cmdline:
             continue
 
-        # Skip child processes spawned by the main training process
-        # (e.g. torch DataLoader workers). The main process is its own
-        # session leader or direct child of accelerate.
+        # Skip DataLoader/compile worker children of the main training process.
+        # The real trainer's parent is the accelerate launcher (which we
+        # already filter above), so only skip when the parent is itself a
+        # direct training invocation (no "accelerate" in its cmdline).
         try:
             with open(f"/proc/{pid}/stat", "rb") as f:
                 stat_fields = f.read().decode().split()
                 ppid = int(stat_fields[3])
-            # If parent is also a matching training script, this is a worker child
             try:
                 with open(f"/proc/{ppid}/cmdline", "rb") as f:
                     parent_cmd = f.read().decode("utf-8", errors="replace")
-                if any(sig in parent_cmd for sig in TRAINING_SIGNATURES):
+                if (
+                    any(sig in parent_cmd for sig in TRAINING_SIGNATURES)
+                    and "accelerate" not in parent_cmd
+                ):
                     continue
             except (OSError, PermissionError):
                 pass
