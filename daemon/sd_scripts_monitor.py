@@ -9,6 +9,7 @@ descriptor in /proc) to extract real-time progress metrics.
 import logging
 import os
 import re
+import struct
 
 from daemon.config import settings
 
@@ -127,11 +128,210 @@ def _parse_log_tail(log_path: str) -> dict:
     return result
 
 
+def _find_tfevents_file(logging_dir: str) -> str | None:
+    """Find the most recent TensorBoard events file under logging_dir.
+
+    sd-scripts writes to: {logging_dir}/{timestamp}/{subdir}/events.out.tfevents.*
+    """
+    best: tuple[float, str] | None = None
+    try:
+        for root, _dirs, files in os.walk(logging_dir):
+            for f in files:
+                if f.startswith("events.out.tfevents."):
+                    full = os.path.join(root, f)
+                    mtime = os.path.getmtime(full)
+                    if best is None or mtime > best[0]:
+                        best = (mtime, full)
+    except OSError:
+        pass
+    return best[1] if best else None
+
+
+def _parse_tfevents_tail(path: str) -> dict:
+    """Read the tail of a TensorBoard events file for loss and step.
+
+    Uses raw struct parsing of the TFRecord format + minimal protobuf
+    wire-format decoding — no external dependencies needed.
+
+    TFRecord format per record:
+      8 bytes: uint64 length
+      4 bytes: masked crc32c of length
+      `length` bytes: data (serialized tf.Event protobuf)
+      4 bytes: masked crc32c of data
+
+    Event protobuf fields we care about:
+      field 2 (int64): step
+      field 5 (Summary → repeated Value):
+        Value field 1 (string): tag
+        Value field 2 (float): simple_value
+    """
+    result: dict = {}
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            # Read last 64KB — enough for recent events
+            f.seek(max(0, size - 65536))
+            data = f.read()
+    except OSError:
+        return result
+
+    # Scan for TFRecord boundaries and parse each record
+    last_step = 0
+    last_loss = None
+    pos = 0
+    # If we seeked into the middle of the file, find the first valid record
+    # by scanning for plausible record lengths
+    while pos + 12 < len(data):
+        try:
+            length = struct.unpack("<Q", data[pos : pos + 8])[0]
+        except struct.error:
+            pos += 1
+            continue
+        record_end = pos + 12 + length + 4
+        if length > 100000 or record_end > len(data):
+            pos += 1
+            continue
+
+        record_data = data[pos + 12 : pos + 12 + length]
+        step, loss = _decode_event(record_data)
+        if step is not None and step > last_step:
+            last_step = step
+        if loss is not None:
+            last_loss = loss
+        pos = record_end
+
+    if last_step > 0:
+        result["current_step"] = last_step
+    if last_loss is not None:
+        result["current_loss"] = round(last_loss, 4)
+
+    return result
+
+
+def _decode_event(data: bytes) -> tuple[int | None, float | None]:
+    """Minimal protobuf decoder for tf.Event — extracts step and loss/avr_loss."""
+    step = None
+    loss = None
+    pos = 0
+    while pos < len(data):
+        try:
+            tag_byte = data[pos]
+            field_num = tag_byte >> 3
+            wire_type = tag_byte & 0x07
+            pos += 1
+        except IndexError:
+            break
+
+        if wire_type == 0:  # varint
+            val, pos = _decode_varint(data, pos)
+            if val is None:
+                break
+            if field_num == 2:  # step
+                step = val
+        elif wire_type == 1:  # 64-bit (double)
+            pos += 8
+        elif wire_type == 2:  # length-delimited
+            length, pos = _decode_varint(data, pos)
+            if length is None or pos + length > len(data):
+                break
+            if field_num == 5:  # summary
+                loss = _decode_summary_loss(data[pos : pos + length])
+            pos += length
+        elif wire_type == 5:  # 32-bit (float)
+            pos += 4
+        else:
+            break  # unknown wire type, stop
+
+    return step, loss
+
+
+def _decode_summary_loss(data: bytes) -> float | None:
+    """Decode a tf.Summary message and extract loss value."""
+    # Summary has repeated Value (field 1, length-delimited)
+    # Value has tag (field 1, string) and simple_value (field 2, float32)
+    loss = None
+    pos = 0
+    while pos < len(data):
+        try:
+            tag_byte = data[pos]
+            field_num = tag_byte >> 3
+            wire_type = tag_byte & 0x07
+            pos += 1
+        except IndexError:
+            break
+
+        if wire_type == 2:  # length-delimited
+            length, pos = _decode_varint(data, pos)
+            if length is None or pos + length > len(data):
+                break
+            if field_num == 1:  # Value message
+                tag_str, value = _decode_summary_value(data[pos : pos + length])
+                if tag_str and value is not None and ("loss" in tag_str):
+                    loss = value
+            pos += length
+        else:
+            break
+    return loss
+
+
+def _decode_summary_value(data: bytes) -> tuple[str | None, float | None]:
+    """Decode a tf.Summary.Value — extract tag string and simple_value float."""
+    tag_str = None
+    simple_value = None
+    pos = 0
+    while pos < len(data):
+        try:
+            tag_byte = data[pos]
+            field_num = tag_byte >> 3
+            wire_type = tag_byte & 0x07
+            pos += 1
+        except IndexError:
+            break
+
+        if wire_type == 2:  # length-delimited (string)
+            length, pos = _decode_varint(data, pos)
+            if length is None or pos + length > len(data):
+                break
+            if field_num == 1:  # tag
+                try:
+                    tag_str = data[pos : pos + length].decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+            pos += length
+        elif wire_type == 5:  # 32-bit float
+            if pos + 4 <= len(data) and field_num == 2:
+                simple_value = struct.unpack("<f", data[pos : pos + 4])[0]
+            pos += 4
+        elif wire_type == 0:  # varint
+            _, pos = _decode_varint(data, pos)
+        elif wire_type == 1:  # 64-bit
+            pos += 8
+        else:
+            break
+    return tag_str, simple_value
+
+
+def _decode_varint(data: bytes, pos: int) -> tuple[int | None, int]:
+    """Decode a protobuf varint starting at pos. Returns (value, new_pos)."""
+    result = 0
+    shift = 0
+    while pos < len(data):
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
+        shift += 7
+        if shift > 63:
+            break
+    return None, pos
+
+
 def _progress_from_cmdline_and_checkpoints(parts: list[str], output_name: str | None) -> dict:
-    """Estimate progress from cmdline args and saved checkpoint files.
+    """Estimate progress from cmdline args, checkpoint files, and TensorBoard events.
 
     Used when no log file is available (terminal-launched training).
-    Counts epoch checkpoint files in --output_dir to determine current_epoch.
     """
     result: dict = {}
 
@@ -147,7 +347,6 @@ def _progress_from_cmdline_and_checkpoints(parts: list[str], output_name: str | 
             epoch_nums = []
             for f in os.listdir(output_dir):
                 if f.startswith(prefix) and f.endswith(".safetensors"):
-                    # Extract epoch number from filename
                     num_part = f[len(prefix):].replace(".safetensors", "")
                     if num_part.isdigit():
                         epoch_nums.append(int(num_part))
@@ -156,7 +355,20 @@ def _progress_from_cmdline_and_checkpoints(parts: list[str], output_name: str | 
         except OSError:
             pass
 
-    # Calculate pct_complete from epochs
+    # Parse TensorBoard events for step-level loss and step count
+    logging_dir = _extract_cmdline_arg(parts, "--logging_dir")
+    if logging_dir:
+        logging_dir = os.path.expanduser(logging_dir)
+        tfevents = _find_tfevents_file(logging_dir)
+        if tfevents:
+            tb_data = _parse_tfevents_tail(tfevents)
+            if "current_step" in tb_data:
+                result["current_step"] = tb_data["current_step"]
+            if "current_loss" in tb_data:
+                result["current_loss"] = tb_data["current_loss"]
+
+    # Calculate pct_complete from epochs (step-level % needs total_steps which
+    # we don't have from cmdline alone)
     current_epoch = result.get("current_epoch", 0)
     max_epochs = result.get("max_epochs", 0)
     if max_epochs > 0:
