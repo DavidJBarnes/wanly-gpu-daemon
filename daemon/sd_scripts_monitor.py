@@ -49,14 +49,40 @@ def _extract_cmdline_arg(parts: list[str], flag: str) -> str | None:
     return None
 
 
-def _find_log_path(pid: int) -> str | None:
-    """Follow /proc/{pid}/fd/1 to find the training log file, if any."""
-    try:
-        target = os.readlink(f"/proc/{pid}/fd/1")
-        if os.path.isfile(target):
-            return target
-    except (OSError, PermissionError):
-        pass
+def _find_log_path(pid: int, cmdline_parts: list[str] | None = None) -> str | None:
+    """Find the training log file for a process.
+
+    Checks, in order:
+    1. /proc/{pid}/fd/1 (stdout) — used when musubi-tuner-ui redirects output
+    2. /proc/{pid}/fd/2 (stderr) — tqdm writes to stderr
+    3. The --output_dir from cmdline for any .log files
+    """
+    # Check stdout and stderr file descriptors
+    for fd in (1, 2):
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+            if os.path.isfile(target):
+                return target
+        except (OSError, PermissionError):
+            pass
+
+    # Fall back to looking for log files in the output directory
+    if cmdline_parts:
+        output_dir = _extract_cmdline_arg(cmdline_parts, "--output_dir")
+        if output_dir and os.path.isdir(output_dir):
+            # Find the most recently modified .log file
+            log_files = []
+            try:
+                for f in os.listdir(output_dir):
+                    if f.endswith(".log"):
+                        full = os.path.join(output_dir, f)
+                        log_files.append((os.path.getmtime(full), full))
+            except OSError:
+                pass
+            if log_files:
+                log_files.sort(reverse=True)
+                return log_files[0][1]
+
     return None
 
 
@@ -159,7 +185,7 @@ def check_training_active() -> dict | None:
         }
 
         # Try to parse the training log for live progress metrics
-        log_path = _find_log_path(pid)
+        log_path = _find_log_path(pid, parts)
         if log_path:
             progress = _parse_log_tail(log_path)
             info.update(progress)
