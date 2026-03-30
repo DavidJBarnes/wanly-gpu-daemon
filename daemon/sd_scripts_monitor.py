@@ -127,6 +127,24 @@ def check_training_active() -> dict | None:
         if "compile_worker" in cmdline or "accelerate" in cmdline:
             continue
 
+        # Skip child processes spawned by the main training process
+        # (e.g. torch DataLoader workers). The main process is its own
+        # session leader or direct child of accelerate.
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                stat_fields = f.read().decode().split()
+                ppid = int(stat_fields[3])
+            # If parent is also a matching training script, this is a worker child
+            try:
+                with open(f"/proc/{ppid}/cmdline", "rb") as f:
+                    parent_cmd = f.read().decode("utf-8", errors="replace")
+                if any(sig in parent_cmd for sig in TRAINING_SIGNATURES):
+                    continue
+            except (OSError, PermissionError):
+                pass
+        except (OSError, PermissionError, IndexError, ValueError):
+            pass
+
         parts = cmdline.split("\x00")
 
         # Extract output_name from cmdline if present
