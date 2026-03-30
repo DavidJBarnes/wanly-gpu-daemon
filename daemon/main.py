@@ -85,7 +85,7 @@ async def register_with_retry(client, *, friendly_name, hostname, ip_address, co
 async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event):
     """Send heartbeats to the registry every heartbeat_interval seconds."""
     beat_count = 0
-    last_comfyui_state = None
+    last_busy_state = None
     while not shutdown_event.is_set():
         try:
             await asyncio.wait_for(
@@ -105,6 +105,10 @@ async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdo
 
         # Collect sd-scripts training status
         sd_scripts_status = get_sd_scripts_status()
+        sd_scripts_training = sd_scripts_status.get("sd_scripts_training", False)
+
+        # Worker is busy if either ComfyUI is processing or sd-scripts is training
+        is_busy = comfyui_busy or sd_scripts_training
 
         try:
             data = await registry.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status)
@@ -121,12 +125,27 @@ async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdo
                 logger.info("Drain requested by registry — will stop after current work")
                 drain_event.set()
 
-            # Log state changes immediately, otherwise only every 5th beat
-            state = (comfyui_running, comfyui_busy)
-            if state != last_comfyui_state:
-                status_str = "offline" if not comfyui_running else ("busy" if comfyui_busy else "idle")
-                logger.info("ComfyUI: %s", status_str)
-                last_comfyui_state = state
+            # Push status update when busy state changes
+            if is_busy != last_busy_state:
+                new_status = "online-busy" if is_busy else "online-idle"
+                try:
+                    await registry.update_status(worker_id, new_status)
+                except Exception as e:
+                    logger.error("Failed to update status to %s: %s", new_status, e)
+
+                # Log what changed
+                reasons = []
+                if comfyui_busy:
+                    reasons.append("ComfyUI busy")
+                if sd_scripts_training:
+                    info = sd_scripts_status.get("sd_scripts_training_info") or {}
+                    name = info.get("output_name", "")
+                    reasons.append(f"sd-scripts training{f' ({name})' if name else ''}")
+                if reasons:
+                    logger.info("Status: %s — %s", new_status, ", ".join(reasons))
+                else:
+                    logger.info("Status: %s", new_status)
+                last_busy_state = is_busy
             elif beat_count % 5 == 0:
                 logger.debug("Heartbeat OK (beat #%d)", beat_count)
         except Exception as e:
@@ -213,10 +232,13 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, friendly_name_ref, 
                 logger.info("Drain active — segment finished, shutting down")
                 shutdown_event.set()
             else:
-                try:
-                    await registry.update_status(worker_id, "online-idle")
-                except Exception as e:
-                    logger.error("Failed to update status to idle: %s", e)
+                # Only go idle if sd-scripts isn't training (heartbeat loop handles ongoing busy)
+                sd_status = get_sd_scripts_status()
+                if not sd_status.get("sd_scripts_training"):
+                    try:
+                        await registry.update_status(worker_id, "online-idle")
+                    except Exception as e:
+                        logger.error("Failed to update status to idle: %s", e)
 
 
 async def _stop_runpod_pod():
