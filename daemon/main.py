@@ -15,6 +15,7 @@ from daemon.registry_client import RegistryClient
 from daemon.gpu_stats import get_gpu_stats
 from daemon.resource_sync import sync_resources
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
+from daemon.a1111_monitor import get_status as get_a1111_status
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,11 +108,14 @@ async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdo
         sd_scripts_status = get_sd_scripts_status()
         sd_scripts_training = sd_scripts_status.get("sd_scripts_training", False)
 
+        # Collect A1111 status
+        a1111_status = get_a1111_status()
+
         # Worker is busy if either ComfyUI is processing or sd-scripts is training
         is_busy = comfyui_busy or sd_scripts_training
 
         try:
-            data = await registry.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status)
+            data = await registry.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status, a1111_status)
             beat_count += 1
 
             # Pick up renames from the registry
@@ -323,6 +327,12 @@ async def run():
         sd_status["sd_scripts_installed"],
         sd_status["sd_scripts_training"],
         f" ({sd_status['sd_scripts_training_info']['output_name']})" if sd_status.get("sd_scripts_training_info") else "",
+    )
+
+    a1111_stat = get_a1111_status()
+    logger.info("A1111: installed=%s, running=%s",
+        a1111_stat["a1111_installed"],
+        a1111_stat["a1111_running"],
     )
 
     # Clear any orphaned ComfyUI queue items from previous daemon runs
