@@ -25,6 +25,7 @@ from PIL import Image
 
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
 from daemon.lora_sync import ensure_loras_available
+from daemon.motion_extractor import _augment_prompt_with_motion, extract_motion_keywords
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
@@ -168,6 +169,16 @@ async def execute_segment(
 ) -> None:
     """Execute a single segment end-to-end."""
     lora_names = ", ".join(l.high_file or l.low_file or "?" for l in (segment.loras or []))
+
+    augmented_prompt = segment.prompt
+    if segment.previous_motion_keywords:
+        original_prompt = segment.prompt
+        augmented_prompt = _augment_prompt_with_motion(
+            original_prompt, segment.previous_motion_keywords
+        )
+        logger.info("Augmented prompt with motion continuity: %s -> %s", original_prompt[:50], augmented_prompt[:50])
+        segment = segment.model_copy(update={"prompt": augmented_prompt})
+
     logger.info(
         "=== Segment %d (job %s) === prompt: %s%s",
         segment.index, str(segment.job_id)[:8],
@@ -226,10 +237,23 @@ async def execute_segment(
         # Step 3: Build workflow
         t0 = time.monotonic()
         await progress.log("[3/7] Building workflow...")
+        reference_frames_filenames = []
+        if segment.reference_frames:
+            for ref_s3_path in segment.reference_frames:
+                ref_data = await _download_with_retry(
+                    lambda: queue.download_file(ref_s3_path), f"reference_frame"
+                )
+                _validate_image_data(ref_data, "reference_frame")
+                ext = os.path.splitext(ref_s3_path)[1] or ".png"
+                ref_filename = f"ref_{len(reference_frames_filenames)}_{segment.id}{ext}"
+                comfyui_filename = await comfyui.upload_image(ref_data, ref_filename)
+                reference_frames_filenames.append(comfyui_filename)
+                logger.info("Uploaded reference frame to ComfyUI: %s", comfyui_filename)
         workflow = build_workflow(
             segment,
             start_image_filename=start_image_filename,
             initial_reference_image_filename=initial_ref_filename,
+            reference_frame_filenames=reference_frames_filenames if reference_frames_filenames else None,
         )
         await progress.log(f"[3/7] Workflow built ({len(workflow)} nodes)")
         step_times.append(("build", time.monotonic() - t0))
@@ -265,11 +289,19 @@ async def execute_segment(
         await progress.log(f"[6/7] Video downloaded: {video_info['filename']} ({video_mb:.1f} MB)")
         step_times.append(("download", time.monotonic() - t0))
 
-        # Step 7: Extract last frame + upload
+        # Step 7: Extract last frame + extract motion + upload
         t0 = time.monotonic()
         await progress.log("[7/7] Extracting last frame and uploading...")
         last_frame_data = await _extract_last_frame(video_data)
-        await queue.upload_segment_output(segment.id, video_data, last_frame_data)
+
+        motion_keywords = await extract_motion_keywords(segment.prompt, video_data)
+        if motion_keywords:
+            await progress.log(f"[7/7] Motion detected: {', '.join(motion_keywords)}")
+        segment_result = SegmentResult(
+            status="completed",
+            motion_keywords=motion_keywords if motion_keywords else None,
+        )
+        await queue.upload_segment_output(segment.id, video_data, last_frame_data, segment_result)
         step_times.append(("upload", time.monotonic() - t0))
 
         total = time.monotonic() - segment_start

@@ -55,7 +55,7 @@ class QueueClient:
             _raise_with_details(resp, f"update_segment {segment_id}")
 
     async def upload_segment_output(
-        self, segment_id: uuid.UUID, video_data: bytes, last_frame_data: bytes
+        self, segment_id: uuid.UUID, video_data: bytes, last_frame_data: bytes, result: SegmentResult | None = None
     ) -> None:
         """Upload video + last frame to the API, which stores them in S3."""
         resp = await self.client.post(
@@ -64,11 +64,14 @@ class QueueClient:
                 "video": ("output.mp4", video_data, "video/mp4"),
                 "last_frame": ("last_frame.png", last_frame_data, "image/png"),
             },
-            timeout=300,  # Large uploads may take a while
+            timeout=300,
         )
         if not resp.is_success:
             _raise_with_details(resp, f"upload_segment_output {segment_id}")
         logger.info("Uploaded segment output via API for %s", segment_id)
+
+        if result and result.motion_keywords:
+            await self.update_segment(segment_id, result)
 
     async def download_file(self, s3_path: str) -> bytes:
         """Download a file from S3 via the API proxy."""

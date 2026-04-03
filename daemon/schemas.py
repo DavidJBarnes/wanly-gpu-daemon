@@ -34,6 +34,9 @@ class SegmentClaim(BaseModel):
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
     initial_reference_image: Optional[str] = None
+    motion_keywords: Optional[list[str]] = None
+    previous_motion_keywords: Optional[list[str]] = None
+    reference_frames: Optional[list[str]] = None
     lightx2v_strength_high: Optional[float] = None
     lightx2v_strength_low: Optional[float] = None
     cfg_high: Optional[float] = None
@@ -53,3 +56,4 @@ class SegmentResult(BaseModel):
     last_frame_path: Optional[str] = None
     error_message: Optional[str] = None
     progress_log: Optional[str] = None
+    motion_keywords: Optional[list[str]] = None
