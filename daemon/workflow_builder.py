@@ -435,6 +435,17 @@ def build_workflow(
         ref_clip_vision_loaders = []
         ref_clip_vision_encodes = []
 
+        # If PainterLongVideo already has clip_vision_output (from identity anchor), preserve it
+        existing_clip_vision = workflow["98"]["inputs"].get("clip_vision_output")
+        if existing_clip_vision:
+            # Convert single reference to list format
+            if isinstance(existing_clip_vision[0], int):
+                ref_clip_vision_encodes.append(existing_clip_vision)
+            else:
+                ref_clip_vision_encodes.extend(existing_clip_vision)
+            # Remove from PainterLongVideo inputs - we'll add all refs together below
+            del workflow["98"]["inputs"]["clip_vision_output"]
+
         for i, ref_filename in enumerate(reference_frame_filenames[:3]):
             curr_ref_node = ref_node_id + (i * 10)
             curr_clip_vision = clip_vision_ref_node_id + (i * 10)
