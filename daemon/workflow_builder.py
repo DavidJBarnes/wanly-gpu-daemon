@@ -438,10 +438,12 @@ def build_workflow(
         # If PainterLongVideo already has clip_vision_output (from identity anchor), preserve it
         existing_clip_vision = workflow["98"]["inputs"].get("clip_vision_output")
         if existing_clip_vision:
-            # Convert single reference to list format
-            if isinstance(existing_clip_vision[0], int):
+            # Check if it's a single reference like ["302", 0] or already a list
+            if isinstance(existing_clip_vision[0], str):
+                # Single reference - wrap in list
                 ref_clip_vision_encodes.append(existing_clip_vision)
             else:
+                # Already a list
                 ref_clip_vision_encodes.extend(existing_clip_vision)
             # Remove from PainterLongVideo inputs - we'll add all refs together below
             del workflow["98"]["inputs"]["clip_vision_output"]
