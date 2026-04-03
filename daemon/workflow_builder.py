@@ -426,10 +426,11 @@ def build_workflow(
         )
 
     # Multi-frame identity anchoring with reference frames
+    # Use node IDs 350+ to avoid conflict with PainterLongVideo nodes (300-312)
     if reference_frame_filenames and segment.index > 0:
-        ref_node_id = 310
-        clip_vision_ref_node_id = 311
-        clip_vision_encode_node_id = 312
+        ref_node_id = 350
+        clip_vision_ref_node_id = 351
+        clip_vision_encode_node_id = 352
 
         ref_clip_vision_loaders = []
         ref_clip_vision_encodes = []
