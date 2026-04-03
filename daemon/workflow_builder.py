@@ -426,27 +426,15 @@ def build_workflow(
         )
 
     # Multi-frame identity anchoring with reference frames
-    # Use node IDs 350+ to avoid conflict with PainterLongVideo nodes (300-312)
-    if reference_frame_filenames and segment.index > 0:
+    # Only use this when NOT using identity anchoring (PainterLongVideo),
+    # since PainterLongVideo already handles identity via initial_reference_image
+    if reference_frame_filenames and segment.index > 0 and not initial_reference_image_filename:
         ref_node_id = 350
         clip_vision_ref_node_id = 351
         clip_vision_encode_node_id = 352
 
         ref_clip_vision_loaders = []
         ref_clip_vision_encodes = []
-
-        # If PainterLongVideo already has clip_vision_output (from identity anchor), preserve it
-        existing_clip_vision = workflow["98"]["inputs"].get("clip_vision_output")
-        if existing_clip_vision:
-            # Check if it's a single reference like ["302", 0] or already a list
-            if isinstance(existing_clip_vision[0], str):
-                # Single reference - wrap in list
-                ref_clip_vision_encodes.append(existing_clip_vision)
-            else:
-                # Already a list
-                ref_clip_vision_encodes.extend(existing_clip_vision)
-            # Remove from PainterLongVideo inputs - we'll add all refs together below
-            del workflow["98"]["inputs"]["clip_vision_output"]
 
         for i, ref_filename in enumerate(reference_frame_filenames[:3]):
             curr_ref_node = ref_node_id + (i * 10)
