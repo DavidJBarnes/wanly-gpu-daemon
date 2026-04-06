@@ -70,7 +70,7 @@ class QueueClient:
             _raise_with_details(resp, f"upload_segment_output {segment_id}")
         logger.info("Uploaded segment output via API for %s", segment_id)
 
-        if result and result.motion_keywords:
+        if result and (result.motion_keywords or result.motion_magnitude):
             await self.update_segment(segment_id, result)
 
     async def download_file(self, s3_path: str) -> bytes:
