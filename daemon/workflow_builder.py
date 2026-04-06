@@ -330,9 +330,8 @@ def build_workflow(
             job's original input image for PainterLongVideo identity anchoring.
             When provided (segment > 0), node 98 is swapped from WanImageToVideo
             to PainterLongVideo with dual-reference inputs.
-        reference_frame_filenames: Additional reference frame filenames for
-            multi-frame identity anchoring. These are used to strengthen
-            character consistency across segments.
+            identity for characters. PainterLongVideo only accepts a single
+            clip_vision_output, so multi-frame reference frames are not used.
     """
     gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
     workflow = copy.deepcopy(WAN_I2V_API_WORKFLOW)
@@ -424,50 +423,6 @@ def build_workflow(
             initial_reference_image_filename,
             settings.clip_vision_model,
         )
-
-    # Multi-frame identity anchoring with reference frames
-    # Only use this when NOT using identity anchoring (PainterLongVideo),
-    # since PainterLongVideo already handles identity via initial_reference_image
-    if reference_frame_filenames and segment.index > 0 and not initial_reference_image_filename:
-        ref_node_id = 350
-        clip_vision_ref_node_id = 351
-        clip_vision_encode_node_id = 352
-
-        ref_clip_vision_loaders = []
-        ref_clip_vision_encodes = []
-
-        for i, ref_filename in enumerate(reference_frame_filenames[:3]):
-            curr_ref_node = ref_node_id + (i * 10)
-            curr_clip_vision = clip_vision_ref_node_id + (i * 10)
-            curr_encode = clip_vision_encode_node_id + (i * 10)
-
-            workflow[curr_ref_node] = {
-                "class_type": "LoadImage",
-                "inputs": {"image": ref_filename},
-                "_meta": {"title": f"Reference Frame {i + 1}"},
-            }
-            workflow[curr_clip_vision] = {
-                "class_type": "CLIPVisionLoader",
-                "inputs": {"clip_name": settings.clip_vision_model},
-                "_meta": {"title": f"Ref CLIP Vision {i + 1}"},
-            }
-            workflow[curr_encode] = {
-                "class_type": "CLIPVisionEncode",
-                "inputs": {
-                    "clip_vision": [curr_clip_vision, 0],
-                    "image": [curr_ref_node, 0],
-                    "crop": "center",
-                },
-                "_meta": {"title": f"Ref Encode {i + 1}"},
-            }
-            ref_clip_vision_encodes.append([curr_encode, 0])
-
-        if ref_clip_vision_encodes and "PainterLongVideo" in workflow["98"]["class_type"]:
-            workflow["98"]["inputs"]["clip_vision_output"] = ref_clip_vision_encodes
-            logger.info(
-                "Added %d reference frames for multi-frame identity anchoring",
-                len(ref_clip_vision_encodes),
-            )
 
     # User LoRAs
     if segment.loras:
