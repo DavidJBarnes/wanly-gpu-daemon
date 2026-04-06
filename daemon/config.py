@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     cfg_low: float = 1.0  # CFG for low noise KSampler (node 85)
     clip_vision_model: str = "clip_vision_h.safetensors"
 
+    # PainterLongVideo motion parameters (identity anchoring)
+    painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
+    painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
+
     # sd-scripts LoRA training monitor
     sd_scripts_path: str = "~/projects/sd-scripts"
 
