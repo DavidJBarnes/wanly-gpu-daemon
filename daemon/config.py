@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
     painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
 
+    # Motion matching (optical flow based)
+    motion_matching_enabled: bool = True  # Enable automatic motion amplitude matching
+    motion_amplitude_default: float = 1.3  # Default motion_amplitude for segment 0
+    motion_amplitude_min: float = 1.0  # Minimum motion_amplitude (no motion boost)
+    motion_amplitude_max: float = 2.0  # Maximum motion_amplitude (extreme motion)
+
     # sd-scripts LoRA training monitor
     sd_scripts_path: str = "~/projects/sd-scripts"
 

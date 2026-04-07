@@ -11,6 +11,7 @@ from typing import Any
 
 from daemon.config import settings
 from daemon.schemas import SegmentClaim
+from daemon.motion_analyzer import estimate_motion_from_flow
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,42 @@ def _calculate_generation_params(target_fps: int, duration_sec: float, speed: fl
     }
 
 
+def _calculate_motion_amplitude(
+    segment_index: int,
+    previous_motion_magnitude: float | None,
+    motion_amplitude_setting: float,
+) -> float:
+    """Calculate motion_amplitude for a segment based on previous motion data.
+    
+    Args:
+        segment_index: Index of the segment being built (0 = first segment)
+        previous_motion_magnitude: Measured motion from previous segment (px/frame)
+        motion_amplitude_setting: Default/configured motion_amplitude value
+        
+    Returns:
+        motion_amplitude to use for this segment
+    """
+    # Segment 0 uses the default/configured value
+    if segment_index == 0:
+        return motion_amplitude_setting
+    
+    # If no previous motion data, use default
+    if previous_motion_magnitude is None:
+        return motion_amplitude_setting
+    
+    # Motion matching enabled: estimate amplitude to match previous motion
+    # Use previous_motion_magnitude as target to achieve consistency
+    estimated = estimate_motion_from_flow(
+        previous_motion_magnitude=previous_motion_magnitude,
+        previous_motion_amplitude=motion_amplitude_setting,
+        target_motion_magnitude=previous_motion_magnitude,
+    )
+    
+    # Clamp to valid range
+    from daemon.config import settings
+    return max(settings.motion_amplitude_min, min(settings.motion_amplitude_max, estimated))
+
+
 def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
     """Add user LoRA nodes and rewire the lightx2v chain."""
     loras = [l for l in loras if l.get("high_file") or l.get("low_file")]
@@ -318,6 +355,7 @@ def build_workflow(
     start_image_filename: str | None = None,
     initial_reference_image_filename: str | None = None,
     reference_frame_filenames: list[str] | None = None,
+    previous_motion_magnitude: float | None = None,
 ) -> dict:
     """Build a complete ComfyUI workflow from segment parameters.
 
@@ -332,8 +370,20 @@ def build_workflow(
             to PainterLongVideo with dual-reference inputs.
             identity for characters. PainterLongVideo only accepts a single
             clip_vision_output, so multi-frame reference frames are not used.
+        previous_motion_magnitude: Measured motion magnitude from previous 
+            segment (px/frame). Used to auto-adjust motion_amplitude for 
+            consistent motion across segments.
     """
     gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
+    
+    # Calculate motion_amplitude based on previous segment's motion
+    motion_amplitude = _calculate_motion_amplitude(
+        segment_index=segment.index,
+        previous_motion_magnitude=previous_motion_magnitude,
+        motion_amplitude_setting=settings.painter_motion_amplitude,
+    )
+    logger.info("Segment %d motion_amplitude: %.2f (previous_magnitude=%s)",
+                segment.index, motion_amplitude, previous_motion_magnitude)
     workflow = copy.deepcopy(WAN_I2V_API_WORKFLOW)
 
     # Inject model filenames from config
@@ -410,7 +460,7 @@ def build_workflow(
                 "batch_size": 1,
                 "previous_video": ["97", 0],
                 "motion_frames": settings.painter_motion_frames,
-                "motion_amplitude": settings.painter_motion_amplitude,
+                "motion_amplitude": motion_amplitude,
                 "initial_reference_image": ["300", 0],
                 "clip_vision_output": ["302", 0],
                 "start_image": ["97", 0],

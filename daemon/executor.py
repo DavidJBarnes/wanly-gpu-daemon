@@ -26,6 +26,7 @@ from PIL import Image
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
 from daemon.lora_sync import ensure_loras_available
 from daemon.motion_extractor import _augment_prompt_with_motion, extract_motion_keywords
+from daemon.motion_analyzer import measure_motion_magnitude
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
@@ -249,11 +250,13 @@ async def execute_segment(
                 comfyui_filename = await comfyui.upload_image(ref_data, ref_filename)
                 reference_frames_filenames.append(comfyui_filename)
                 logger.info("Uploaded reference frame to ComfyUI: %s", comfyui_filename)
+        # Pass previous segment's motion magnitude for motion matching
         workflow = build_workflow(
             segment,
             start_image_filename=start_image_filename,
             initial_reference_image_filename=initial_ref_filename,
             reference_frame_filenames=reference_frames_filenames if reference_frames_filenames else None,
+            previous_motion_magnitude=segment.previous_motion_magnitude,
         )
         await progress.log(f"[3/7] Workflow built ({len(workflow)} nodes)")
         step_times.append(("build", time.monotonic() - t0))
@@ -289,10 +292,15 @@ async def execute_segment(
         await progress.log(f"[6/7] Video downloaded: {video_info['filename']} ({video_mb:.1f} MB)")
         step_times.append(("download", time.monotonic() - t0))
 
-        # Step 7: Extract last frame + extract motion + upload
+        # Step 7: Extract last frame + measure motion + upload
         t0 = time.monotonic()
         await progress.log("[7/7] Extracting last frame and uploading...")
         last_frame_data = await _extract_last_frame(video_data)
+
+        # Measure motion magnitude using optical flow
+        motion_magnitude = await measure_motion_magnitude(video_data)
+        if motion_magnitude:
+            await progress.log(f"[7/7] Motion magnitude: %.2f px/frame" % motion_magnitude)
 
         motion_keywords = await extract_motion_keywords(segment.prompt, video_data)
         if motion_keywords:
@@ -300,6 +308,7 @@ async def execute_segment(
         segment_result = SegmentResult(
             status="completed",
             motion_keywords=motion_keywords if motion_keywords else None,
+            motion_magnitude=motion_magnitude,
         )
         await queue.upload_segment_output(segment.id, video_data, last_frame_data, segment_result)
         step_times.append(("upload", time.monotonic() - t0))

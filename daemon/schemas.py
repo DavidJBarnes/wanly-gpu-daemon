@@ -36,6 +36,7 @@ class SegmentClaim(BaseModel):
     initial_reference_image: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
     previous_motion_keywords: Optional[list[str]] = None
+    previous_motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
     lightx2v_strength_high: Optional[float] = None
     lightx2v_strength_low: Optional[float] = None
@@ -57,3 +58,4 @@ class SegmentResult(BaseModel):
     error_message: Optional[str] = None
     progress_log: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
+    motion_magnitude: Optional[float] = None
