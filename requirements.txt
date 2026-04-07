@@ -1,4 +1,5 @@
 httpx
+opencv-python-headless
 Pillow
 pydantic-settings
 python-dotenv
