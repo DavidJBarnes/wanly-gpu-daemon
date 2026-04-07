@@ -298,9 +298,9 @@ async def execute_segment(
         last_frame_data = await _extract_last_frame(video_data)
 
         # Measure motion magnitude using optical flow
-        motion_magnitude = await measure_motion_magnitude(video_data)
+        motion_magnitude = measure_motion_magnitude(video_data)
         if motion_magnitude:
-            await progress.log(f"[7/7] Motion magnitude: %.2f px/frame" % motion_magnitude)
+            await progress.log(f"[7/7] Motion magnitude: {motion_magnitude:.2f} px/frame")
 
         motion_keywords = await extract_motion_keywords(segment.prompt, video_data)
         if motion_keywords:
