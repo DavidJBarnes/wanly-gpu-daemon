@@ -74,11 +74,12 @@ class QueueClient:
             await self.update_segment(segment_id, result)
 
     async def download_file(self, s3_path: str) -> bytes:
-        """Download a file from S3 via the API proxy."""
+        """Download a file from S3 via a presigned URL redirect."""
         large = s3_path.endswith(".safetensors") or s3_path.endswith(".pth")
         timeout = 600 if large else 60
         resp = await self.client.get(
-            "/files", params={"path": s3_path}, timeout=timeout
+            "/files", params={"path": s3_path}, timeout=timeout,
+            follow_redirects=True,
         )
         if not resp.is_success:
             _raise_with_details(resp, f"download_file {s3_path}")
