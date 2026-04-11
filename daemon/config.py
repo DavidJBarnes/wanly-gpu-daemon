@@ -2,7 +2,6 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    registry_url: str = "http://localhost:8000"
     friendly_name: str = "gpu-worker-1"
     heartbeat_interval: int = 30
     comfyui_url: str = "http://localhost:8188"

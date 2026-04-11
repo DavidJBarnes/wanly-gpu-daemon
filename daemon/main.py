@@ -11,7 +11,6 @@ from daemon.executor import execute_segment
 from daemon.model_validator import cleanup_partial_downloads, validate_models
 from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
-from daemon.registry_client import RegistryClient
 from daemon.gpu_stats import get_gpu_stats
 from daemon.resource_sync import sync_resources
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
@@ -60,7 +59,7 @@ def _log_system_info(system_info: dict | None) -> None:
 
 
 async def register_with_retry(client, *, friendly_name, hostname, ip_address, comfyui_running, shutdown_event):
-    """Attempt to register with the registry, retrying every 10s until success or shutdown.
+    """Attempt to register with the API, retrying every 10s until success or shutdown.
     Returns (worker_id, friendly_name) — friendly_name may differ from config if renamed via console."""
     attempt = 0
     while not shutdown_event.is_set():
@@ -75,7 +74,7 @@ async def register_with_retry(client, *, friendly_name, hostname, ip_address, co
             logger.info("Registered as %s (id=%s)", registered_name, worker_id)
             return worker_id, registered_name
         except Exception as e:
-            logger.error("Failed to register with registry at %s (attempt %d): %s", settings.registry_url, attempt, e)
+            logger.error("Failed to register with API at %s (attempt %d): %s", settings.queue_url, attempt, e)
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=10)
             except asyncio.TimeoutError:
@@ -83,8 +82,8 @@ async def register_with_retry(client, *, friendly_name, hostname, ip_address, co
     return None, None
 
 
-async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event):
-    """Send heartbeats to the registry every heartbeat_interval seconds."""
+async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event):
+    """Send heartbeats every heartbeat_interval seconds."""
     beat_count = 0
     last_busy_state = None
     while not shutdown_event.is_set():
@@ -115,7 +114,7 @@ async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdo
         is_busy = comfyui_busy or sd_scripts_training
 
         try:
-            data = await registry.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status, a1111_status)
+            data = await queue.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status, a1111_status)
             beat_count += 1
 
             # Pick up renames from the registry
@@ -124,16 +123,16 @@ async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdo
                 logger.info("Friendly name updated: %s → %s", friendly_name_ref[0], new_name)
                 friendly_name_ref[0] = new_name
 
-            # Check if registry signals drain
+            # Check if API signals drain
             if data.get("status") == "draining" and not drain_event.is_set():
-                logger.info("Drain requested by registry — will stop after current work")
+                logger.info("Drain requested — will stop after current work")
                 drain_event.set()
 
             # Push status update when busy state changes
             if is_busy != last_busy_state:
                 new_status = "online-busy" if is_busy else "online-idle"
                 try:
-                    await registry.update_status(worker_id, new_status)
+                    await queue.update_status(worker_id, new_status)
                 except Exception as e:
                     logger.error("Failed to update status to %s: %s", new_status, e)
 
@@ -156,7 +155,7 @@ async def heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdo
             logger.error("Heartbeat failed: %s", e)
 
 
-async def job_poll_loop(registry, comfyui, queue, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event):
+async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event):
     """Poll the queue for segments and execute them one at a time."""
     poll_count = 0
     while not shutdown_event.is_set():
@@ -206,7 +205,7 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, friendly_name_ref, 
 
         executing_event.set()
         try:
-            await registry.update_status(worker_id, "online-busy")
+            await queue.update_status(worker_id, "online-busy")
         except Exception as e:
             logger.error("Failed to update status to busy: %s", e)
 
@@ -240,7 +239,7 @@ async def job_poll_loop(registry, comfyui, queue, worker_id, friendly_name_ref, 
                 sd_status = get_sd_scripts_status()
                 if not sd_status.get("sd_scripts_training"):
                     try:
-                        await registry.update_status(worker_id, "online-idle")
+                        await queue.update_status(worker_id, "online-idle")
                     except Exception as e:
                         logger.error("Failed to update status to idle: %s", e)
 
@@ -292,7 +291,6 @@ def kill_stale_daemons():
 
 async def run():
     kill_stale_daemons()
-    registry = RegistryClient()
     comfyui = ComfyUIClient()
     queue = QueueClient()
     shutdown_event = asyncio.Event()
@@ -347,7 +345,6 @@ async def run():
     if not nodes_ok:
         logger.error("Required custom nodes are missing or could not be installed. Exiting.")
         await comfyui.close()
-        await registry.close()
         await queue.close()
         return
 
@@ -356,7 +353,6 @@ async def run():
     if not resources_ok:
         logger.error("Resource sync failed. Exiting.")
         await comfyui.close()
-        await registry.close()
         await queue.close()
         return
 
@@ -370,7 +366,6 @@ async def run():
     if not models_ok:
         logger.error("Model validation failed. Exiting.")
         await comfyui.close()
-        await registry.close()
         await queue.close()
         return
 
@@ -379,7 +374,7 @@ async def run():
     _log_system_info(system_info)
 
     worker_id, registered_name = await register_with_retry(
-        registry,
+        queue,
         friendly_name=settings.friendly_name,
         hostname=hostname,
         ip_address=ip_address,
@@ -389,7 +384,6 @@ async def run():
 
     if worker_id is None:
         logger.info("Shutdown requested before registration completed")
-        await registry.close()
         await queue.close()
         await comfyui.close()
         return
@@ -399,10 +393,10 @@ async def run():
 
     try:
         heartbeat_task = asyncio.create_task(
-            heartbeat_loop(registry, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event)
+            heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event)
         )
         job_task = asyncio.create_task(
-            job_poll_loop(registry, comfyui, queue, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event)
+            job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event)
         )
 
         await asyncio.gather(heartbeat_task, job_task)
@@ -420,7 +414,7 @@ async def run():
 
         logger.info("Shutting down, deregistering...")
         try:
-            await registry.deregister(worker_id)
+            await queue.deregister(worker_id)
             logger.info("Deregistered successfully")
         except Exception as e:
             logger.error("Failed to deregister: %s", e)
@@ -429,7 +423,6 @@ async def run():
         if drain_event.is_set():
             await _stop_runpod_pod()
 
-        await registry.close()
         await queue.close()
         await comfyui.close()
 

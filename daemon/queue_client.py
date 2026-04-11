@@ -21,7 +21,7 @@ def _raise_with_details(resp: httpx.Response, context: str) -> None:
 
 
 class QueueClient:
-    """HTTP client for the wanly-api queue endpoints."""
+    """HTTP client for the wanly-api (queue + worker registry)."""
 
     def __init__(self):
         self.base_url = settings.queue_url
@@ -84,6 +84,66 @@ class QueueClient:
         if not resp.is_success:
             _raise_with_details(resp, f"download_file {s3_path}")
         return resp.content
+
+    # --- Worker registry methods (formerly in RegistryClient) ---
+
+    async def register(
+        self,
+        friendly_name: str,
+        hostname: str,
+        ip_address: str,
+        comfyui_running: bool,
+    ) -> tuple[uuid.UUID, str]:
+        resp = await self.client.post(
+            "/workers",
+            json={
+                "friendly_name": friendly_name,
+                "hostname": hostname,
+                "ip_address": ip_address,
+                "comfyui_running": comfyui_running,
+            },
+        )
+        if not resp.is_success:
+            _raise_with_details(resp, "register")
+        data = resp.json()
+        return uuid.UUID(data["id"]), data["friendly_name"]
+
+    async def heartbeat(
+        self,
+        worker_id: uuid.UUID,
+        comfyui_running: bool,
+        gpu_stats: dict | None = None,
+        sd_scripts_status: dict | None = None,
+        a1111_status: dict | None = None,
+    ) -> dict:
+        """Send heartbeat. Returns full worker data including current friendly_name."""
+        payload: dict = {"comfyui_running": comfyui_running}
+        if gpu_stats is not None:
+            payload["gpu_stats"] = gpu_stats
+        if sd_scripts_status is not None:
+            payload["sd_scripts"] = sd_scripts_status
+        if a1111_status is not None:
+            payload["a1111"] = a1111_status
+        resp = await self.client.post(
+            f"/workers/{worker_id}/heartbeat",
+            json=payload,
+        )
+        if not resp.is_success:
+            _raise_with_details(resp, "heartbeat")
+        return resp.json()
+
+    async def update_status(self, worker_id: uuid.UUID, status: str):
+        resp = await self.client.patch(
+            f"/workers/{worker_id}/status",
+            json={"status": status},
+        )
+        if not resp.is_success:
+            _raise_with_details(resp, f"update_status {status}")
+
+    async def deregister(self, worker_id: uuid.UUID):
+        resp = await self.client.delete(f"/workers/{worker_id}")
+        if not resp.is_success:
+            _raise_with_details(resp, "deregister")
 
     async def close(self):
         await self.client.aclose()
