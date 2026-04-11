@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     runpod_pod_id: str | None = None
     runpod_api_key: str | None = None
 
-    model_config = {"env_file": ".env"}
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
 
 settings = Settings()
