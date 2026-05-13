@@ -349,29 +349,52 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim, input_node: str = "87")
 
 
 def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
-    """Build a faceswap-only workflow: load existing video → faceswap → re-encode."""
+    """Build a faceswap-only workflow: load video at 15fps → faceswap → RIFE → encode.
+
+    Matches the normal generation pipeline: faceswap on native-rate frames,
+    then RIFE interpolates back to target fps.
+    """
+    gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
     workflow: dict[str, Any] = {}
 
     workflow["400"] = {
         "class_type": "VHS_LoadVideo",
         "inputs": {
             "video": video_filename,
-            "force_rate": 0.0,
+            "force_rate": float(GENERATION_FPS),
             "custom_width": 0,
             "custom_height": 0,
             "frame_load_cap": 0,
             "skip_first_frames": 0,
             "select_every_nth": 1,
         },
-        "_meta": {"title": "Load Existing Video"},
+        "_meta": {"title": "Load Existing Video @ 15fps"},
     }
 
     _add_faceswap(workflow, segment, input_node="400")
 
+    rife_multiplier = gen["rife_multiplier"]
+    workflow["200"] = {
+        "class_type": "RIFE VFI",
+        "inputs": {
+            "ckpt_name": "rife49.pth",
+            "clear_cache_after_n_frames": 10,
+            "multiplier": rife_multiplier,
+            "fast_mode": True,
+            "ensemble": True,
+            "scale_factor": 1.0,
+            "dtype": "float16",
+            "torch_compile": False,
+            "batch_size": 1,
+            "frames": ["183", 0],
+        },
+        "_meta": {"title": f"RIFE {rife_multiplier}x Interpolation"},
+    }
+
     workflow["186"] = {
         "class_type": "VHS_VideoCombine",
         "inputs": {
-            "frame_rate": segment.fps,
+            "frame_rate": gen["output_fps"],
             "loop_count": 0,
             "filename_prefix": "output",
             "format": "video/h264-mp4",
@@ -381,12 +404,13 @@ def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
             "trim_to_audio": False,
             "pingpong": False,
             "save_output": True,
-            "images": ["183", 0],
+            "images": ["200", 0],
         },
         "_meta": {"title": "Video Combine"},
     }
 
-    logger.info("Built faceswap-only workflow (%d nodes) for video: %s", len(workflow), video_filename)
+    logger.info("Built faceswap-only workflow (%d nodes, rife %dx) for video: %s",
+                len(workflow), rife_multiplier, video_filename)
     return workflow
 
 
