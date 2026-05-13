@@ -356,10 +356,9 @@ def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
         "class_type": "VHS_LoadVideo",
         "inputs": {
             "video": video_filename,
-            "force_rate": 0,
-            "force_size": "Disabled",
-            "custom_width": segment.width,
-            "custom_height": segment.height,
+            "force_rate": 0.0,
+            "custom_width": 0,
+            "custom_height": 0,
             "frame_load_cap": 0,
             "skip_first_frames": 0,
             "select_every_nth": 1,
