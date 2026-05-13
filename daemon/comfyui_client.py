@@ -84,6 +84,18 @@ class ComfyUIClient:
         result = resp.json()
         return result.get("name", filename)
 
+    async def upload_video(self, data: bytes, filename: str) -> str:
+        """Upload a video to ComfyUI's input folder. Returns the stored filename."""
+        resp = await self.http.post(
+            "/upload/image",
+            files={"image": (filename, data, "video/mp4")},
+            data={"overwrite": "true", "type": "input"},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        return result.get("name", filename)
+
     async def submit_workflow(self, workflow: dict) -> tuple[str, str]:
         """Submit a workflow to ComfyUI. Returns (prompt_id, client_id)."""
         client_id = str(uuid.uuid4())

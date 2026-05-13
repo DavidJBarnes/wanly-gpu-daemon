@@ -43,6 +43,8 @@ class SegmentClaim(BaseModel):
     cfg_high: Optional[float] = None
     cfg_low: Optional[float] = None
     negative_prompt: Optional[str] = None
+    reprocess_type: Optional[str] = None
+    output_path: Optional[str] = None
     width: int
     height: int
     fps: int

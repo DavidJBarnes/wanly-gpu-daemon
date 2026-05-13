@@ -268,14 +268,12 @@ def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
     workflow["102"]["inputs"]["model"] = [last_low_node, 0]
 
 
-def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
+def _add_faceswap(workflow: dict, segment: SegmentClaim, input_node: str = "87") -> None:
     """Add face swap nodes (188 LoadImage + 183 FaceSwap).
 
-    Faceswap runs BEFORE RIFE interpolation on the native WAN frames
-    (node 87 VAEDecode output). RIFE then smoothly interpolates between
-    already-swapped frames.
+    input_node controls where frames come from: "87" (VAEDecode) for generation
+    workflows, or "400" (VHS_LoadVideo) for faceswap-only reprocessing.
     """
-    # Node 188: load face source image
     workflow["188"] = {
         "class_type": "LoadImage",
         "inputs": {"image": segment.faceswap_image},
@@ -309,7 +307,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
                 "face_restore_model": "codeformer-v0.1.0.pth",
                 "face_restore_visibility": 1.0,
                 "codeformer_weight": 0.8,
-                "input_image": ["87", 0],
+                "input_image": [input_node, 0],
                 "source_image": ["188", 0],
                 "options": ["189", 0],
             },
@@ -320,7 +318,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
         # FaceFusion (default)
         facefusion_inputs: dict[str, Any] = {
             "source_images": ["188", 0],
-            "target_image": ["87", 0],
+            "target_image": [input_node, 0],
             "api_token": "-1",
             "face_swapper_model": "inswapper_128",
             "face_detector_model": "retinaface",
@@ -348,6 +346,47 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim) -> None:
             "_meta": {"title": "FaceFusion Face Swap"},
         }
         logger.info("Added FaceFusion face swap nodes")
+
+
+def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
+    """Build a faceswap-only workflow: load existing video → faceswap → re-encode."""
+    workflow: dict[str, Any] = {}
+
+    workflow["400"] = {
+        "class_type": "VHS_LoadVideo",
+        "inputs": {
+            "video": video_filename,
+            "force_rate": 0,
+            "force_size": "Disabled",
+            "frame_load_cap": 0,
+            "skip_first_frames": 0,
+            "select_every_nth": 1,
+        },
+        "_meta": {"title": "Load Existing Video"},
+    }
+
+    _add_faceswap(workflow, segment, input_node="400")
+
+    workflow["186"] = {
+        "class_type": "VHS_VideoCombine",
+        "inputs": {
+            "frame_rate": segment.fps,
+            "loop_count": 0,
+            "filename_prefix": "output",
+            "format": "video/h264-mp4",
+            "pix_fmt": "yuv420p",
+            "crf": 15,
+            "save_metadata": True,
+            "trim_to_audio": False,
+            "pingpong": False,
+            "save_output": True,
+            "images": ["183", 0],
+        },
+        "_meta": {"title": "Video Combine"},
+    }
+
+    logger.info("Built faceswap-only workflow (%d nodes) for video: %s", len(workflow), video_filename)
+    return workflow
 
 
 def build_workflow(
