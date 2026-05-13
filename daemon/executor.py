@@ -174,13 +174,12 @@ async def _execute_faceswap_reprocess(
         segment.index, str(segment.job_id)[:8], segment.faceswap_method or "facefusion",
     )
 
-    if not segment.output_path:
-        raise RuntimeError("No output_path on segment — cannot reprocess without existing video")
-
     progress = ProgressLog(segment.id, queue)
     segment_start = time.monotonic()
 
     try:
+        if not segment.output_path:
+            raise RuntimeError("No output_path on segment — cannot reprocess without existing video")
         # Step 1: Download existing video from S3
         await progress.log("[1/5] Downloading existing video...")
         video_data = await _download_with_retry(

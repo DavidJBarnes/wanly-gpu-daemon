@@ -213,6 +213,14 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
             await execute_segment(segment, comfyui, queue)
         except Exception as e:
             logger.exception("Unexpected error executing segment %s", segment.id)
+            try:
+                from daemon.schemas import SegmentResult
+                await queue.update_segment(
+                    segment.id,
+                    SegmentResult(status="failed", error_message=f"{type(e).__name__}: {e}"[:2000]),
+                )
+            except Exception as report_err:
+                logger.error("Failed to report segment failure: %s", report_err)
         finally:
             # Log VRAM usage after each segment to spot memory leaks
             try:
