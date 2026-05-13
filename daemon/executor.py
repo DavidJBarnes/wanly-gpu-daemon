@@ -244,6 +244,8 @@ async def _execute_faceswap_reprocess(
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
+        if hasattr(e, "response") and hasattr(e.response, "text"):
+            error_msg += f"\nResponse: {e.response.text[:500]}"
         logger.exception("Faceswap reprocess segment %s failed", segment.id)
         await queue.update_segment(
             segment.id,

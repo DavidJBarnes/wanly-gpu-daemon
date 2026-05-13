@@ -358,6 +358,8 @@ def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
             "video": video_filename,
             "force_rate": 0,
             "force_size": "Disabled",
+            "custom_width": segment.width,
+            "custom_height": segment.height,
             "frame_load_cap": 0,
             "skip_first_frames": 0,
             "select_every_nth": 1,
