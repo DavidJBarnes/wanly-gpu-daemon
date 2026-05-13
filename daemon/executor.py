@@ -30,7 +30,7 @@ from daemon.motion_analyzer import measure_motion_magnitude
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
-from daemon.workflow_builder import build_workflow
+from daemon.workflow_builder import build_workflow, build_faceswap_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -163,12 +163,104 @@ async def _extract_last_frame(video_data: bytes) -> bytes:
                 pass
 
 
+async def _execute_faceswap_reprocess(
+    segment: SegmentClaim,
+    comfyui: ComfyUIClient,
+    queue: QueueClient,
+) -> None:
+    """Apply faceswap to an existing completed video without regenerating it."""
+    logger.info(
+        "=== Faceswap reprocess segment %d (job %s) === method: %s",
+        segment.index, str(segment.job_id)[:8], segment.faceswap_method or "facefusion",
+    )
+
+    if not segment.output_path:
+        raise RuntimeError("No output_path on segment — cannot reprocess without existing video")
+
+    progress = ProgressLog(segment.id, queue)
+    segment_start = time.monotonic()
+
+    try:
+        # Step 1: Download existing video from S3
+        await progress.log("[1/5] Downloading existing video...")
+        video_data = await _download_with_retry(
+            lambda: queue.download_file(segment.output_path), "existing_video"
+        )
+        video_mb = len(video_data) / (1024 * 1024)
+        await progress.log(f"[1/5] Video downloaded ({video_mb:.1f} MB)")
+
+        # Step 2: Upload video + faceswap image to ComfyUI
+        await progress.log("[2/5] Uploading to ComfyUI...")
+        video_filename = f"reprocess_{segment.id}.mp4"
+        comfyui_video = await comfyui.upload_video(video_data, video_filename)
+        logger.info("Uploaded existing video to ComfyUI as: %s", comfyui_video)
+
+        faceswap_comfyui_filename = await _resolve_faceswap_image(segment, comfyui, queue)
+        if faceswap_comfyui_filename:
+            segment = segment.model_copy(update={"faceswap_image": faceswap_comfyui_filename})
+        await progress.log("[2/5] Files ready in ComfyUI")
+
+        # Step 3: Build and submit faceswap-only workflow
+        await progress.log("[3/5] Building faceswap workflow...")
+        workflow = build_faceswap_workflow(segment, comfyui_video)
+        prompt_id, client_id = await comfyui.submit_workflow(workflow)
+        await progress.log(f"[3/5] Submitted (prompt_id={prompt_id[:8]})")
+
+        # Step 4: Wait for execution
+        await progress.log("[4/5] Waiting for faceswap execution...")
+        await comfyui.monitor_execution(prompt_id, client_id)
+        await progress.log("[4/5] Execution complete")
+
+        # Step 5: Download output, extract last frame, upload
+        await progress.log("[5/5] Downloading result and uploading...")
+        history = await comfyui.get_history(prompt_id)
+        video_info = comfyui.find_video_output(history)
+        if not video_info:
+            raise RuntimeError("No video output found in ComfyUI history")
+
+        result_data = await comfyui.download_output(
+            filename=video_info["filename"],
+            subfolder=video_info.get("subfolder", ""),
+            output_type=video_info.get("type", "output"),
+        )
+        last_frame_data = await _extract_last_frame(result_data)
+
+        segment_result = SegmentResult(status="completed")
+        await queue.upload_segment_output(segment.id, result_data, last_frame_data, segment_result)
+
+        total = time.monotonic() - segment_start
+        logger.info("Faceswap reprocess segment %d complete in %.1fs", segment.index, total)
+
+    except ComfyUIExecutionError as e:
+        error_msg = f"ComfyUI error: {e}"
+        if e.node_id:
+            error_msg += f" (node {e.node_id} [{e.node_type}])"
+        logger.error(error_msg)
+        if e.traceback:
+            logger.error("Traceback:\n%s", e.traceback)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        logger.exception("Faceswap reprocess segment %s failed", segment.id)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+
+
 async def execute_segment(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
     queue: QueueClient,
 ) -> None:
     """Execute a single segment end-to-end."""
+    if segment.reprocess_type == "faceswap":
+        return await _execute_faceswap_reprocess(segment, comfyui, queue)
+
     lora_names = ", ".join(l.high_file or l.low_file or "?" for l in (segment.loras or []))
 
     augmented_prompt = segment.prompt
