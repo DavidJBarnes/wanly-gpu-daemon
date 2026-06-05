@@ -84,6 +84,13 @@ async def _pip_install_requirements(node_dir: Path) -> None:
         logger.info("pip install completed for %s", node_dir.name)
 
 
+def _package_dir_present(custom_nodes_dir: Path, pkg_name: str, pkg_info: dict) -> bool:
+    """Return True if the package directory exists under its primary or any alternate name."""
+    if (custom_nodes_dir / pkg_name).is_dir():
+        return True
+    return any((custom_nodes_dir / alt).is_dir() for alt in pkg_info.get("alt_dirs", []))
+
+
 async def check_and_install_nodes(comfyui_client) -> bool:
     """Check for required custom nodes and install any that are missing.
 
@@ -91,8 +98,11 @@ async def check_and_install_nodes(comfyui_client) -> bool:
         comfyui_client: ComfyUIClient instance (used to query /object_info if ComfyUI is running).
 
     Returns:
-        True if all required nodes are available (or were just installed and need a restart).
-        False if installation failed or ComfyUI path is not configured.
+        True if all required node types are verified available (or COMFYUI_PATH is unset, or
+        ComfyUI is not yet running so verification is deferred to its next start).
+        False — caller should abort startup — if a package failed to clone/install, if nodes
+        were just installed and ComfyUI must restart to load them, or if a package is present
+        on disk but failed to import (its node types are missing from /object_info).
     """
     comfyui_path = settings.comfyui_path
     if not comfyui_path:
@@ -106,34 +116,31 @@ async def check_and_install_nodes(comfyui_client) -> bool:
 
     # Phase 1: Check which node directories are missing and install them
     installed_any = False
+    install_failed: list[str] = []
     for pkg_name, pkg_info in CUSTOM_NODE_PACKAGES.items():
-        pkg_dir = custom_nodes_dir / pkg_name
-        if pkg_dir.is_dir():
+        if _package_dir_present(custom_nodes_dir, pkg_name, pkg_info):
             logger.debug("Node %s: installed", pkg_name)
             continue
 
-        # Check alternate directory names (e.g. comfyui-reactor vs comfyui-reactor-node)
-        alt_found = False
-        for alt in pkg_info.get("alt_dirs", []):
-            if (custom_nodes_dir / alt).is_dir():
-                logger.debug("Node %s: found as %s", pkg_name, alt)
-                alt_found = True
-                break
-        if alt_found:
-            continue
-
         logger.warning("✗ %s — not found, installing...", pkg_name)
-        success = await _git_clone(pkg_info["repo"], pkg_dir)
+        success = await _git_clone(pkg_info["repo"], custom_nodes_dir / pkg_name)
         if not success:
             logger.error("Failed to install %s — workflows using %s will fail", pkg_name, pkg_info["nodes"])
+            install_failed.append(pkg_name)
             continue
 
-        await _pip_install_requirements(pkg_dir)
+        await _pip_install_requirements(custom_nodes_dir / pkg_name)
         installed_any = True
 
     # Phase 2: If ComfyUI is running, verify nodes are actually loaded via /object_info
     comfyui_running = await comfyui_client.check_health()
     if not comfyui_running:
+        if install_failed:
+            logger.error(
+                "Could not install required custom node package(s): %s. These must be present "
+                "before the daemon can serve jobs.", install_failed,
+            )
+            return False
         if installed_any:
             logger.info("Custom nodes installed. ComfyUI is not running — nodes will load on next start.")
         return True
@@ -141,29 +148,50 @@ async def check_and_install_nodes(comfyui_client) -> bool:
     if installed_any:
         logger.warning(
             "New custom nodes were installed. ComfyUI must be restarted to load them. "
-            "Please restart ComfyUI and re-run the daemon."
+            "Exiting so the daemon relaunches against a freshly-started ComfyUI."
         )
         return False
 
-    # Verify via /object_info that all required node types are available
+    if install_failed:
+        logger.error(
+            "Could not install required custom node package(s): %s. Refusing to start.",
+            install_failed,
+        )
+        return False
+
+    # Verify via /object_info that every on-disk package actually registered its node types.
+    # A package whose directory exists but whose nodes are absent from /object_info failed to
+    # import at ComfyUI startup (bad dependency, version skew, syntax error, etc.). If we let
+    # the daemon proceed it would register as a healthy worker and then fail EVERY segment with
+    # a 400 "missing_node_type" — a silent, money-burning failure. Treat it as fatal instead.
     try:
         available_nodes = await _get_available_nodes(comfyui_client)
     except Exception as e:
         logger.warning("Could not query /object_info: %s — skipping node verification", e)
         return True
 
-    all_required = []
-    for pkg_info in CUSTOM_NODE_PACKAGES.values():
-        all_required.extend(pkg_info["nodes"])
+    failed_imports: dict[str, list[str]] = {}
+    for pkg_name, pkg_info in CUSTOM_NODE_PACKAGES.items():
+        missing = [n for n in pkg_info["nodes"] if n not in available_nodes]
+        if missing:
+            failed_imports[pkg_name] = missing
 
-    missing = [n for n in all_required if n not in available_nodes]
-    if missing:
-        logger.warning(
-            "The following node types are not available in ComfyUI despite packages being installed: %s. "
-            "Try restarting ComfyUI.",
-            missing,
+    if failed_imports:
+        for pkg_name, missing in failed_imports.items():
+            logger.error(
+                "Custom node package '%s' is installed on disk but its node type(s) %s are NOT "
+                "registered in ComfyUI — the package failed to import at ComfyUI startup. Check the "
+                "ComfyUI log (e.g. /workspace/logs/comfyui.log) for an 'IMPORT FAILED: %s' traceback.",
+                pkg_name, missing, pkg_name,
+            )
+        total = sum(len(m) for m in failed_imports.values())
+        logger.error(
+            "Refusing to start: %d required node type(s) across %d package(s) failed to register. "
+            "The daemon would otherwise accept jobs and fail every segment with a 400 "
+            "missing_node_type error.",
+            total, len(failed_imports),
         )
-        return True  # Don't block startup — nodes might work after a manual restart
+        return False
 
     logger.info("All required custom nodes verified via /object_info")
     return True
