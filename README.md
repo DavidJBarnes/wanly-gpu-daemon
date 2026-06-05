@@ -1,13 +1,21 @@
 # wanly-gpu-daemon
 
-Background daemon that runs on each GPU worker machine. Registers with the GPU registry, sends periodic heartbeats, and monitors local ComfyUI availability.
+Worker daemon that claims segments from the wanly API and runs ComfyUI workflows for video generation.
+
+## Overview
+
+1. Registers with the wanly API on startup
+2. Polls the API for pending segments
+3. Downloads input images, executes ComfyUI workflows, and uploads output videos
+4. Sends periodic heartbeats with GPU/stats to the API
+5. Deregisters on shutdown (SIGINT/SIGTERM)
 
 ## Setup
 
 ### Prerequisites
 
 - Python 3.11+
-- ComfyUI running locally (optional, status is reported to registry)
+- ComfyUI running locally (or accessible via URL)
 
 ### Environment
 
@@ -19,23 +27,44 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `REGISTRY_URL` | URL of the wanly-gpu-registry service | `http://localhost:8000` |
+| `QUEUE_URL` | URL of the wanly API | `http://localhost:8001` |
+| `QUEUE_API_KEY` | API key for wanly API auth | (required) |
 | `FRIENDLY_NAME` | Display name for this worker | `gpu-worker-1` |
 | `HEARTBEAT_INTERVAL` | Seconds between heartbeats | `30` |
 | `COMFYUI_URL` | Local ComfyUI instance URL | `http://localhost:8188` |
+| `COMFYUI_PATH` | Path to ComfyUI installation | (optional) |
+| `POLL_INTERVAL` | Seconds between segment polls | `5` |
 
 ### Install and run
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 
 python -m daemon.main
 ```
 
-## Behavior
+## Key Files
 
-1. On startup: detects hostname, IP, and ComfyUI status, then registers with the GPU registry
-2. Sends heartbeats to the registry every `HEARTBEAT_INTERVAL` seconds
-3. On shutdown (SIGINT/SIGTERM): deregisters from the registry
+| File | Purpose |
+|------|---------|
+| `daemon/main.py` | Entry point and polling loop |
+| `daemon/executor.py` | Segment execution workflow |
+| `daemon/comfyui_client.py` | ComfyUI WebSocket client |
+| `daemon/workflow_builder.py` | Builds ComfyUI workflow JSON |
+| `daemon/queue_client.py` | API client (segment claiming, worker registration, heartbeats) |
+| `daemon/config.py` | Pydantic-settings configuration |
+
+## Deployment
+
+Runs as systemd service `wanly` on GPU servers:
+
+```bash
+sudo systemctl restart wanly
+```
+
+## Related Projects
+
+- `wanly-api`: Backend API server (worker registry, segment queue, job management)
+- `wanly-console`: Frontend React app
