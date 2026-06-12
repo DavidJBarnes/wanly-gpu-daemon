@@ -42,6 +42,10 @@ class SegmentClaim(BaseModel):
     lightx2v_strength_low: Optional[float] = None
     cfg_high: Optional[float] = None
     cfg_low: Optional[float] = None
+    steps_total: Optional[int] = None
+    high_noise_steps: Optional[int] = None
+    shift_high: Optional[float] = None
+    shift_low: Optional[float] = None
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None

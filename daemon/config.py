@@ -25,6 +25,23 @@ class Settings(BaseSettings):
     cfg_low: float = 1.0  # CFG for low noise KSampler (node 85)
     clip_vision_model: str = "clip_vision_h.safetensors"
 
+    # Sampler schedule (previously hardcoded in the workflow template)
+    generation_fps: int = 16  # Wan 2.2 14B is trained at 16fps; was hardcoded 15. CORRECTNESS FIX.
+    steps_total: int = 4  # total KSamplerAdvanced schedule length (shared by both passes)
+    high_noise_steps: int = 2  # boundary: high-noise expert runs steps [0, high_noise_steps); low-noise runs [high_noise_steps, steps_total)
+    shift_high: float = 5.0  # ModelSamplingSD3 shift for the high-noise expert (node 104)
+    shift_low: float = 5.0  # ModelSamplingSD3 shift for the low-noise expert (node 103)
+
+    # --- Realism profile (de-distilled high-noise) — flip these to A/B against the distilled baseline ---
+    # Setting lightx2v_strength_high = 0.0 removes the distillation LoRA from the high-noise pass entirely
+    # (the builder rewires the graph), letting the high-noise expert run real steps at real CFG.
+    #   lightx2v_strength_high = 0.0
+    #   cfg_high               = 3.5
+    #   steps_total            = 8
+    #   high_noise_steps       = 4
+    #   shift_high             = 7.0
+    #   (low-noise stays distilled: lightx2v_strength_low = 1.0, cfg_low = 1.0, shift_low = 5.0)
+
     # PainterLongVideo motion parameters (identity anchoring)
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
     painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
