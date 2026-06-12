@@ -15,9 +15,6 @@ from daemon.motion_analyzer import estimate_motion_from_flow
 
 logger = logging.getLogger(__name__)
 
-# Generation is always at 15fps; RIFE interpolation brings it to target fps.
-GENERATION_FPS = 15
-
 # Node IDs for dynamically added user LoRA pairs (up to 3).
 LORA_NODE_IDS = {
     "high": ["118", "120", "122"],
@@ -167,12 +164,20 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
 }
 
 
+def _snap_to_4n_plus_1(frames: int) -> int:
+    """Snap a frame count to the nearest 4n+1 value (Wan VAE temporal stride = 4), min 5."""
+    return max(4 * math.floor((frames - 1) / 4 + 0.5) + 1, 5)
+
+
 def _calculate_generation_params(target_fps: int, duration_sec: float, speed: float = 1.0) -> dict[str, Any]:
+    gen_fps = settings.generation_fps
     speed = max(speed, 0.25)
     # More speed = more WAN frames = more motion packed into the same duration.
-    wan_frames = max(math.ceil(duration_sec * GENERATION_FPS * speed), 5)
+    wan_frames = max(math.ceil(duration_sec * gen_fps * speed), 5)
+    # Wan VAE is 4x temporal; off-grid lengths cause end-of-clip artifacts.
+    wan_frames = _snap_to_4n_plus_1(wan_frames)
     # RIFE smoothing based on target fps (2x for 30fps, 4x for 60fps).
-    rife_multiplier = max(target_fps // GENERATION_FPS, 1)
+    rife_multiplier = max(round(target_fps / gen_fps), 1)
     total_frames = wan_frames * rife_multiplier
     # Output fps adjusts so all frames fit into the requested duration.
     output_fps = round(total_frames / duration_sec)
@@ -349,7 +354,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim, input_node: str = "87")
 
 
 def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
-    """Build a faceswap-only workflow: load video at 15fps → faceswap → RIFE → encode.
+    """Build a faceswap-only workflow: load video at generation fps → faceswap → RIFE → encode.
 
     Matches the normal generation pipeline: faceswap on native-rate frames,
     then RIFE interpolates back to target fps.
@@ -361,14 +366,14 @@ def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
         "class_type": "VHS_LoadVideo",
         "inputs": {
             "video": video_filename,
-            "force_rate": float(GENERATION_FPS),
+            "force_rate": float(settings.generation_fps),
             "custom_width": 0,
             "custom_height": 0,
             "frame_load_cap": 0,
             "skip_first_frames": 0,
             "select_every_nth": 1,
         },
-        "_meta": {"title": "Load Existing Video @ 15fps"},
+        "_meta": {"title": f"Load Existing Video @ {settings.generation_fps}fps"},
     }
 
     _add_faceswap(workflow, segment, input_node="400")
@@ -434,9 +439,17 @@ def build_workflow(
             to PainterLongVideo with dual-reference inputs.
             identity for characters. PainterLongVideo only accepts a single
             clip_vision_output, so multi-frame reference frames are not used.
-        previous_motion_magnitude: Measured motion magnitude from previous 
-            segment (px/frame). Used to auto-adjust motion_amplitude for 
+        previous_motion_magnitude: Measured motion magnitude from previous
+            segment (px/frame). Used to auto-adjust motion_amplitude for
             consistent motion across segments.
+
+    Sampler knobs (lightx2v strengths, cfg, steps_total, high_noise_steps,
+    shift_high, shift_low) resolve as: per-segment override (if not None) →
+    `settings.<field>` default. When a resolved lightx2v strength is <= 0,
+    the corresponding distillation LoRA node (101 high / 102 low) is removed
+    and its upstream model (bare UNET or end of the user-LoRA chain) is
+    spliced directly into the ModelSamplingSD3 node (104 / 103), letting that
+    expert run de-distilled at real steps and real CFG.
     """
     gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
     
@@ -455,14 +468,32 @@ def build_workflow(
     workflow["90"]["inputs"]["vae_name"] = settings.vae_model
     workflow["95"]["inputs"]["unet_name"] = settings.unet_high_model
     workflow["96"]["inputs"]["unet_name"] = settings.unet_low_model
+    strength_high = segment.lightx2v_strength_high if segment.lightx2v_strength_high is not None else settings.lightx2v_strength_high
+    strength_low = segment.lightx2v_strength_low if segment.lightx2v_strength_low is not None else settings.lightx2v_strength_low
     workflow["101"]["inputs"]["lora_name"] = settings.lightx2v_lora_high
-    workflow["101"]["inputs"]["strength_model"] = segment.lightx2v_strength_high if segment.lightx2v_strength_high is not None else settings.lightx2v_strength_high
+    workflow["101"]["inputs"]["strength_model"] = strength_high
     workflow["102"]["inputs"]["lora_name"] = settings.lightx2v_lora_low
-    workflow["102"]["inputs"]["strength_model"] = segment.lightx2v_strength_low if segment.lightx2v_strength_low is not None else settings.lightx2v_strength_low
+    workflow["102"]["inputs"]["strength_model"] = strength_low
 
     # CFG values for KSampler nodes
     workflow["86"]["inputs"]["cfg"] = segment.cfg_high if segment.cfg_high is not None else settings.cfg_high
     workflow["85"]["inputs"]["cfg"] = segment.cfg_low if segment.cfg_low is not None else settings.cfg_low
+
+    # Sampler schedule and shift (segment override → settings default)
+    steps_total = segment.steps_total if segment.steps_total is not None else settings.steps_total
+    high_noise_steps = segment.high_noise_steps if segment.high_noise_steps is not None else settings.high_noise_steps
+    high_noise_steps = max(1, min(high_noise_steps, steps_total - 1))  # clamp to a valid split
+    shift_high = segment.shift_high if segment.shift_high is not None else settings.shift_high
+    shift_low = segment.shift_low if segment.shift_low is not None else settings.shift_low
+
+    workflow["86"]["inputs"]["steps"] = steps_total
+    workflow["86"]["inputs"]["start_at_step"] = 0
+    workflow["86"]["inputs"]["end_at_step"] = high_noise_steps
+    workflow["85"]["inputs"]["steps"] = steps_total
+    workflow["85"]["inputs"]["start_at_step"] = high_noise_steps
+    workflow["85"]["inputs"]["end_at_step"] = steps_total
+    workflow["104"]["inputs"]["shift"] = shift_high
+    workflow["103"]["inputs"]["shift"] = shift_low
 
     # Negative prompt
     if segment.negative_prompt is not None:
@@ -542,6 +573,17 @@ def build_workflow(
     if segment.loras:
         _add_user_loras(workflow, [l.model_dump() for l in segment.loras])
 
+    # De-distilled rewire: strength <= 0 removes the lightx2v LoRA node and
+    # splices its upstream model (bare UNET or end of user-LoRA chain) into
+    # ModelSamplingSD3. Must run after _add_user_loras, which rewires
+    # 101/102 .inputs.model to the end of the user-LoRA chain.
+    if strength_high <= 0:
+        workflow["104"]["inputs"]["model"] = workflow["101"]["inputs"]["model"]
+        del workflow["101"]
+    if strength_low <= 0:
+        workflow["103"]["inputs"]["model"] = workflow["102"]["inputs"]["model"]
+        del workflow["102"]
+
     # Face swap (before RIFE so it processes only native WAN frames, not
     # interpolated ones — cuts faceswap frame count by 50-75%)
     faceswap = segment.faceswap_enabled and segment.faceswap_image
@@ -590,14 +632,22 @@ def build_workflow(
     }
 
     logger.info(
-        "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, speed=%.1fx, seed=%d, faceswap=%s",
+        "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, speed=%.1fx, seed=%d, faceswap=%s, "
+        "steps_total=%d, high_noise_steps=%d, shift_high=%.1f, shift_low=%.1f, "
+        "strength_high=%.2f, strength_low=%.2f",
         segment.width,
         segment.height,
         gen["wan_frames"],
-        GENERATION_FPS,
+        settings.generation_fps,
         rife_multiplier,
         segment.speed,
         segment.seed,
         faceswap,
+        steps_total,
+        high_noise_steps,
+        shift_high,
+        shift_low,
+        strength_high,
+        strength_low,
     )
     return workflow
