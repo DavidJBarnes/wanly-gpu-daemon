@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     vae_model: str = "wan_2.1_vae.safetensors"
     unet_high_model: str = "wan2.2_i2v_high_noise_14B_fp16.safetensors"
     unet_low_model: str = "wan2.2_i2v_low_noise_14B_fp16.safetensors"
+    # UNETLoader weight_dtype (nodes 95 high / 96 low). Clarity vs. speed/VRAM lever.
+    #   "default"          — load at native precision (sharpest, most VRAM)
+    #   "fp8_e4m3fn"       — fp8 storage, standard matmul (clean; recommended for baked-fp8 DaSiWa)
+    #   "fp8_e4m3fn_fast"  — fp8 + reduced-precision fast GEMM (fuzziest; Ada/Hopper only — wasted on the 3090)
+    unet_weight_dtype: str = "fp8_e4m3fn"
     lightx2v_lora_high: str = "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
     lightx2v_lora_low: str = "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
     lightx2v_strength_high: float = 2.0  # Strength for high noise lightx2v LoRA (community range: 1.0–5.6)
@@ -32,15 +37,15 @@ class Settings(BaseSettings):
     shift_high: float = 5.0  # ModelSamplingSD3 shift for the high-noise expert (node 104)
     shift_low: float = 5.0  # ModelSamplingSD3 shift for the low-noise expert (node 103)
 
-    # --- Realism profile (de-distilled high-noise) — flip these to A/B against the distilled baseline ---
-    # Setting lightx2v_strength_high = 0.0 removes the distillation LoRA from the high-noise pass entirely
-    # (the builder rewires the graph), letting the high-noise expert run real steps at real CFG.
-    #   lightx2v_strength_high = 0.0
-    #   cfg_high               = 3.5
-    #   steps_total            = 8
-    #   high_noise_steps       = 4
-    #   shift_high             = 7.0
-    #   (low-noise stays distilled: lightx2v_strength_low = 1.0, cfg_low = 1.0, shift_low = 5.0)
+    # --- Realism profile (de-distilled high-noise) — single A/B toggle against the distilled baseline ---
+    # When True, the high-noise expert runs de-distilled: its lightx2v LoRA is dropped (the builder
+    # rewires the graph) and it runs real steps at real CFG, for stronger motion and more natural
+    # facial expression. Low-noise pass stays distilled. The bundle below moves together because
+    # steps_total is shared across both passes, so a single switch is the clean way to flip it.
+    # Distilled baseline: strength_high 2.0, cfg_high 1.0, steps_total 4, high_noise_steps 2, shift_high 5.0
+    # Realism bundle:     strength_high 0.0, cfg_high 3.5, steps_total 8, high_noise_steps 4, shift_high 7.0
+    # Per-segment overrides (from the job) still win over the profile.
+    high_noise_realism: bool = False
 
     # PainterLongVideo motion parameters (identity anchoring)
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion

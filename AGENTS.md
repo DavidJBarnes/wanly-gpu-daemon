@@ -61,13 +61,17 @@ Environment variables (see `daemon/settings.py`):
 
 ## Deployment
 
-Runs as systemd service `wanly` on GPU servers:
-- `2070.zero` (RTX 4070)
-- `3090.zero` (RTX 3090)
+Runs as systemd service `wanly` on self-hosted GPU servers (ZeroTier network):
+- `2070.zero` (RTX 4070) — 192.168.196.x
+- `3090.zero` (RTX 3090) — 192.168.196.172
+
+Servers are accessed directly via SSH over ZeroTier (no AWS/RunPod involved):
 
 ```bash
-sudo systemctl restart wanly
+ssh 3090.zero 'sudo systemctl restart wanly'
 ```
+
+The daemon working directory is `/home/david/projects/wanly-gpu-daemon` with `.env` at that path. Deploy by pulling the git repo and restarting the service.
 
 ## Related Projects
 
