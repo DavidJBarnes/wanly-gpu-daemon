@@ -101,14 +101,14 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
         "class_type": "UNETLoader",
         "inputs": {
             "unet_name": "wan2.2_i2v_high_noise_14B_fp16.safetensors",
-            "weight_dtype": "default",
+            "weight_dtype": "fp8_e4m3fn_fast",
         },
     },
     "96": {
         "class_type": "UNETLoader",
         "inputs": {
             "unet_name": "wan2.2_i2v_low_noise_14B_fp16.safetensors",
-            "weight_dtype": "default",
+            "weight_dtype": "fp8_e4m3fn_fast",
         },
     },
     "97": {
@@ -468,7 +468,19 @@ def build_workflow(
     workflow["90"]["inputs"]["vae_name"] = settings.vae_model
     workflow["95"]["inputs"]["unet_name"] = settings.unet_high_model
     workflow["96"]["inputs"]["unet_name"] = settings.unet_low_model
-    strength_high = segment.lightx2v_strength_high if segment.lightx2v_strength_high is not None else settings.lightx2v_strength_high
+    workflow["95"]["inputs"]["weight_dtype"] = settings.unet_weight_dtype
+    workflow["96"]["inputs"]["weight_dtype"] = settings.unet_weight_dtype
+    # High-noise realism profile: when enabled, the high-noise expert runs de-distilled
+    # (lightx2v dropped, real steps + CFG) for stronger motion and more natural facial
+    # expression. Low-noise pass is untouched. These become the high-noise defaults;
+    # per-segment overrides from the job still take precedence below.
+    if settings.high_noise_realism:
+        d_strength_high, d_cfg_high, d_steps_total, d_high_noise_steps, d_shift_high = 0.0, 3.5, 8, 4, 7.0
+    else:
+        d_strength_high, d_cfg_high = settings.lightx2v_strength_high, settings.cfg_high
+        d_steps_total, d_high_noise_steps, d_shift_high = settings.steps_total, settings.high_noise_steps, settings.shift_high
+
+    strength_high = segment.lightx2v_strength_high if segment.lightx2v_strength_high is not None else d_strength_high
     strength_low = segment.lightx2v_strength_low if segment.lightx2v_strength_low is not None else settings.lightx2v_strength_low
     workflow["101"]["inputs"]["lora_name"] = settings.lightx2v_lora_high
     workflow["101"]["inputs"]["strength_model"] = strength_high
@@ -476,14 +488,14 @@ def build_workflow(
     workflow["102"]["inputs"]["strength_model"] = strength_low
 
     # CFG values for KSampler nodes
-    workflow["86"]["inputs"]["cfg"] = segment.cfg_high if segment.cfg_high is not None else settings.cfg_high
+    workflow["86"]["inputs"]["cfg"] = segment.cfg_high if segment.cfg_high is not None else d_cfg_high
     workflow["85"]["inputs"]["cfg"] = segment.cfg_low if segment.cfg_low is not None else settings.cfg_low
 
-    # Sampler schedule and shift (segment override → settings default)
-    steps_total = segment.steps_total if segment.steps_total is not None else settings.steps_total
-    high_noise_steps = segment.high_noise_steps if segment.high_noise_steps is not None else settings.high_noise_steps
+    # Sampler schedule and shift (segment override → profile/settings default)
+    steps_total = segment.steps_total if segment.steps_total is not None else d_steps_total
+    high_noise_steps = segment.high_noise_steps if segment.high_noise_steps is not None else d_high_noise_steps
     high_noise_steps = max(1, min(high_noise_steps, steps_total - 1))  # clamp to a valid split
-    shift_high = segment.shift_high if segment.shift_high is not None else settings.shift_high
+    shift_high = segment.shift_high if segment.shift_high is not None else d_shift_high
     shift_low = segment.shift_low if segment.shift_low is not None else settings.shift_low
 
     workflow["86"]["inputs"]["steps"] = steps_total
@@ -634,7 +646,7 @@ def build_workflow(
     logger.info(
         "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, speed=%.1fx, seed=%d, faceswap=%s, "
         "steps_total=%d, high_noise_steps=%d, shift_high=%.1f, shift_low=%.1f, "
-        "strength_high=%.2f, strength_low=%.2f",
+        "strength_high=%.2f, strength_low=%.2f, dtype=%s, model=%s | %s",
         segment.width,
         segment.height,
         gen["wan_frames"],
@@ -649,5 +661,8 @@ def build_workflow(
         shift_low,
         strength_high,
         strength_low,
+        settings.unet_weight_dtype,
+        workflow["95"]["inputs"]["unet_name"],
+        workflow["96"]["inputs"]["unet_name"],
     )
     return workflow
