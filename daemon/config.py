@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     # Per-segment overrides (from the job) still win over the profile.
     high_noise_realism: bool = False
 
+    # Faceswap / output quality knobs
+    # ReActor CodeFormer blend: lower lets more of the raw, expressive generated face show
+    # through instead of the smoothed CodeFormer prior (was hardcoded 1.0 → generic faces).
+    faceswap_restore_visibility: float = 0.5
+    # RIFE VFI fast mode: False = cleaner interpolated frames (was hardcoded True).
+    rife_fast_mode: bool = False
+
     # PainterLongVideo motion parameters (identity anchoring)
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
     painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
