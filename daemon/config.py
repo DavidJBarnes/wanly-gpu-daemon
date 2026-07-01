@@ -75,3 +75,50 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# Generation mode presets — each is a FULL profile (model + sampler knobs) selected
+# per job via GenerationMode (wanly-api) and resolved in workflow_builder by segment.mode.
+# identity/expression are the proven walking-5/walking-7 recipes. dasiwa values are
+# best-known and want one confirming test before they're locked.
+_BASE_HIGH = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+_BASE_LOW = "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
+
+MODE_PRESETS: dict[str, dict] = {
+    # Wan22 Base (Character Identity) — fully resident, ~16m, 10/10 identity
+    "identity": {
+        "unet_high_model": _BASE_HIGH, "unet_low_model": _BASE_LOW,
+        "unet_weight_dtype": "fp8_e4m3fn",
+        "lightx2v_strength_high": 0.5, "lightx2v_strength_low": 0.5,
+        "cfg_high": 1.0, "cfg_low": 1.0,
+        "steps_total": 10, "high_noise_steps": 5,
+        "shift_high": 5.0, "shift_low": 5.0,
+    },
+    # Wan22 Base (Identity + Expression) — de-distilled high (lightx2v 0 + real CFG),
+    # model offloads, ~21m, natural motion + expression. Needs the cfg-aware estimate.
+    "expression": {
+        "unet_high_model": _BASE_HIGH, "unet_low_model": _BASE_LOW,
+        "unet_weight_dtype": "fp8_e4m3fn",
+        "lightx2v_strength_high": 0.0, "lightx2v_strength_low": 0.5,
+        "cfg_high": 3.5, "cfg_low": 1.0,
+        "steps_total": 20, "high_noise_steps": 12,
+        "shift_high": 5.0, "shift_low": 5.0,
+    },
+    # DaSiWa (Fast) — baked-distilled remix, ~13m, natural motion / weaker identity.
+    # TODO: confirm values with one test run before treating as final.
+    "dasiwa": {
+        "unet_high_model": "DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors",
+        "unet_low_model": "DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors",
+        "unet_weight_dtype": "fp8_e4m3fn",
+        "lightx2v_strength_high": 0.0, "lightx2v_strength_low": 0.0,
+        "cfg_high": 1.0, "cfg_low": 1.0,
+        "steps_total": 8, "high_noise_steps": 4,
+        "shift_high": 5.0, "shift_low": 5.0,
+    },
+}
+
+
+def get_mode_preset(mode: str | None) -> dict:
+    """Resolve a job's generation mode to its full model+sampler preset.
+    Unknown/legacy modes fall back to the safe resident 'identity' profile."""
+    return MODE_PRESETS.get(mode or "identity", MODE_PRESETS["identity"])

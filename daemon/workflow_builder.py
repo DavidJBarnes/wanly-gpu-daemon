@@ -9,7 +9,7 @@ import logging
 import math
 from typing import Any
 
-from daemon.config import settings
+from daemon.config import settings, get_mode_preset
 from daemon.schemas import SegmentClaim
 from daemon.motion_analyzer import estimate_motion_from_flow
 
@@ -220,7 +220,7 @@ def _calculate_motion_amplitude(
     )
     
     # Clamp to valid range
-    from daemon.config import settings
+    from daemon.config import settings, get_mode_preset
     return max(settings.motion_amplitude_min, min(settings.motion_amplitude_max, estimated))
 
 
@@ -242,7 +242,7 @@ def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
         high_node_id = LORA_NODE_IDS["high"][i]
         low_node_id = LORA_NODE_IDS["low"][i]
 
-        if high_file:
+        if high_file and high_weight != 0:
             workflow[high_node_id] = {
                 "class_type": "LoraLoaderModelOnly",
                 "inputs": {
@@ -255,7 +255,7 @@ def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
             last_high_node = high_node_id
             logger.info("Added LoRA %d high: %s (weight=%.2f)", i + 1, high_file, high_weight)
 
-        if low_file:
+        if low_file and low_weight != 0:
             workflow[low_node_id] = {
                 "class_type": "LoraLoaderModelOnly",
                 "inputs": {
@@ -463,40 +463,38 @@ def build_workflow(
                 segment.index, motion_amplitude, previous_motion_magnitude)
     workflow = copy.deepcopy(WAN_I2V_API_WORKFLOW)
 
-    # Inject model filenames from config
-    workflow["84"]["inputs"]["clip_name"] = settings.clip_model
-    workflow["90"]["inputs"]["vae_name"] = settings.vae_model
-    workflow["95"]["inputs"]["unet_name"] = settings.unet_high_model
-    workflow["96"]["inputs"]["unet_name"] = settings.unet_low_model
-    workflow["95"]["inputs"]["weight_dtype"] = settings.unet_weight_dtype
-    workflow["96"]["inputs"]["weight_dtype"] = settings.unet_weight_dtype
-    # High-noise realism profile: when enabled, the high-noise expert runs de-distilled
-    # (lightx2v dropped, real steps + CFG) for stronger motion and more natural facial
-    # expression. Low-noise pass is untouched. These become the high-noise defaults;
-    # per-segment overrides from the job still take precedence below.
-    if settings.high_noise_realism:
-        d_strength_high, d_cfg_high, d_steps_total, d_high_noise_steps, d_shift_high = 0.0, 3.5, 8, 4, 7.0
-    else:
-        d_strength_high, d_cfg_high = settings.lightx2v_strength_high, settings.cfg_high
-        d_steps_total, d_high_noise_steps, d_shift_high = settings.steps_total, settings.high_noise_steps, settings.shift_high
+    # Resolve the job's generation mode → a full model + sampler preset (MODE_PRESETS).
+    # The mode is set once per job and locked for all its segments.
+    p = get_mode_preset(getattr(segment, "mode", None))
 
-    strength_high = segment.lightx2v_strength_high if segment.lightx2v_strength_high is not None else d_strength_high
-    strength_low = segment.lightx2v_strength_low if segment.lightx2v_strength_low is not None else settings.lightx2v_strength_low
+    # Inject models from the preset. Text encoder on CPU frees ~6.4 GB so the 14B loads
+    # resident on the 3090 (harmless elsewhere).
+    workflow["84"]["inputs"]["clip_name"] = settings.clip_model
+    workflow["84"]["inputs"]["device"] = "cpu"
+    workflow["90"]["inputs"]["vae_name"] = settings.vae_model
+    workflow["95"]["inputs"]["unet_name"] = p["unet_high_model"]
+    workflow["96"]["inputs"]["unet_name"] = p["unet_low_model"]
+    workflow["95"]["inputs"]["weight_dtype"] = p["unet_weight_dtype"]
+    workflow["96"]["inputs"]["weight_dtype"] = p["unet_weight_dtype"]
+
+    # lightx2v strength <= 0 triggers the de-distill rewire below (removes the distillation
+    # LoRA so that expert runs at real steps/CFG — the expression preset relies on this).
+    strength_high = p["lightx2v_strength_high"]
+    strength_low = p["lightx2v_strength_low"]
     workflow["101"]["inputs"]["lora_name"] = settings.lightx2v_lora_high
     workflow["101"]["inputs"]["strength_model"] = strength_high
     workflow["102"]["inputs"]["lora_name"] = settings.lightx2v_lora_low
     workflow["102"]["inputs"]["strength_model"] = strength_low
 
     # CFG values for KSampler nodes
-    workflow["86"]["inputs"]["cfg"] = segment.cfg_high if segment.cfg_high is not None else d_cfg_high
-    workflow["85"]["inputs"]["cfg"] = segment.cfg_low if segment.cfg_low is not None else settings.cfg_low
+    workflow["86"]["inputs"]["cfg"] = p["cfg_high"]
+    workflow["85"]["inputs"]["cfg"] = p["cfg_low"]
 
-    # Sampler schedule and shift (segment override → profile/settings default)
-    steps_total = segment.steps_total if segment.steps_total is not None else d_steps_total
-    high_noise_steps = segment.high_noise_steps if segment.high_noise_steps is not None else d_high_noise_steps
-    high_noise_steps = max(1, min(high_noise_steps, steps_total - 1))  # clamp to a valid split
-    shift_high = segment.shift_high if segment.shift_high is not None else d_shift_high
-    shift_low = segment.shift_low if segment.shift_low is not None else settings.shift_low
+    # Sampler schedule and shift from the preset
+    steps_total = p["steps_total"]
+    high_noise_steps = max(1, min(p["high_noise_steps"], steps_total - 1))  # clamp to a valid split
+    shift_high = p["shift_high"]
+    shift_low = p["shift_low"]
 
     workflow["86"]["inputs"]["steps"] = steps_total
     workflow["86"]["inputs"]["start_at_step"] = 0
