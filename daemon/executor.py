@@ -207,7 +207,7 @@ async def _execute_faceswap_reprocess(
 
         # Step 4: Wait for execution
         await progress.log("[4/5] Waiting for faceswap execution...")
-        await comfyui.monitor_execution(prompt_id, client_id)
+        await comfyui.monitor_execution(prompt_id, client_id, progress)
         await progress.log("[4/5] Execution complete")
 
         # Step 5: Download output, extract last frame, upload
@@ -364,7 +364,7 @@ async def execute_segment(
         # Step 5: Wait for ComfyUI execution
         t0 = time.monotonic()
         await progress.log("[5/7] Waiting for ComfyUI execution...")
-        await comfyui.monitor_execution(prompt_id, client_id)
+        await comfyui.monitor_execution(prompt_id, client_id, progress)
         await progress.log("[5/7] Execution complete")
         step_times.append(("execute", time.monotonic() - t0))
 
