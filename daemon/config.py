@@ -115,6 +115,19 @@ MODE_PRESETS: dict[str, dict] = {
         "steps_total": 8, "high_noise_steps": 4,
         "shift_high": 5.0, "shift_low": 5.0,
     },
+    # Wan22 Remix (Enhanced Motions) — remix V2.1: motion/pose baked into the weights, so
+    # NO high-expert motion LoRAs are stacked (→ less identity drag on the character LoRA).
+    # Baked-distilled (lightning) like dasiwa → cfg 1, low steps, external lightx2v off.
+    # TODO: confirm values with one test run. V3.0 is a heavier-distilled 27GB upgrade (deferred).
+    "remix": {
+        "unet_high_model": "wan22RemixT2VI2V_i2vHighV21.safetensors",
+        "unet_low_model": "wan22RemixT2VI2V_i2vLowV21.safetensors",
+        "unet_weight_dtype": "fp8_e4m3fn",
+        "lightx2v_strength_high": 0.0, "lightx2v_strength_low": 0.0,
+        "cfg_high": 1.0, "cfg_low": 1.0,
+        "steps_total": 8, "high_noise_steps": 4,
+        "shift_high": 5.0, "shift_low": 5.0,
+    },
 }
 
 
