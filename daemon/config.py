@@ -105,7 +105,7 @@ MODE_PRESETS: dict[str, dict] = {
         "shift_high": 5.0, "shift_low": 5.0,
     },
     # DaSiWa (Fast) — baked-distilled remix, ~13m, natural motion / weaker identity.
-    # TODO: confirm values with one test run before treating as final.
+    # Confirmed 2026-07-01 (first preset guess ran clean + looked great).
     "dasiwa": {
         "unet_high_model": "DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors",
         "unet_low_model": "DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors",
