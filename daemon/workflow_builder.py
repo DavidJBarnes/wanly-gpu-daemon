@@ -467,6 +467,15 @@ def build_workflow(
     # The mode is set once per job and locked for all its segments.
     p = get_mode_preset(getattr(segment, "mode", None))
 
+    # Per-job memory hint for the 3090's cfg-aware model_base patch (harmless where that
+    # patch isn't applied, e.g. RunPod): cfg>1 (expression) → 0.015 so the model offloads
+    # to fit the CFG-doubled activation; cfg<=1 (identity/dasiwa) → 0.003 = resident.
+    try:
+        with open("/tmp/wanly_estimate", "w") as _ef:
+            _ef.write("0.015" if p["cfg_high"] > 1 else "0.003")
+    except Exception:
+        pass
+
     # Inject models from the preset. Text encoder on CPU frees ~6.4 GB so the 14B loads
     # resident on the 3090 (harmless elsewhere).
     workflow["84"]["inputs"]["clip_name"] = settings.clip_model
