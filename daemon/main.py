@@ -158,6 +158,7 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
 async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event):
     """Poll the queue for segments and execute them one at a time."""
     poll_count = 0
+    animate_cap: list = [None]   # Final Cut (WanAnimateToVideo) capability — checked once when ComfyUI is up
     while not shutdown_event.is_set():
         try:
             await asyncio.wait_for(
@@ -189,8 +190,12 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
             poll_count += 1
             continue
 
+        if animate_cap[0] is None:
+            animate_cap[0] = await comfyui.has_node("WanAnimateToVideo")
+            logger.info("Final Cut (Animate) capability: %s", animate_cap[0])
+
         try:
-            segment = await queue.claim_next(worker_id, friendly_name_ref[0])
+            segment = await queue.claim_next(worker_id, friendly_name_ref[0], supports_animate=bool(animate_cap[0]))
         except Exception as e:
             logger.error("Poll failed: %s", e)
             continue

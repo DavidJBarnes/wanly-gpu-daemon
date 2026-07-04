@@ -30,7 +30,7 @@ from daemon.motion_analyzer import measure_motion_magnitude
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
-from daemon.workflow_builder import build_workflow, build_faceswap_workflow
+from daemon.workflow_builder import build_workflow, build_faceswap_workflow, build_animate_workflow, animate_memory_estimate
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +253,95 @@ async def _execute_faceswap_reprocess(
         )
 
 
+async def _execute_animate(
+    segment: SegmentClaim,
+    comfyui: ComfyUIClient,
+    queue: QueueClient,
+) -> None:
+    """Final Cut: re-render an existing (finalized) video through Wan 2.2 Animate.
+
+    Driving video = segment.output_path (source's finalized video); character reference =
+    segment.start_image. Mirrors the faceswap-reprocess flow but runs the Animate graph.
+    """
+    logger.info(
+        "=== Final Cut (animate) segment %d (job %s) === mode=%s preset=%s",
+        segment.index, str(segment.job_id)[:8],
+        segment.animate_mode or "mix", segment.animate_preset or "fast",
+    )
+    progress = ProgressLog(segment.id, queue)
+    segment_start = time.monotonic()
+
+    try:
+        if not segment.output_path:
+            raise RuntimeError("No output_path on segment — Final Cut needs the source's finalized video")
+
+        # Step 1: download the driving (source finalized) video + upload to ComfyUI
+        await progress.log("[1/5] Downloading source video...")
+        video_data = await _download_with_retry(
+            lambda: queue.download_file(segment.output_path), "driving_video"
+        )
+        driving_filename = await comfyui.upload_video(video_data, f"finalcut_driving_{segment.id}.mp4")
+
+        # Step 2: resolve the character reference image + ensure LoRA available
+        reference_filename = await _resolve_start_image(segment, comfyui, queue)
+        if not reference_filename:
+            raise RuntimeError("No reference image resolved for Final Cut")
+        if segment.loras:
+            await ensure_loras_available(segment.loras, queue)
+        await progress.log("[2/5] Files ready in ComfyUI")
+
+        # Step 3: memory estimate for the 3090 model_base patch, then build + submit
+        try:
+            with open("/tmp/wanly_estimate", "w") as f:
+                f.write(animate_memory_estimate(segment))
+        except Exception:
+            logger.warning("Could not write /tmp/wanly_estimate (non-fatal)")
+        workflow = build_animate_workflow(segment, driving_filename, reference_filename)
+        prompt_id, client_id = await comfyui.submit_workflow(workflow)
+        await progress.log(f"[3/5] Submitted (prompt_id={prompt_id[:8]})")
+
+        # Step 4: wait (chunked Animate — can be several minutes)
+        await progress.log("[4/5] Waiting for Animate execution...")
+        await comfyui.monitor_execution(prompt_id, client_id, progress)
+
+        # Step 5: download output, extract last frame, upload
+        await progress.log("[5/5] Downloading result and uploading...")
+        history = await comfyui.get_history(prompt_id)
+        video_info = comfyui.find_video_output(history)
+        if not video_info:
+            raise RuntimeError("No video output found in ComfyUI history")
+        result_data = await comfyui.download_output(
+            filename=video_info["filename"],
+            subfolder=video_info.get("subfolder", ""),
+            output_type=video_info.get("type", "output"),
+        )
+        last_frame_data = await _extract_last_frame(result_data)
+        await queue.upload_segment_output(
+            segment.id, result_data, last_frame_data, SegmentResult(status="completed")
+        )
+        logger.info("Final Cut segment %d complete in %.1fs", segment.index, time.monotonic() - segment_start)
+
+    except ComfyUIExecutionError as e:
+        error_msg = f"ComfyUI error: {e}"
+        if e.node_id:
+            error_msg += f" (node {e.node_id} [{e.node_type}])"
+        logger.error(error_msg)
+        if e.traceback:
+            logger.error("Traceback:\n%s", e.traceback)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        logger.exception("Final Cut segment %s failed", segment.id)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+
+
 async def execute_segment(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -261,6 +350,8 @@ async def execute_segment(
     """Execute a single segment end-to-end."""
     if segment.reprocess_type == "faceswap":
         return await _execute_faceswap_reprocess(segment, comfyui, queue)
+    if segment.reprocess_type == "animate":
+        return await _execute_animate(segment, comfyui, queue)
 
     lora_names = ", ".join(l.high_file or l.low_file or "?" for l in (segment.loras or []))
 

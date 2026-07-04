@@ -673,3 +673,129 @@ def build_workflow(
         workflow["96"]["inputs"]["unet_name"],
     )
     return workflow
+
+
+# --- Final Cut / Wan 2.2 Animate -----------------------------------------------
+# Ported from the validated animate.py CLI graph (move/mix + chunk-chaining).
+_ANIMATE_MODEL = "Wan2_2-Animate-14B_fp8_e4m3fn_scaled_KJ.safetensors"
+_ANIMATE_LIGHTX2V = "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"
+_ANIMATE_RELIGHT = "WanAnimate_relight_lora_fp16.safetensors"
+_ANIMATE_PRESET_RES = {
+    "fast":    {"portrait": (480, 832),  "landscape": (832, 480)},
+    "highres": {"portrait": (720, 1280), "landscape": (1280, 720)},
+}
+_ANIMATE_PRESET_STEPS = {"fast": 6, "highres": 8}
+_ANIMATE_NEG = "blurry, distorted, deformed, plastic skin, low quality, watermark, text, extra limbs"
+
+
+def animate_memory_estimate(segment: SegmentClaim) -> str:
+    """Per-run memory-estimate constant for the 3090 model_base patch (/tmp/wanly_estimate)."""
+    preset = (segment.animate_preset or "fast").lower()
+    W, H = _ANIMATE_PRESET_RES.get(preset, _ANIMATE_PRESET_RES["fast"])["portrait"]
+    return "0.015" if (W * H > 480 * 832) else "0.003"
+
+
+def build_animate_workflow(segment: SegmentClaim, driving_filename: str, reference_filename: str) -> dict:
+    """Final Cut: Wan 2.2 Animate re-render of a driving video with a character reference.
+
+    driving_filename / reference_filename are ComfyUI-local (already uploaded). Output dims come
+    from the preset + the driving orientation (source job w/h); chunk count covers the full clip.
+    """
+    mode = (segment.animate_mode or "mix").lower()
+    preset = (segment.animate_preset or "fast").lower()
+    orient = "landscape" if segment.width > segment.height else "portrait"
+    W, H = _ANIMATE_PRESET_RES.get(preset, _ANIMATE_PRESET_RES["fast"])[orient]
+    steps = _ANIMATE_PRESET_STEPS.get(preset, 6)
+    L, OVERLAP = 77, 5
+    target = max(L, int((segment.duration_seconds or 5.0) * 16))
+    stride = L - OVERLAP
+    N = max(1, 1 + -(-max(0, target - L) // stride))   # ceil: chunks to cover the driving clip
+    frame_cap = L + (N - 1) * stride + 4
+
+    char_lora = None
+    for l in (segment.loras or []):
+        f = l.low_file or l.high_file
+        if f:
+            char_lora = (f, l.low_weight or 0.7)
+            break
+
+    wf: dict[str, Any] = {}
+    def n(i, ct, **inp):
+        wf[str(i)] = {"class_type": ct, "inputs": inp}
+
+    n(1, "VHS_LoadVideo", video=driving_filename, force_rate=16.0, custom_width=0, custom_height=0,
+      frame_load_cap=frame_cap, skip_first_frames=0, select_every_nth=1)
+    n(2, "ImageScale", image=["1", 0], upscale_method="bilinear", width=W, height=H, crop="center")
+    n(4, "OnnxDetectionModelLoader", vitpose_model="vitpose-l-wholebody.onnx",
+      yolo_model="yolov10m.onnx", onnx_device="CUDAExecutionProvider")
+    n(5, "PoseAndFaceDetection", model=["4", 0], images=["2", 0], width=W, height=H, face_padding=0)
+    n(6, "DrawViTPose", pose_data=["5", 0], width=W, height=H, retarget_padding=16,
+      body_stick_width=-1, hand_stick_width=-1, draw_head=True)
+    n(7, "LoadImage", image=reference_filename)
+    n(8, "ImageScale", image=["7", 0], upscale_method="bilinear", width=W, height=H, crop="center")
+    n(9, "CLIPVisionLoader", clip_name="clip_vision_h.safetensors")
+    n(10, "CLIPVisionEncode", clip_vision=["9", 0], image=["8", 0], crop="center")
+    n(11, "CLIPLoader", clip_name="umt5_xxl_fp8_e4m3fn_scaled.safetensors", type="wan")
+    n(12, "CLIPTextEncode", clip=["11", 0], text=segment.prompt)
+    n(13, "CLIPTextEncode", clip=["11", 0], text=(segment.negative_prompt or _ANIMATE_NEG))
+    n(14, "VAELoader", vae_name="wan_2.1_vae.safetensors")
+    n(15, "UNETLoader", unet_name=_ANIMATE_MODEL, weight_dtype="default")
+    model = ["15", 0]
+    n(16, "LoraLoaderModelOnly", model=model, lora_name=_ANIMATE_LIGHTX2V, strength_model=1.0)
+    model = ["16", 0]
+    if mode == "mix":
+        n(24, "LoraLoaderModelOnly", model=model, lora_name=_ANIMATE_RELIGHT, strength_model=1.0)
+        model = ["24", 0]
+    if char_lora:
+        n(23, "LoraLoaderModelOnly", model=model, lora_name=char_lora[0], strength_model=char_lora[1])
+        model = ["23", 0]
+    n(17, "ModelSamplingSD3", model=model, shift=8.0)
+
+    mix_bg = mix_mask = None
+    if mode == "mix":
+        n(30, "DownloadAndLoadSAM2Model", model="sam2.1_hiera_base_plus.safetensors",
+          segmentor="video", device="cuda", precision="fp16")
+        n(31, "Sam2Segmentation", sam2_model=["30", 0], image=["2", 0], keep_model_loaded=False, bboxes=["5", 3])
+        n(32, "GrowMaskWithBlur", mask=["31", 0], expand=6, incremental_expandrate=0.0,
+          tapered_corners=True, flip_input=False, blur_radius=3.0, lerp_alpha=1.0, decay_factor=1.0, fill_holes=True)
+        n(35, "BlockifyMask", masks=["32", 0], block_size=32, device="gpu")
+        n(36, "DrawMaskOnImage", image=["2", 0], mask=["35", 0], color="0, 0, 0", device="gpu")
+        mix_bg, mix_mask = ["36", 0], ["35", 0]
+
+    chunk_imgs, prev_decode, prev_offset = [], None, None
+    for ci in range(N):
+        w = 100 + ci * 10
+        anim = dict(positive=["12", 0], negative=["13", 0], vae=["14", 0], width=W, height=H, length=L,
+                    batch_size=1, continue_motion_max_frames=OVERLAP,
+                    clip_vision_output=["10", 0], reference_image=["8", 0],
+                    face_video=["5", 1], pose_video=["6", 0])
+        if mix_bg is not None:
+            anim["background_video"] = mix_bg
+            anim["character_mask"] = mix_mask
+        if ci == 0:
+            anim["video_frame_offset"] = 0
+        else:
+            anim["video_frame_offset"] = prev_offset
+            anim["continue_motion"] = prev_decode
+        n(w, "WanAnimateToVideo", **anim)
+        n(w + 1, "KSampler", model=["17", 0], positive=[str(w), 0], negative=[str(w), 1], latent_image=[str(w), 2],
+          seed=segment.seed, steps=steps, cfg=1.0, sampler_name="euler", scheduler="simple", denoise=1.0)
+        n(w + 2, "TrimVideoLatent", samples=[str(w + 1), 0], trim_amount=[str(w), 3])
+        n(w + 3, "VAEDecode", samples=[str(w + 2), 0], vae=["14", 0])
+        n(w + 4, "ImageFromBatch", image=[str(w + 3), 0], batch_index=[str(w), 4], length=4096)
+        chunk_imgs.append([str(w + 4), 0])
+        prev_decode, prev_offset = [str(w + 3), 0], [str(w), 5]
+
+    if len(chunk_imgs) == 1:
+        final_imgs = chunk_imgs[0]
+    else:
+        acc, cid = chunk_imgs[0], 900
+        for img in chunk_imgs[1:]:
+            n(cid, "ImageBatch", image1=acc, image2=img)
+            acc = [str(cid), 0]
+            cid += 1
+        final_imgs = acc
+
+    n(22, "VHS_VideoCombine", images=final_imgs, frame_rate=16, loop_count=0,
+      filename_prefix=f"finalcut_{segment.id}", format="video/h264-mp4", pingpong=False, save_output=True)
+    return wf

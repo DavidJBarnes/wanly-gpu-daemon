@@ -42,6 +42,14 @@ class ComfyUIClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         self.http = httpx.AsyncClient(base_url=self.base_url, timeout=30, headers=headers)
 
+    async def has_node(self, node_type: str) -> bool:
+        """True if ComfyUI has the given node type registered (capability check)."""
+        try:
+            r = await self.http.get(f"/object_info/{node_type}")
+            return r.status_code == 200
+        except Exception:
+            return False
+
     async def check_health(self) -> bool:
         """Check if ComfyUI is running via GET /system_stats."""
         try:

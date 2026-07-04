@@ -42,6 +42,8 @@ class SegmentClaim(BaseModel):
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
+    animate_mode: Optional[str] = None      # Final Cut: Wan Animate mode (move/mix)
+    animate_preset: Optional[str] = None    # Final Cut: preset (fast/highres)
     width: int
     height: int
     fps: int
