@@ -290,7 +290,8 @@ async def _execute_animate(
             await ensure_loras_available(segment.loras, queue)
         await progress.log("[2/5] Files ready in ComfyUI")
 
-        # Step 3: memory estimate for the 3090 model_base patch, then build + submit
+        # Step 3: clear VRAM (avoid OOM from a prior job's residue), set memory estimate, build + submit
+        await comfyui.free_memory()
         try:
             with open("/tmp/wanly_estimate", "w") as f:
                 f.write(animate_memory_estimate(segment))
@@ -322,6 +323,7 @@ async def _execute_animate(
         logger.info("Final Cut segment %d complete in %.1fs", segment.index, time.monotonic() - segment_start)
 
     except ComfyUIExecutionError as e:
+        await comfyui.free_memory()   # release VRAM so an OOM'd animate job can't poison the next job
         error_msg = f"ComfyUI error: {e}"
         if e.node_id:
             error_msg += f" (node {e.node_id} [{e.node_type}])"
@@ -334,6 +336,7 @@ async def _execute_animate(
         )
 
     except Exception as e:
+        await comfyui.free_memory()   # release VRAM on any animate failure
         error_msg = f"{type(e).__name__}: {e}"
         logger.exception("Final Cut segment %s failed", segment.id)
         await queue.update_segment(

@@ -50,6 +50,13 @@ class ComfyUIClient:
         except Exception:
             return False
 
+    async def free_memory(self, unload_models: bool = True) -> None:
+        """Free ComfyUI VRAM (unload models + clear cache). Best-effort — avoids OOM cascades."""
+        try:
+            await self.http.post("/free", json={"unload_models": unload_models, "free_memory": True})
+        except Exception as e:
+            logger.warning("ComfyUI /free failed (non-fatal): %s", e)
+
     async def check_health(self) -> bool:
         """Check if ComfyUI is running via GET /system_stats."""
         try:
