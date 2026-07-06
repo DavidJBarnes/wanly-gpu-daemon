@@ -694,12 +694,11 @@ _ANIMATE_NEG = "blurry, distorted, deformed, plastic skin, low quality, watermar
 def animate_memory_estimate(segment: SegmentClaim) -> str:
     """Per-run memory-estimate constant for the 3090 model_base patch (/tmp/wanly_estimate).
 
-    Mix mode (14B Animate + SAM2 + relight LoRA) and high-res are memory-heavy, so use the
-    offload estimate (0.015) to avoid OOM; plain move/fast fits resident (0.003).
+    Final Cut is a heavy quality pass: the 14B Animate model plus full-video pose/face conditioning
+    held in VRAM. Resident (0.003) only survives short clips and OOMs on longer ones (move OR mix),
+    so always offload (0.015). Speed cost is acceptable for a polish pass — Draft mode is the fast path.
     """
-    mode = (segment.animate_mode or "mix").lower()
-    preset = (segment.animate_preset or "fast").lower()
-    return "0.015" if (mode == "mix" or preset == "highres") else "0.003"
+    return "0.015"
 
 
 def build_animate_workflow(segment: SegmentClaim, driving_filename: str, reference_filename: str) -> dict:
