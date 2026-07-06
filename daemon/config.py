@@ -137,7 +137,7 @@ MODE_PRESETS: dict[str, dict] = {
         "unet_weight_dtype": "fp8_e4m3fn",
         "lightx2v_strength_high": 0.0, "lightx2v_strength_low": 0.0,
         "cfg_high": 1.0, "cfg_low": 1.0,
-        "steps_total": 6, "high_noise_steps": 3,
+        "steps_total": 4, "high_noise_steps": 2,
         "shift_high": 5.0, "shift_low": 5.0,
     },
 }
