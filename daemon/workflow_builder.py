@@ -714,10 +714,19 @@ def build_animate_workflow(segment: SegmentClaim, driving_filename: str, referen
     W, H = _ANIMATE_PRESET_RES.get(preset, _ANIMATE_PRESET_RES["fast"])[orient]
     steps = _ANIMATE_PRESET_STEPS.get(preset, 6)
     L, OVERLAP = 77, 5
-    target = max(L, int((segment.duration_seconds or 5.0) * 16))
     stride = L - OVERLAP
-    N = max(1, 1 + -(-max(0, target - L) // stride))   # ceil: chunks to cover the driving clip
-    frame_cap = L + (N - 1) * stride + 4
+    driving_frames = max(4, int((segment.duration_seconds or 5.0) * 16))
+
+    def _len4n1(nf):  # nearest valid Wan length (4k+1), clamped to [5, L]
+        return max(5, min(L, 4 * round((max(5, min(L, nf)) - 1) / 4) + 1))
+
+    # Size chunks to the driver so we don't over-generate frozen padding past its end.
+    if driving_frames <= L:
+        N, last_len = 1, _len4n1(driving_frames)
+    else:
+        N = max(1, 1 + round((driving_frames - L) / stride))   # round, not ceil
+        last_len = _len4n1(L - max(0, (L + (N - 1) * stride) - driving_frames))
+    frame_cap = driving_frames + 4
 
     char_lora = None
     for l in (segment.loras or []):
@@ -772,7 +781,8 @@ def build_animate_workflow(segment: SegmentClaim, driving_filename: str, referen
     chunk_imgs, prev_decode, prev_offset = [], None, None
     for ci in range(N):
         w = 100 + ci * 10
-        anim = dict(positive=["12", 0], negative=["13", 0], vae=["14", 0], width=W, height=H, length=L,
+        anim = dict(positive=["12", 0], negative=["13", 0], vae=["14", 0], width=W, height=H,
+                    length=(last_len if ci == N - 1 else L),
                     batch_size=1, continue_motion_max_frames=OVERLAP,
                     clip_vision_output=["10", 0], reference_image=["8", 0],
                     face_video=["5", 1], pose_video=["6", 0])
