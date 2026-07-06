@@ -470,9 +470,12 @@ def build_workflow(
     # Per-job memory hint for the 3090's cfg-aware model_base patch (harmless where that
     # patch isn't applied, e.g. RunPod): cfg>1 (expression) → 0.015 so the model offloads
     # to fit the CFG-doubled activation; cfg<=1 (identity/dasiwa) → 0.003 = resident.
+    # Safety: a high-res draft (meant to be a small driver) → offload so it can't OOM/cascade.
     try:
+        _big = segment.width * segment.height > 480 * 832
+        _offload = p["cfg_high"] > 1 or (getattr(segment, "mode", None) == "draft" and _big)
         with open("/tmp/wanly_estimate", "w") as _ef:
-            _ef.write("0.015" if p["cfg_high"] > 1 else "0.003")
+            _ef.write("0.015" if _offload else "0.003")
     except Exception:
         pass
 
