@@ -689,10 +689,14 @@ _ANIMATE_NEG = "blurry, distorted, deformed, plastic skin, low quality, watermar
 
 
 def animate_memory_estimate(segment: SegmentClaim) -> str:
-    """Per-run memory-estimate constant for the 3090 model_base patch (/tmp/wanly_estimate)."""
+    """Per-run memory-estimate constant for the 3090 model_base patch (/tmp/wanly_estimate).
+
+    Mix mode (14B Animate + SAM2 + relight LoRA) and high-res are memory-heavy, so use the
+    offload estimate (0.015) to avoid OOM; plain move/fast fits resident (0.003).
+    """
+    mode = (segment.animate_mode or "mix").lower()
     preset = (segment.animate_preset or "fast").lower()
-    W, H = _ANIMATE_PRESET_RES.get(preset, _ANIMATE_PRESET_RES["fast"])["portrait"]
-    return "0.015" if (W * H > 480 * 832) else "0.003"
+    return "0.015" if (mode == "mix" or preset == "highres") else "0.003"
 
 
 def build_animate_workflow(segment: SegmentClaim, driving_filename: str, reference_filename: str) -> dict:
