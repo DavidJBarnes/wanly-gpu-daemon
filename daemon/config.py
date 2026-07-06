@@ -128,6 +128,18 @@ MODE_PRESETS: dict[str, dict] = {
         "steps_total": 8, "high_noise_steps": 4,
         "shift_high": 5.0, "shift_low": 5.0,
     },
+    # Draft / Driver — ultra-fast stage-1 for the Final Cut pipeline. Motion is all that matters
+    # (Animate re-renders identity/face/scene), so DaSiWa's distilled model at minimal steps.
+    # Pair with low resolution + 16fps + no LoRA/faceswap for the full ~3x speedup.
+    "draft": {
+        "unet_high_model": "DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors",
+        "unet_low_model": "DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors",
+        "unet_weight_dtype": "fp8_e4m3fn",
+        "lightx2v_strength_high": 0.0, "lightx2v_strength_low": 0.0,
+        "cfg_high": 1.0, "cfg_low": 1.0,
+        "steps_total": 6, "high_noise_steps": 3,
+        "shift_high": 5.0, "shift_low": 5.0,
+    },
 }
 
 
