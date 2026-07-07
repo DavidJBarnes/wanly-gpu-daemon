@@ -464,6 +464,24 @@ def build_workflow(
     workflow["86"]["inputs"]["cfg"] = segment.cfg_high if segment.cfg_high is not None else settings.cfg_high
     workflow["85"]["inputs"]["cfg"] = segment.cfg_low if segment.cfg_low is not None else settings.cfg_low
 
+    # Sampler step schedule (per-job override). Both KSamplers share the total length; the
+    # boundary splits it: high (86) runs [0, high_noise_steps], low (85) runs [high_noise_steps, total].
+    steps_total = segment.steps_total if segment.steps_total is not None else settings.steps_total
+    high_noise_steps = segment.high_noise_steps if segment.high_noise_steps is not None else settings.high_noise_steps
+    workflow["86"]["inputs"]["steps"] = steps_total
+    workflow["86"]["inputs"]["start_at_step"] = 0
+    workflow["86"]["inputs"]["end_at_step"] = high_noise_steps
+    workflow["85"]["inputs"]["steps"] = steps_total
+    workflow["85"]["inputs"]["start_at_step"] = high_noise_steps
+    workflow["85"]["inputs"]["end_at_step"] = steps_total
+
+    # De-distill bypass: when a lightx2v strength is 0, drop that Lightning LoRA from the graph
+    # (repoint its consumer past it) so the expert runs raw and CFG > 1 does real work.
+    if workflow["101"]["inputs"]["strength_model"] == 0:
+        workflow["104"]["inputs"]["model"] = workflow["101"]["inputs"]["model"]  # high chain skips node 101
+    if workflow["102"]["inputs"]["strength_model"] == 0:
+        workflow["103"]["inputs"]["model"] = workflow["102"]["inputs"]["model"]  # low chain skips node 102
+
     # Negative prompt
     if segment.negative_prompt is not None:
         workflow["89"]["inputs"]["text"] = segment.negative_prompt

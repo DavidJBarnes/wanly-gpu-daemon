@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     lightx2v_strength_low: float = 1.0  # Strength for low noise lightx2v LoRA (community range: 1.0–2.0)
     cfg_high: float = 1.0  # CFG for high noise KSampler (node 86)
     cfg_low: float = 1.0  # CFG for low noise KSampler (node 85)
+    # Sampler schedule (distilled default = 4/2). Per-job override lets you de-distill:
+    # pass lightx2v strength 0 (builder drops the Lightning LoRA) + raise cfg + raise steps.
+    steps_total: int = 4  # total KSamplerAdvanced schedule length (both passes share it)
+    high_noise_steps: int = 2  # boundary: high runs [0, high_noise_steps], low runs [high_noise_steps, steps_total]
     clip_vision_model: str = "clip_vision_h.safetensors"
 
     # PainterLongVideo motion parameters (identity anchoring)
