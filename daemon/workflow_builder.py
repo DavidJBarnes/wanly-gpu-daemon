@@ -9,11 +9,14 @@ import logging
 import math
 from typing import Any
 
-from daemon.config import settings, get_mode_preset
+from daemon.config import settings
 from daemon.schemas import SegmentClaim
 from daemon.motion_analyzer import estimate_motion_from_flow
 
 logger = logging.getLogger(__name__)
+
+# Generation is always at 15fps; RIFE interpolation brings it to target fps.
+GENERATION_FPS = 15
 
 # Node IDs for dynamically added user LoRA pairs (up to 3).
 LORA_NODE_IDS = {
@@ -101,14 +104,14 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
         "class_type": "UNETLoader",
         "inputs": {
             "unet_name": "wan2.2_i2v_high_noise_14B_fp16.safetensors",
-            "weight_dtype": "fp8_e4m3fn_fast",
+            "weight_dtype": "default",
         },
     },
     "96": {
         "class_type": "UNETLoader",
         "inputs": {
             "unet_name": "wan2.2_i2v_low_noise_14B_fp16.safetensors",
-            "weight_dtype": "fp8_e4m3fn_fast",
+            "weight_dtype": "default",
         },
     },
     "97": {
@@ -164,20 +167,12 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
 }
 
 
-def _snap_to_4n_plus_1(frames: int) -> int:
-    """Snap a frame count to the nearest 4n+1 value (Wan VAE temporal stride = 4), min 5."""
-    return max(4 * math.floor((frames - 1) / 4 + 0.5) + 1, 5)
-
-
 def _calculate_generation_params(target_fps: int, duration_sec: float, speed: float = 1.0) -> dict[str, Any]:
-    gen_fps = settings.generation_fps
     speed = max(speed, 0.25)
     # More speed = more WAN frames = more motion packed into the same duration.
-    wan_frames = max(math.ceil(duration_sec * gen_fps * speed), 5)
-    # Wan VAE is 4x temporal; off-grid lengths cause end-of-clip artifacts.
-    wan_frames = _snap_to_4n_plus_1(wan_frames)
+    wan_frames = max(math.ceil(duration_sec * GENERATION_FPS * speed), 5)
     # RIFE smoothing based on target fps (2x for 30fps, 4x for 60fps).
-    rife_multiplier = max(round(target_fps / gen_fps), 1)
+    rife_multiplier = max(target_fps // GENERATION_FPS, 1)
     total_frames = wan_frames * rife_multiplier
     # Output fps adjusts so all frames fit into the requested duration.
     output_fps = round(total_frames / duration_sec)
@@ -220,7 +215,7 @@ def _calculate_motion_amplitude(
     )
     
     # Clamp to valid range
-    from daemon.config import settings, get_mode_preset
+    from daemon.config import settings
     return max(settings.motion_amplitude_min, min(settings.motion_amplitude_max, estimated))
 
 
@@ -242,7 +237,7 @@ def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
         high_node_id = LORA_NODE_IDS["high"][i]
         low_node_id = LORA_NODE_IDS["low"][i]
 
-        if high_file and high_weight != 0:
+        if high_file:
             workflow[high_node_id] = {
                 "class_type": "LoraLoaderModelOnly",
                 "inputs": {
@@ -255,7 +250,7 @@ def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
             last_high_node = high_node_id
             logger.info("Added LoRA %d high: %s (weight=%.2f)", i + 1, high_file, high_weight)
 
-        if low_file and low_weight != 0:
+        if low_file:
             workflow[low_node_id] = {
                 "class_type": "LoraLoaderModelOnly",
                 "inputs": {
@@ -310,7 +305,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim, input_node: str = "87")
                 "swap_model": "inswapper_128.onnx",
                 "facedetection": "retinaface_resnet50",
                 "face_restore_model": "codeformer-v0.1.0.pth",
-                "face_restore_visibility": settings.faceswap_restore_visibility,
+                "face_restore_visibility": 1.0,
                 "codeformer_weight": 0.8,
                 "input_image": [input_node, 0],
                 "source_image": ["188", 0],
@@ -354,7 +349,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim, input_node: str = "87")
 
 
 def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
-    """Build a faceswap-only workflow: load video at generation fps → faceswap → RIFE → encode.
+    """Build a faceswap-only workflow: load video at 15fps → faceswap → RIFE → encode.
 
     Matches the normal generation pipeline: faceswap on native-rate frames,
     then RIFE interpolates back to target fps.
@@ -366,14 +361,14 @@ def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
         "class_type": "VHS_LoadVideo",
         "inputs": {
             "video": video_filename,
-            "force_rate": float(settings.generation_fps),
+            "force_rate": float(GENERATION_FPS),
             "custom_width": 0,
             "custom_height": 0,
             "frame_load_cap": 0,
             "skip_first_frames": 0,
             "select_every_nth": 1,
         },
-        "_meta": {"title": f"Load Existing Video @ {settings.generation_fps}fps"},
+        "_meta": {"title": "Load Existing Video @ 15fps"},
     }
 
     _add_faceswap(workflow, segment, input_node="400")
@@ -385,7 +380,7 @@ def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
             "ckpt_name": "rife49.pth",
             "clear_cache_after_n_frames": 10,
             "multiplier": rife_multiplier,
-            "fast_mode": settings.rife_fast_mode,
+            "fast_mode": True,
             "ensemble": True,
             "scale_factor": 1.0,
             "dtype": "float16",
@@ -439,17 +434,9 @@ def build_workflow(
             to PainterLongVideo with dual-reference inputs.
             identity for characters. PainterLongVideo only accepts a single
             clip_vision_output, so multi-frame reference frames are not used.
-        previous_motion_magnitude: Measured motion magnitude from previous
-            segment (px/frame). Used to auto-adjust motion_amplitude for
+        previous_motion_magnitude: Measured motion magnitude from previous 
+            segment (px/frame). Used to auto-adjust motion_amplitude for 
             consistent motion across segments.
-
-    Sampler knobs (lightx2v strengths, cfg, steps_total, high_noise_steps,
-    shift_high, shift_low) resolve as: per-segment override (if not None) →
-    `settings.<field>` default. When a resolved lightx2v strength is <= 0,
-    the corresponding distillation LoRA node (101 high / 102 low) is removed
-    and its upstream model (bare UNET or end of the user-LoRA chain) is
-    spliced directly into the ModelSamplingSD3 node (104 / 103), letting that
-    expert run de-distilled at real steps and real CFG.
     """
     gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
     
@@ -463,59 +450,19 @@ def build_workflow(
                 segment.index, motion_amplitude, previous_motion_magnitude)
     workflow = copy.deepcopy(WAN_I2V_API_WORKFLOW)
 
-    # Resolve the job's generation mode → a full model + sampler preset (MODE_PRESETS).
-    # The mode is set once per job and locked for all its segments.
-    p = get_mode_preset(getattr(segment, "mode", None))
-
-    # Per-job memory hint for the 3090's cfg-aware model_base patch (harmless where that
-    # patch isn't applied, e.g. RunPod): cfg>1 (expression) → 0.015 so the model offloads
-    # to fit the CFG-doubled activation; cfg<=1 (identity/dasiwa) → 0.003 = resident.
-    # Safety: a high-res draft (meant to be a small driver) → offload so it can't OOM/cascade.
-    try:
-        _big = segment.width * segment.height > 480 * 832
-        _offload = p["cfg_high"] > 1 or (getattr(segment, "mode", None) == "draft" and _big)
-        with open("/tmp/wanly_estimate", "w") as _ef:
-            _ef.write("0.015" if _offload else "0.003")
-    except Exception:
-        pass
-
-    # Inject models from the preset. Text encoder on CPU frees ~6.4 GB so the 14B loads
-    # resident on the 3090 (harmless elsewhere).
+    # Inject model filenames from config
     workflow["84"]["inputs"]["clip_name"] = settings.clip_model
-    workflow["84"]["inputs"]["device"] = "cpu"
     workflow["90"]["inputs"]["vae_name"] = settings.vae_model
-    workflow["95"]["inputs"]["unet_name"] = p["unet_high_model"]
-    workflow["96"]["inputs"]["unet_name"] = p["unet_low_model"]
-    workflow["95"]["inputs"]["weight_dtype"] = p["unet_weight_dtype"]
-    workflow["96"]["inputs"]["weight_dtype"] = p["unet_weight_dtype"]
-
-    # lightx2v strength <= 0 triggers the de-distill rewire below (removes the distillation
-    # LoRA so that expert runs at real steps/CFG — the expression preset relies on this).
-    strength_high = p["lightx2v_strength_high"]
-    strength_low = p["lightx2v_strength_low"]
+    workflow["95"]["inputs"]["unet_name"] = settings.unet_high_model
+    workflow["96"]["inputs"]["unet_name"] = settings.unet_low_model
     workflow["101"]["inputs"]["lora_name"] = settings.lightx2v_lora_high
-    workflow["101"]["inputs"]["strength_model"] = strength_high
+    workflow["101"]["inputs"]["strength_model"] = segment.lightx2v_strength_high if segment.lightx2v_strength_high is not None else settings.lightx2v_strength_high
     workflow["102"]["inputs"]["lora_name"] = settings.lightx2v_lora_low
-    workflow["102"]["inputs"]["strength_model"] = strength_low
+    workflow["102"]["inputs"]["strength_model"] = segment.lightx2v_strength_low if segment.lightx2v_strength_low is not None else settings.lightx2v_strength_low
 
     # CFG values for KSampler nodes
-    workflow["86"]["inputs"]["cfg"] = p["cfg_high"]
-    workflow["85"]["inputs"]["cfg"] = p["cfg_low"]
-
-    # Sampler schedule and shift from the preset
-    steps_total = p["steps_total"]
-    high_noise_steps = max(1, min(p["high_noise_steps"], steps_total - 1))  # clamp to a valid split
-    shift_high = p["shift_high"]
-    shift_low = p["shift_low"]
-
-    workflow["86"]["inputs"]["steps"] = steps_total
-    workflow["86"]["inputs"]["start_at_step"] = 0
-    workflow["86"]["inputs"]["end_at_step"] = high_noise_steps
-    workflow["85"]["inputs"]["steps"] = steps_total
-    workflow["85"]["inputs"]["start_at_step"] = high_noise_steps
-    workflow["85"]["inputs"]["end_at_step"] = steps_total
-    workflow["104"]["inputs"]["shift"] = shift_high
-    workflow["103"]["inputs"]["shift"] = shift_low
+    workflow["86"]["inputs"]["cfg"] = segment.cfg_high if segment.cfg_high is not None else settings.cfg_high
+    workflow["85"]["inputs"]["cfg"] = segment.cfg_low if segment.cfg_low is not None else settings.cfg_low
 
     # Negative prompt
     if segment.negative_prompt is not None:
@@ -595,17 +542,6 @@ def build_workflow(
     if segment.loras:
         _add_user_loras(workflow, [l.model_dump() for l in segment.loras])
 
-    # De-distilled rewire: strength <= 0 removes the lightx2v LoRA node and
-    # splices its upstream model (bare UNET or end of user-LoRA chain) into
-    # ModelSamplingSD3. Must run after _add_user_loras, which rewires
-    # 101/102 .inputs.model to the end of the user-LoRA chain.
-    if strength_high <= 0:
-        workflow["104"]["inputs"]["model"] = workflow["101"]["inputs"]["model"]
-        del workflow["101"]
-    if strength_low <= 0:
-        workflow["103"]["inputs"]["model"] = workflow["102"]["inputs"]["model"]
-        del workflow["102"]
-
     # Face swap (before RIFE so it processes only native WAN frames, not
     # interpolated ones — cuts faceswap frame count by 50-75%)
     faceswap = segment.faceswap_enabled and segment.faceswap_image
@@ -622,7 +558,7 @@ def build_workflow(
             "ckpt_name": "rife49.pth",
             "clear_cache_after_n_frames": 10,
             "multiplier": rife_multiplier,
-            "fast_mode": settings.rife_fast_mode,
+            "fast_mode": True,
             "ensemble": True,
             "scale_factor": 1.0,
             "dtype": "float16",
@@ -654,164 +590,14 @@ def build_workflow(
     }
 
     logger.info(
-        "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, speed=%.1fx, seed=%d, faceswap=%s, "
-        "steps_total=%d, high_noise_steps=%d, shift_high=%.1f, shift_low=%.1f, "
-        "strength_high=%.2f, strength_low=%.2f, dtype=%s, model=%s | %s",
+        "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, speed=%.1fx, seed=%d, faceswap=%s",
         segment.width,
         segment.height,
         gen["wan_frames"],
-        settings.generation_fps,
+        GENERATION_FPS,
         rife_multiplier,
         segment.speed,
         segment.seed,
         faceswap,
-        steps_total,
-        high_noise_steps,
-        shift_high,
-        shift_low,
-        strength_high,
-        strength_low,
-        settings.unet_weight_dtype,
-        workflow["95"]["inputs"]["unet_name"],
-        workflow["96"]["inputs"]["unet_name"],
     )
     return workflow
-
-
-# --- Final Cut / Wan 2.2 Animate -----------------------------------------------
-# Ported from the validated animate.py CLI graph (move/mix + chunk-chaining).
-_ANIMATE_MODEL = "Wan2_2-Animate-14B_fp8_e4m3fn_scaled_KJ.safetensors"
-_ANIMATE_LIGHTX2V = "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"
-_ANIMATE_RELIGHT = "WanAnimate_relight_lora_fp16.safetensors"
-_ANIMATE_PRESET_RES = {
-    "fast":    {"portrait": (480, 832),  "landscape": (832, 480)},
-    "highres": {"portrait": (720, 1280), "landscape": (1280, 720)},
-}
-_ANIMATE_PRESET_STEPS = {"fast": 6, "highres": 8}
-_ANIMATE_NEG = "blurry, distorted, deformed, plastic skin, low quality, watermark, text, extra limbs"
-
-
-def animate_memory_estimate(segment: SegmentClaim) -> str:
-    """Per-run memory-estimate constant for the 3090 model_base patch (/tmp/wanly_estimate).
-
-    Final Cut is a heavy quality pass: the 14B Animate model plus full-video pose/face conditioning
-    held in VRAM. Resident (0.003) only survives short clips and OOMs on longer ones (move OR mix),
-    so always offload (0.015). Speed cost is acceptable for a polish pass — Draft mode is the fast path.
-    """
-    return "0.015"
-
-
-def build_animate_workflow(segment: SegmentClaim, driving_filename: str, reference_filename: str) -> dict:
-    """Final Cut: Wan 2.2 Animate re-render of a driving video with a character reference.
-
-    driving_filename / reference_filename are ComfyUI-local (already uploaded). Output dims come
-    from the preset + the driving orientation (source job w/h); chunk count covers the full clip.
-    """
-    mode = (segment.animate_mode or "mix").lower()
-    preset = (segment.animate_preset or "fast").lower()
-    orient = "landscape" if segment.width > segment.height else "portrait"
-    W, H = _ANIMATE_PRESET_RES.get(preset, _ANIMATE_PRESET_RES["fast"])[orient]
-    steps = _ANIMATE_PRESET_STEPS.get(preset, 6)
-    L, OVERLAP = 77, 5
-    stride = L - OVERLAP
-    driving_frames = max(4, int((segment.duration_seconds or 5.0) * 16))
-
-    def _len4n1(nf):  # nearest valid Wan length (4k+1), clamped to [5, L]
-        return max(5, min(L, 4 * round((max(5, min(L, nf)) - 1) / 4) + 1))
-
-    # Size chunks to the driver so we don't over-generate frozen padding past its end.
-    if driving_frames <= L:
-        N, last_len = 1, _len4n1(driving_frames)
-    else:
-        N = max(1, 1 + round((driving_frames - L) / stride))   # round, not ceil
-        last_len = _len4n1(L - max(0, (L + (N - 1) * stride) - driving_frames))
-    frame_cap = driving_frames + 4
-
-    char_lora = None
-    for l in (segment.loras or []):
-        f = l.low_file or l.high_file
-        if f:
-            char_lora = (f, l.low_weight or 0.7)
-            break
-
-    wf: dict[str, Any] = {}
-    def n(i, ct, **inp):
-        wf[str(i)] = {"class_type": ct, "inputs": inp}
-
-    n(1, "VHS_LoadVideo", video=driving_filename, force_rate=16.0, custom_width=0, custom_height=0,
-      frame_load_cap=frame_cap, skip_first_frames=0, select_every_nth=1)
-    n(2, "ImageScale", image=["1", 0], upscale_method="bilinear", width=W, height=H, crop="center")
-    n(4, "OnnxDetectionModelLoader", vitpose_model="vitpose-l-wholebody.onnx",
-      yolo_model="yolov10m.onnx", onnx_device="CUDAExecutionProvider")
-    n(5, "PoseAndFaceDetection", model=["4", 0], images=["2", 0], width=W, height=H, face_padding=0)
-    n(6, "DrawViTPose", pose_data=["5", 0], width=W, height=H, retarget_padding=16,
-      body_stick_width=-1, hand_stick_width=-1, draw_head=True)
-    n(7, "LoadImage", image=reference_filename)
-    n(8, "ImageScale", image=["7", 0], upscale_method="bilinear", width=W, height=H, crop="center")
-    n(9, "CLIPVisionLoader", clip_name="clip_vision_h.safetensors")
-    n(10, "CLIPVisionEncode", clip_vision=["9", 0], image=["8", 0], crop="center")
-    n(11, "CLIPLoader", clip_name="umt5_xxl_fp8_e4m3fn_scaled.safetensors", type="wan")
-    n(12, "CLIPTextEncode", clip=["11", 0], text=segment.prompt)
-    n(13, "CLIPTextEncode", clip=["11", 0], text=(segment.negative_prompt or _ANIMATE_NEG))
-    n(14, "VAELoader", vae_name="wan_2.1_vae.safetensors")
-    n(15, "UNETLoader", unet_name=_ANIMATE_MODEL, weight_dtype="default")
-    model = ["15", 0]
-    n(16, "LoraLoaderModelOnly", model=model, lora_name=_ANIMATE_LIGHTX2V, strength_model=1.0)
-    model = ["16", 0]
-    if mode == "mix":
-        n(24, "LoraLoaderModelOnly", model=model, lora_name=_ANIMATE_RELIGHT, strength_model=1.0)
-        model = ["24", 0]
-    if char_lora:
-        n(23, "LoraLoaderModelOnly", model=model, lora_name=char_lora[0], strength_model=char_lora[1])
-        model = ["23", 0]
-    n(17, "ModelSamplingSD3", model=model, shift=8.0)
-
-    mix_bg = mix_mask = None
-    if mode == "mix":
-        n(30, "DownloadAndLoadSAM2Model", model="sam2.1_hiera_base_plus.safetensors",
-          segmentor="video", device="cuda", precision="fp16")
-        n(31, "Sam2Segmentation", sam2_model=["30", 0], image=["2", 0], keep_model_loaded=False, bboxes=["5", 3])
-        n(32, "GrowMaskWithBlur", mask=["31", 0], expand=6, incremental_expandrate=0.0,
-          tapered_corners=True, flip_input=False, blur_radius=3.0, lerp_alpha=1.0, decay_factor=1.0, fill_holes=True)
-        n(35, "BlockifyMask", masks=["32", 0], block_size=32, device="gpu")
-        n(36, "DrawMaskOnImage", image=["2", 0], mask=["35", 0], color="0, 0, 0", device="gpu")
-        mix_bg, mix_mask = ["36", 0], ["35", 0]
-
-    chunk_imgs, prev_decode, prev_offset = [], None, None
-    for ci in range(N):
-        w = 100 + ci * 10
-        anim = dict(positive=["12", 0], negative=["13", 0], vae=["14", 0], width=W, height=H,
-                    length=(last_len if ci == N - 1 else L),
-                    batch_size=1, continue_motion_max_frames=OVERLAP,
-                    clip_vision_output=["10", 0], reference_image=["8", 0],
-                    face_video=["5", 1], pose_video=["6", 0])
-        if mix_bg is not None:
-            anim["background_video"] = mix_bg
-            anim["character_mask"] = mix_mask
-        if ci == 0:
-            anim["video_frame_offset"] = 0
-        else:
-            anim["video_frame_offset"] = prev_offset
-            anim["continue_motion"] = prev_decode
-        n(w, "WanAnimateToVideo", **anim)
-        n(w + 1, "KSampler", model=["17", 0], positive=[str(w), 0], negative=[str(w), 1], latent_image=[str(w), 2],
-          seed=segment.seed, steps=steps, cfg=1.0, sampler_name="euler", scheduler="simple", denoise=1.0)
-        n(w + 2, "TrimVideoLatent", samples=[str(w + 1), 0], trim_amount=[str(w), 3])
-        n(w + 3, "VAEDecode", samples=[str(w + 2), 0], vae=["14", 0])
-        n(w + 4, "ImageFromBatch", image=[str(w + 3), 0], batch_index=[str(w), 4], length=4096)
-        chunk_imgs.append([str(w + 4), 0])
-        prev_decode, prev_offset = [str(w + 3), 0], [str(w), 5]
-
-    if len(chunk_imgs) == 1:
-        final_imgs = chunk_imgs[0]
-    else:
-        acc, cid = chunk_imgs[0], 900
-        for img in chunk_imgs[1:]:
-            n(cid, "ImageBatch", image1=acc, image2=img)
-            acc = [str(cid), 0]
-            cid += 1
-        final_imgs = acc
-
-    n(22, "VHS_VideoCombine", images=final_imgs, frame_rate=16, loop_count=0,
-      filename_prefix=f"finalcut_{segment.id}", format="video/h264-mp4", pingpong=False, save_output=True)
-    return wf

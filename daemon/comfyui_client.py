@@ -11,16 +11,8 @@ from daemon.config import settings
 
 logger = logging.getLogger(__name__)
 
-EXECUTION_TIMEOUT = 3600  # 60 minutes (de-distill expression jobs run 28-34m)
+EXECUTION_TIMEOUT = 1800  # 30 minutes
 PROGRESS_TIMEOUT = 300  # 5 minutes without any progress = stuck
-
-# Workflow node IDs → human progress stages (for the Job Detail progress panel).
-# 84 = CLIPLoader/text encode, 86 = high-noise KSampler, 85 = low-noise KSampler.
-NODE_STAGES = {
-    "84": "Text encoding",
-    "86": "High-noise pass",
-    "85": "Low-noise pass",
-}
 
 
 class ComfyUIExecutionError(Exception):
@@ -41,21 +33,6 @@ class ComfyUIClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         self.http = httpx.AsyncClient(base_url=self.base_url, timeout=30, headers=headers)
-
-    async def has_node(self, node_type: str) -> bool:
-        """True if ComfyUI has the given node type registered (capability check)."""
-        try:
-            r = await self.http.get(f"/object_info/{node_type}")
-            return r.status_code == 200
-        except Exception:
-            return False
-
-    async def free_memory(self, unload_models: bool = True) -> None:
-        """Free ComfyUI VRAM (unload models + clear cache). Best-effort — avoids OOM cascades."""
-        try:
-            await self.http.post("/free", json={"unload_models": unload_models, "free_memory": True})
-        except Exception as e:
-            logger.warning("ComfyUI /free failed (non-fatal): %s", e)
 
     async def check_health(self) -> bool:
         """Check if ComfyUI is running via GET /system_stats."""
@@ -132,17 +109,15 @@ class ComfyUIClient:
         logger.info("Submitted workflow, prompt_id=%s", prompt_id)
         return prompt_id, client_id
 
-    async def monitor_execution(self, prompt_id: str, client_id: str, progress=None) -> dict[str, Any]:
+    async def monitor_execution(self, prompt_id: str, client_id: str) -> dict[str, Any]:
         """Monitor workflow execution via WebSocket with a timeout.
 
         Returns output data from 'executed' messages.
         Raises ComfyUIExecutionError on timeout or execution failure.
-        If a ProgressLog is passed, live stage/step updates are pushed to it
-        (→ the Job Detail progress panel).
         """
         try:
             return await asyncio.wait_for(
-                self._monitor_ws(prompt_id, client_id, progress),
+                self._monitor_ws(prompt_id, client_id),
                 timeout=EXECUTION_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -150,7 +125,7 @@ class ComfyUIClient:
                 f"Execution timed out after {EXECUTION_TIMEOUT}s"
             )
 
-    async def _monitor_ws(self, prompt_id: str, client_id: str, progress=None) -> dict[str, Any]:
+    async def _monitor_ws(self, prompt_id: str, client_id: str) -> dict[str, Any]:
         """Inner WebSocket monitoring loop with progress-based timeout."""
         ws_url = f"ws://{self.base_url.replace('http://', '').replace('https://', '')}/ws?clientId={client_id}"
         if self.api_key:
@@ -196,8 +171,6 @@ class ComfyUIClient:
                     else:
                         current_node = node
                         last_progress_pct = -1
-                        if progress is not None and str(node) in NODE_STAGES:
-                            await progress.log(f"{NODE_STAGES[str(node)]}…")
                     last_activity = asyncio.get_event_loop().time()
 
                 elif msg_type == "progress":
@@ -212,9 +185,6 @@ class ComfyUIClient:
                                 node_label = f" (node {current_node})" if current_node else ""
                                 logger.info("       Step %d/%d (%d%%)%s", value, max_val, pct, node_label)
                                 last_progress_pct = threshold
-                                if progress is not None and threshold > 0:
-                                    stage = NODE_STAGES.get(str(current_node), "Sampling")
-                                    await progress.log(f"{stage} · step {value}/{max_val} ({pct}%)")
                                 break
 
                 elif msg_type == "executed":

@@ -38,14 +38,13 @@ class SegmentClaim(BaseModel):
     previous_motion_keywords: Optional[list[str]] = None
     previous_motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
-    mode: str = "identity"  # GenerationMode from the job → daemon resolves model + sampler preset
+    lightx2v_strength_high: Optional[float] = None
+    lightx2v_strength_low: Optional[float] = None
+    cfg_high: Optional[float] = None
+    cfg_low: Optional[float] = None
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
-    animate_mode: Optional[str] = None      # Final Cut (legacy Animate): mode (move/mix)
-    animate_preset: Optional[str] = None    # Final Cut (legacy Animate): preset (fast/highres)
-    facefusion_face_index: int = 0          # Final Cut (FaceFusion): which face to swap, left-to-right
-    facefusion_distance: Optional[float] = None  # FaceFusion reference-face-distance; None → auto
     width: int
     height: int
     fps: int
