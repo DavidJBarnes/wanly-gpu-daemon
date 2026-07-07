@@ -42,8 +42,10 @@ class SegmentClaim(BaseModel):
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
-    animate_mode: Optional[str] = None      # Final Cut: Wan Animate mode (move/mix)
-    animate_preset: Optional[str] = None    # Final Cut: preset (fast/highres)
+    animate_mode: Optional[str] = None      # Final Cut (legacy Animate): mode (move/mix)
+    animate_preset: Optional[str] = None    # Final Cut (legacy Animate): preset (fast/highres)
+    facefusion_face_index: int = 0          # Final Cut (FaceFusion): which face to swap, left-to-right
+    facefusion_distance: Optional[float] = None  # FaceFusion reference-face-distance; None → auto
     width: int
     height: int
     fps: int

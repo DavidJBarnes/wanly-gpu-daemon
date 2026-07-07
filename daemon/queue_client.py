@@ -30,12 +30,13 @@ class QueueClient:
             headers["X-API-Key"] = settings.queue_api_key
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10, headers=headers)
 
-    async def claim_next(self, worker_id: uuid.UUID, worker_name: str | None = None, supports_animate: bool = False) -> Optional[SegmentClaim]:
+    async def claim_next(self, worker_id: uuid.UUID, worker_name: str | None = None, supports_animate: bool = False, supports_facefusion: bool = False) -> Optional[SegmentClaim]:
         """Claim the next available segment. Returns None if no work available."""
         resp = await self.client.get(
             "/segments/next",
             params={"worker_id": str(worker_id), "worker_name": worker_name or settings.friendly_name,
-                    "supports_animate": str(supports_animate).lower()},
+                    "supports_animate": str(supports_animate).lower(),
+                    "supports_facefusion": str(supports_facefusion).lower()},
         )
         if not resp.is_success:
             _raise_with_details(resp, "claim_next")
