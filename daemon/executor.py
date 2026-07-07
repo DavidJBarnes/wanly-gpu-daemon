@@ -17,6 +17,7 @@ import asyncio
 import io
 import logging
 import os
+import shutil
 import tempfile
 import time
 
@@ -24,6 +25,7 @@ import httpx
 from PIL import Image
 
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
+from daemon.config import settings
 from daemon.lora_sync import ensure_loras_available
 from daemon.motion_extractor import _augment_prompt_with_motion, extract_motion_keywords
 from daemon.motion_analyzer import measure_motion_magnitude
@@ -345,6 +347,124 @@ async def _execute_animate(
         )
 
 
+def _build_facefusion_command(
+    segment: SegmentClaim, face_path: str, video_path: str, out_path: str
+) -> list[str]:
+    """The validated FaceFusion recipe: identity + expression, holds through head-turns via a
+    loose reference-face-distance, occlusion mask on. face-index picks which face in a
+    multi-person clip; when a face is targeted the distance auto-tightens to isolate it."""
+    face_index = segment.facefusion_face_index or 0
+    distance = segment.facefusion_distance
+    if distance is None:
+        distance = 0.6 if face_index else 1.0
+    return [
+        settings.facefusion_python, "facefusion.py", "headless-run",
+        "-s", face_path, "-t", video_path, "-o", out_path,
+        "--processors", "face_swapper", "face_enhancer",
+        "--face-swapper-model", "inswapper_128", "--face-swapper-pixel-boost", "512x512",
+        "--face-enhancer-model", "gfpgan_1.4",
+        "--face-mask-types", "box", "occlusion",
+        "--face-selector-mode", "reference", "--reference-face-distance", str(distance),
+        "--face-selector-order", "left-right", "--reference-face-position", str(face_index),
+        "--execution-providers", "cuda",
+    ]
+
+
+async def _run_facefusion(cmd: list[str]) -> tuple[int, str]:
+    """Run FaceFusion in its own conda env as a subprocess (cwd = the facefusion install)."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=os.path.expanduser(settings.facefusion_path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    return proc.returncode, (stdout or b"").decode(errors="replace")
+
+
+async def _execute_facefusion(
+    segment: SegmentClaim,
+    comfyui: ComfyUIClient,
+    queue: QueueClient,
+) -> None:
+    """Final Cut: face-swap a character onto an existing (finalized) video via FaceFusion.
+
+    Driving video = segment.output_path (source's finalized video); reference face =
+    segment.start_image. Runs the validated FaceFusion recipe as a subprocess in its own conda
+    env. GPU serialization is inherent — the segment queue hands the worker one claimed segment
+    at a time, so this blocks like any generation segment; free_memory() first so FaceFusion
+    has the card (ComfyUI reloads lazily afterward).
+    """
+    logger.info(
+        "=== Final Cut (facefusion) segment %d (job %s) === face_index=%d",
+        segment.index, str(segment.job_id)[:8], segment.facefusion_face_index or 0,
+    )
+    progress = ProgressLog(segment.id, queue)
+    segment_start = time.monotonic()
+    tmpdir = tempfile.mkdtemp(prefix=f"finalcut_ff_{segment.id}_")
+
+    try:
+        if not segment.output_path:
+            raise RuntimeError("No output_path — Final Cut needs the source's finalized video")
+        if not segment.start_image:
+            raise RuntimeError("No reference face resolved for Final Cut")
+
+        # Step 1: download the driving (source finalized) video -> local temp
+        await progress.log("[1/5] Downloading source video...")
+        video_data = await _download_with_retry(
+            lambda: queue.download_file(segment.output_path), "driving_video"
+        )
+        video_path = os.path.join(tmpdir, "driving.mp4")
+        with open(video_path, "wb") as f:
+            f.write(video_data)
+
+        # Step 2: download the reference face -> local temp
+        face_data = await _download_with_retry(
+            lambda: queue.download_file(segment.start_image), "reference_face"
+        )
+        _validate_image_data(face_data, "reference_face")
+        face_ext = os.path.splitext(segment.start_image)[1] or ".png"
+        face_path = os.path.join(tmpdir, f"face{face_ext}")
+        with open(face_path, "wb") as f:
+            f.write(face_data)
+        out_path = os.path.join(tmpdir, f"swapped_{segment.id}.mp4")
+        await progress.log("[2/5] Files ready")
+
+        # Step 3: release ComfyUI VRAM so FaceFusion gets the GPU (queue already serializes work)
+        await comfyui.free_memory()
+
+        # Step 4: run FaceFusion (blocking subprocess — holds the worker until done)
+        await progress.log("[3/5] Running FaceFusion swap...")
+        rc, output = await _run_facefusion(
+            _build_facefusion_command(segment, face_path, video_path, out_path)
+        )
+        if rc != 0 or not os.path.exists(out_path):
+            raise RuntimeError(f"FaceFusion failed (rc={rc}): ...{output[-800:]}")
+        await progress.log("[4/5] Swap complete")
+
+        # Step 5: read result -> last frame -> upload
+        await progress.log("[5/5] Uploading result...")
+        with open(out_path, "rb") as f:
+            result_data = f.read()
+        last_frame_data = await _extract_last_frame(result_data)
+        await queue.upload_segment_output(
+            segment.id, result_data, last_frame_data, SegmentResult(status="completed")
+        )
+        logger.info(
+            "Final Cut (facefusion) segment %d complete in %.1fs",
+            segment.index, time.monotonic() - segment_start,
+        )
+
+    except Exception as e:
+        await comfyui.free_memory()   # keep the box clean for the next segment
+        error_msg = f"{type(e).__name__}: {e}"
+        logger.exception("Final Cut (facefusion) segment %s failed", segment.id)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 async def execute_segment(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -353,6 +473,8 @@ async def execute_segment(
     """Execute a single segment end-to-end."""
     if segment.reprocess_type == "faceswap":
         return await _execute_faceswap_reprocess(segment, comfyui, queue)
+    if segment.reprocess_type == "facefusion":
+        return await _execute_facefusion(segment, comfyui, queue)
     if segment.reprocess_type == "animate":
         return await _execute_animate(segment, comfyui, queue)
 

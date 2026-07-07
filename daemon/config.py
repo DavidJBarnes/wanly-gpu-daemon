@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     # sd-scripts LoRA training monitor
     sd_scripts_path: str = "~/projects/sd-scripts"
 
+    # FaceFusion — Final Cut stage-2 face-swap. Runs as a subprocess in its own conda env
+    # (not ComfyUI). Validated recipe is locked in executor._execute_facefusion. Paths are
+    # 3090-specific; override per worker in .env. A worker advertises the `facefusion`
+    # capability only if both of these exist.
+    facefusion_path: str = "/home/david/projects/facefusion"
+    facefusion_python: str = "/home/david/miniconda3/envs/facefusion/bin/python"
+
     # RunPod auto-stop (set by RunPod environment + user config)
     runpod_pod_id: str | None = None
     runpod_api_key: str | None = None
