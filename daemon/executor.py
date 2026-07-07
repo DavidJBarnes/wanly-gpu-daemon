@@ -17,7 +17,6 @@ import asyncio
 import io
 import logging
 import os
-import shutil
 import tempfile
 import time
 
@@ -25,14 +24,13 @@ import httpx
 from PIL import Image
 
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
-from daemon.config import settings
 from daemon.lora_sync import ensure_loras_available
 from daemon.motion_extractor import _augment_prompt_with_motion, extract_motion_keywords
 from daemon.motion_analyzer import measure_motion_magnitude
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
-from daemon.workflow_builder import build_workflow, build_faceswap_workflow, build_animate_workflow, animate_memory_estimate
+from daemon.workflow_builder import build_workflow, build_faceswap_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +207,7 @@ async def _execute_faceswap_reprocess(
 
         # Step 4: Wait for execution
         await progress.log("[4/5] Waiting for faceswap execution...")
-        await comfyui.monitor_execution(prompt_id, client_id, progress)
+        await comfyui.monitor_execution(prompt_id, client_id)
         await progress.log("[4/5] Execution complete")
 
         # Step 5: Download output, extract last frame, upload
@@ -255,216 +253,6 @@ async def _execute_faceswap_reprocess(
         )
 
 
-async def _execute_animate(
-    segment: SegmentClaim,
-    comfyui: ComfyUIClient,
-    queue: QueueClient,
-) -> None:
-    """Final Cut: re-render an existing (finalized) video through Wan 2.2 Animate.
-
-    Driving video = segment.output_path (source's finalized video); character reference =
-    segment.start_image. Mirrors the faceswap-reprocess flow but runs the Animate graph.
-    """
-    logger.info(
-        "=== Final Cut (animate) segment %d (job %s) === mode=%s preset=%s",
-        segment.index, str(segment.job_id)[:8],
-        segment.animate_mode or "mix", segment.animate_preset or "fast",
-    )
-    progress = ProgressLog(segment.id, queue)
-    segment_start = time.monotonic()
-
-    try:
-        if not segment.output_path:
-            raise RuntimeError("No output_path on segment — Final Cut needs the source's finalized video")
-
-        # Step 1: download the driving (source finalized) video + upload to ComfyUI
-        await progress.log("[1/5] Downloading source video...")
-        video_data = await _download_with_retry(
-            lambda: queue.download_file(segment.output_path), "driving_video"
-        )
-        driving_filename = await comfyui.upload_video(video_data, f"finalcut_driving_{segment.id}.mp4")
-
-        # Step 2: resolve the character reference image + ensure LoRA available
-        reference_filename = await _resolve_start_image(segment, comfyui, queue)
-        if not reference_filename:
-            raise RuntimeError("No reference image resolved for Final Cut")
-        if segment.loras:
-            await ensure_loras_available(segment.loras, queue)
-        await progress.log("[2/5] Files ready in ComfyUI")
-
-        # Step 3: clear VRAM (avoid OOM from a prior job's residue), set memory estimate, build + submit
-        await comfyui.free_memory()
-        try:
-            with open("/tmp/wanly_estimate", "w") as f:
-                f.write(animate_memory_estimate(segment))
-        except Exception:
-            logger.warning("Could not write /tmp/wanly_estimate (non-fatal)")
-        workflow = build_animate_workflow(segment, driving_filename, reference_filename)
-        prompt_id, client_id = await comfyui.submit_workflow(workflow)
-        await progress.log(f"[3/5] Submitted (prompt_id={prompt_id[:8]})")
-
-        # Step 4: wait (chunked Animate — can be several minutes)
-        await progress.log("[4/5] Waiting for Animate execution...")
-        await comfyui.monitor_execution(prompt_id, client_id, progress)
-
-        # Step 5: download output, extract last frame, upload
-        await progress.log("[5/5] Downloading result and uploading...")
-        history = await comfyui.get_history(prompt_id)
-        video_info = comfyui.find_video_output(history)
-        if not video_info:
-            raise RuntimeError("No video output found in ComfyUI history")
-        result_data = await comfyui.download_output(
-            filename=video_info["filename"],
-            subfolder=video_info.get("subfolder", ""),
-            output_type=video_info.get("type", "output"),
-        )
-        last_frame_data = await _extract_last_frame(result_data)
-        await queue.upload_segment_output(
-            segment.id, result_data, last_frame_data, SegmentResult(status="completed")
-        )
-        logger.info("Final Cut segment %d complete in %.1fs", segment.index, time.monotonic() - segment_start)
-
-    except ComfyUIExecutionError as e:
-        await comfyui.free_memory()   # release VRAM so an OOM'd animate job can't poison the next job
-        error_msg = f"ComfyUI error: {e}"
-        if e.node_id:
-            error_msg += f" (node {e.node_id} [{e.node_type}])"
-        logger.error(error_msg)
-        if e.traceback:
-            logger.error("Traceback:\n%s", e.traceback)
-        await queue.update_segment(
-            segment.id,
-            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
-        )
-
-    except Exception as e:
-        await comfyui.free_memory()   # release VRAM on any animate failure
-        error_msg = f"{type(e).__name__}: {e}"
-        logger.exception("Final Cut segment %s failed", segment.id)
-        await queue.update_segment(
-            segment.id,
-            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
-        )
-
-
-def _build_facefusion_command(
-    segment: SegmentClaim, face_path: str, video_path: str, out_path: str
-) -> list[str]:
-    """The validated FaceFusion recipe: identity + expression, holds through head-turns via a
-    loose reference-face-distance, occlusion mask on. face-index picks which face in a
-    multi-person clip; when a face is targeted the distance auto-tightens to isolate it."""
-    face_index = segment.facefusion_face_index or 0
-    distance = segment.facefusion_distance
-    if distance is None:
-        distance = 0.6 if face_index else 1.0
-    return [
-        settings.facefusion_python, "facefusion.py", "headless-run",
-        "-s", face_path, "-t", video_path, "-o", out_path,
-        "--processors", "face_swapper", "face_enhancer",
-        "--face-swapper-model", "inswapper_128", "--face-swapper-pixel-boost", "512x512",
-        "--face-enhancer-model", "gfpgan_1.4",
-        "--face-mask-types", "box", "occlusion",
-        "--face-selector-mode", "reference", "--reference-face-distance", str(distance),
-        "--face-selector-order", "left-right", "--reference-face-position", str(face_index),
-        "--execution-providers", "cuda",
-    ]
-
-
-async def _run_facefusion(cmd: list[str]) -> tuple[int, str]:
-    """Run FaceFusion in its own conda env as a subprocess (cwd = the facefusion install)."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=os.path.expanduser(settings.facefusion_path),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-    )
-    stdout, _ = await proc.communicate()
-    return proc.returncode, (stdout or b"").decode(errors="replace")
-
-
-async def _execute_facefusion(
-    segment: SegmentClaim,
-    comfyui: ComfyUIClient,
-    queue: QueueClient,
-) -> None:
-    """Final Cut: face-swap a character onto an existing (finalized) video via FaceFusion.
-
-    Driving video = segment.output_path (source's finalized video); reference face =
-    segment.start_image. Runs the validated FaceFusion recipe as a subprocess in its own conda
-    env. GPU serialization is inherent — the segment queue hands the worker one claimed segment
-    at a time, so this blocks like any generation segment; free_memory() first so FaceFusion
-    has the card (ComfyUI reloads lazily afterward).
-    """
-    logger.info(
-        "=== Final Cut (facefusion) segment %d (job %s) === face_index=%d",
-        segment.index, str(segment.job_id)[:8], segment.facefusion_face_index or 0,
-    )
-    progress = ProgressLog(segment.id, queue)
-    segment_start = time.monotonic()
-    tmpdir = tempfile.mkdtemp(prefix=f"finalcut_ff_{segment.id}_")
-
-    try:
-        if not segment.output_path:
-            raise RuntimeError("No output_path — Final Cut needs the source's finalized video")
-        if not segment.start_image:
-            raise RuntimeError("No reference face resolved for Final Cut")
-
-        # Step 1: download the driving (source finalized) video -> local temp
-        await progress.log("[1/5] Downloading source video...")
-        video_data = await _download_with_retry(
-            lambda: queue.download_file(segment.output_path), "driving_video"
-        )
-        video_path = os.path.join(tmpdir, "driving.mp4")
-        with open(video_path, "wb") as f:
-            f.write(video_data)
-
-        # Step 2: download the reference face -> local temp
-        face_data = await _download_with_retry(
-            lambda: queue.download_file(segment.start_image), "reference_face"
-        )
-        _validate_image_data(face_data, "reference_face")
-        face_ext = os.path.splitext(segment.start_image)[1] or ".png"
-        face_path = os.path.join(tmpdir, f"face{face_ext}")
-        with open(face_path, "wb") as f:
-            f.write(face_data)
-        out_path = os.path.join(tmpdir, f"swapped_{segment.id}.mp4")
-        await progress.log("[2/5] Files ready")
-
-        # Step 3: release ComfyUI VRAM so FaceFusion gets the GPU (queue already serializes work)
-        await comfyui.free_memory()
-
-        # Step 4: run FaceFusion (blocking subprocess — holds the worker until done)
-        await progress.log("[3/5] Running FaceFusion swap...")
-        rc, output = await _run_facefusion(
-            _build_facefusion_command(segment, face_path, video_path, out_path)
-        )
-        if rc != 0 or not os.path.exists(out_path):
-            raise RuntimeError(f"FaceFusion failed (rc={rc}): ...{output[-800:]}")
-        await progress.log("[4/5] Swap complete")
-
-        # Step 5: read result -> last frame -> upload
-        await progress.log("[5/5] Uploading result...")
-        with open(out_path, "rb") as f:
-            result_data = f.read()
-        last_frame_data = await _extract_last_frame(result_data)
-        await queue.upload_segment_output(
-            segment.id, result_data, last_frame_data, SegmentResult(status="completed")
-        )
-        logger.info(
-            "Final Cut (facefusion) segment %d complete in %.1fs",
-            segment.index, time.monotonic() - segment_start,
-        )
-
-    except Exception as e:
-        await comfyui.free_memory()   # keep the box clean for the next segment
-        error_msg = f"{type(e).__name__}: {e}"
-        logger.exception("Final Cut (facefusion) segment %s failed", segment.id)
-        await queue.update_segment(
-            segment.id,
-            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
-        )
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
 async def execute_segment(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -473,10 +261,6 @@ async def execute_segment(
     """Execute a single segment end-to-end."""
     if segment.reprocess_type == "faceswap":
         return await _execute_faceswap_reprocess(segment, comfyui, queue)
-    if segment.reprocess_type == "facefusion":
-        return await _execute_facefusion(segment, comfyui, queue)
-    if segment.reprocess_type == "animate":
-        return await _execute_animate(segment, comfyui, queue)
 
     lora_names = ", ".join(l.high_file or l.low_file or "?" for l in (segment.loras or []))
 
@@ -580,7 +364,7 @@ async def execute_segment(
         # Step 5: Wait for ComfyUI execution
         t0 = time.monotonic()
         await progress.log("[5/7] Waiting for ComfyUI execution...")
-        await comfyui.monitor_execution(prompt_id, client_id, progress)
+        await comfyui.monitor_execution(prompt_id, client_id)
         await progress.log("[5/7] Execution complete")
         step_times.append(("execute", time.monotonic() - t0))
 
