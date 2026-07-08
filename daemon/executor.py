@@ -31,6 +31,7 @@ from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
 from daemon.workflow_builder import build_workflow, build_faceswap_workflow
+from daemon.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +344,22 @@ async def execute_segment(
                 comfyui_filename = await comfyui.upload_image(ref_data, ref_filename)
                 reference_frames_filenames.append(comfyui_filename)
                 logger.info("Uploaded reference frame to ComfyUI: %s", comfyui_filename)
+        # Set ComfyUI's activation-memory estimate for this run (read by the model_base
+        # memory_required patch). CFG>1 runs the uncond pass (~2x activations) and must offload
+        # the idle expert -> 0.015; distilled CFG-1 runs can stay resident and fast -> 0.003.
+        # This is what prevents the de-distilled / long-video OOM.
+        _cfg_hi = segment.cfg_high if segment.cfg_high is not None else settings.cfg_high
+        _cfg_lo = segment.cfg_low if segment.cfg_low is not None else settings.cfg_low
+        _cfg_active = _cfg_hi > 1 or _cfg_lo > 1
+        _estimate = 0.015 if _cfg_active else 0.003
+        try:
+            with open("/tmp/wanly_estimate", "w") as _f:
+                _f.write(str(_estimate))
+            logger.info("wanly_estimate=%s (cfg=%.1f/%.1f -> %s)", _estimate, _cfg_hi, _cfg_lo,
+                        "offload" if _cfg_active else "resident")
+        except Exception as _e:
+            logger.warning("Could not write /tmp/wanly_estimate: %s", _e)
+
         # Pass previous segment's motion magnitude for motion matching
         workflow = build_workflow(
             segment,
