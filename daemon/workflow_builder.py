@@ -475,6 +475,13 @@ def build_workflow(
     workflow["85"]["inputs"]["start_at_step"] = high_noise_steps
     workflow["85"]["inputs"]["end_at_step"] = steps_total
 
+    # Flow-matching schedule shift (per-job). One value on BOTH experts (they share the noise
+    # trajectory; mismatched shifts break the high->low handoff sigma). Higher = more high-noise
+    # steps = more motion; raise when de-distilling to cure the "frozen" look.
+    flow_shift = segment.flow_shift if segment.flow_shift is not None else settings.flow_shift
+    workflow["104"]["inputs"]["shift"] = flow_shift  # high expert ModelSamplingSD3
+    workflow["103"]["inputs"]["shift"] = flow_shift  # low expert ModelSamplingSD3
+
     # De-distill bypass: when a lightx2v strength is 0, drop that Lightning LoRA from the graph
     # (repoint its consumer past it) so the expert runs raw and CFG > 1 does real work.
     if workflow["101"]["inputs"]["strength_model"] == 0:
