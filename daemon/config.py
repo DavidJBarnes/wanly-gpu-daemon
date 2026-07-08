@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     # pass lightx2v strength 0 (builder drops the Lightning LoRA) + raise cfg + raise steps.
     steps_total: int = 4  # total KSamplerAdvanced schedule length (both passes share it)
     high_noise_steps: int = 2  # boundary: high runs [0, high_noise_steps], low runs [high_noise_steps, steps_total]
+    flow_shift: float = 5.0  # ModelSamplingSD3 schedule shift; higher = more high-noise steps = more motion
     clip_vision_model: str = "clip_vision_h.safetensors"
 
     # PainterLongVideo motion parameters (identity anchoring)
