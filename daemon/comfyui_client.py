@@ -14,6 +14,14 @@ logger = logging.getLogger(__name__)
 EXECUTION_TIMEOUT = 1800  # 30 minutes
 PROGRESS_TIMEOUT = 300  # 5 minutes without any progress = stuck
 
+# i2v workflow node id -> human phase name, surfaced to the Job Detail progress log.
+NODE_PHASES = {
+    "84": "Text encoding", "89": "Text encoding", "93": "Text encoding",
+    "98": "Preparing i2v conditioning",
+    "86": "High-noise pass", "85": "Low-noise pass",
+    "87": "Decoding video", "200": "Interpolating frames", "186": "Encoding video",
+}
+
 
 class ComfyUIExecutionError(Exception):
     """Raised when ComfyUI reports an execution error."""
@@ -109,7 +117,7 @@ class ComfyUIClient:
         logger.info("Submitted workflow, prompt_id=%s", prompt_id)
         return prompt_id, client_id
 
-    async def monitor_execution(self, prompt_id: str, client_id: str) -> dict[str, Any]:
+    async def monitor_execution(self, prompt_id: str, client_id: str, progress=None) -> dict[str, Any]:
         """Monitor workflow execution via WebSocket with a timeout.
 
         Returns output data from 'executed' messages.
@@ -117,7 +125,7 @@ class ComfyUIClient:
         """
         try:
             return await asyncio.wait_for(
-                self._monitor_ws(prompt_id, client_id),
+                self._monitor_ws(prompt_id, client_id, progress),
                 timeout=EXECUTION_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -125,13 +133,14 @@ class ComfyUIClient:
                 f"Execution timed out after {EXECUTION_TIMEOUT}s"
             )
 
-    async def _monitor_ws(self, prompt_id: str, client_id: str) -> dict[str, Any]:
+    async def _monitor_ws(self, prompt_id: str, client_id: str, progress=None) -> dict[str, Any]:
         """Inner WebSocket monitoring loop with progress-based timeout."""
         ws_url = f"ws://{self.base_url.replace('http://', '').replace('https://', '')}/ws?clientId={client_id}"
         if self.api_key:
             ws_url += f"&token={self.api_key}"
         outputs: dict[str, Any] = {}
         current_node = None
+        last_phase = None
         last_progress_pct = -1
         last_activity = asyncio.get_event_loop().time()
 
@@ -171,6 +180,11 @@ class ComfyUIClient:
                     else:
                         current_node = node
                         last_progress_pct = -1
+                        phase = NODE_PHASES.get(node)
+                        if phase and phase != last_phase:
+                            last_phase = phase
+                            if progress is not None:
+                                await progress.log(f"→ {phase}")
                     last_activity = asyncio.get_event_loop().time()
 
                 elif msg_type == "progress":
@@ -184,6 +198,8 @@ class ComfyUIClient:
                             if pct >= threshold > last_progress_pct:
                                 node_label = f" (node {current_node})" if current_node else ""
                                 logger.info("       Step %d/%d (%d%%)%s", value, max_val, pct, node_label)
+                                if progress is not None and threshold == 50 and current_node in ("85", "86"):
+                                    await progress.log(f"→ {NODE_PHASES.get(current_node, 'Sampling')} — {value}/{max_val} ({pct}%)")
                                 last_progress_pct = threshold
                                 break
 
