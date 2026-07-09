@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from typing import Optional
@@ -74,16 +75,41 @@ class QueueClient:
             await self.update_segment(segment_id, result)
 
     async def download_file(self, s3_path: str) -> bytes:
-        """Download a file from S3 via a presigned URL redirect."""
+        """Download a file from S3 via a presigned URL redirect.
+
+        Uses a *granular* timeout instead of a flat 600s: a stalled read fails in
+        ~60s (the max gap allowed between chunks) rather than pinning an idle GPU
+        for 10 minutes, while a legitimately slow-but-steady transfer still
+        completes. Transient stalls/network errors are retried a few times with
+        backoff; HTTP status errors (4xx/5xx) are not retried and surface at once.
+        """
         large = s3_path.endswith(".safetensors") or s3_path.endswith(".pth")
-        timeout = 600 if large else 60
-        resp = await self.client.get(
-            "/files", params={"path": s3_path}, timeout=timeout,
-            follow_redirects=True,
+        # connect fast; `read` caps the gap between chunks (stall detector), not the
+        # total transfer time, so big files download fine as long as bytes keep flowing.
+        timeout = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=15.0)
+        attempts = 3 if large else 2
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = await self.client.get(
+                    "/files", params={"path": s3_path}, timeout=timeout,
+                    follow_redirects=True,
+                )
+                if not resp.is_success:
+                    _raise_with_details(resp, f"download_file {s3_path}")
+                return resp.content
+            except httpx.TransportError as exc:
+                # TransportError covers timeouts + connect/read/network errors.
+                last_exc = exc
+                logger.warning(
+                    "download_file %s attempt %d/%d failed (%s): %s",
+                    s3_path, attempt, attempts, type(exc).__name__, exc,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(2 * attempt)
+        raise RuntimeError(
+            f"download_file {s3_path} failed after {attempts} attempts: {last_exc}"
         )
-        if not resp.is_success:
-            _raise_with_details(resp, f"download_file {s3_path}")
-        return resp.content
 
     # --- Worker registry methods (formerly in RegistryClient) ---
 
