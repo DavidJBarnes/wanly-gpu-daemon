@@ -11,7 +11,7 @@ from daemon.config import settings
 
 logger = logging.getLogger(__name__)
 
-EXECUTION_TIMEOUT = 1800  # 30 minutes
+EXECUTION_TIMEOUT = 3600  # 60 minutes (720p is ~4x the pixels of 480p and can exceed 30m)
 PROGRESS_TIMEOUT = 300  # 5 minutes without any progress = stuck
 
 # i2v workflow node id -> human phase name, surfaced to the Job Detail progress log.
