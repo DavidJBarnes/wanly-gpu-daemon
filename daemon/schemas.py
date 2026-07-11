@@ -48,6 +48,12 @@ class SegmentClaim(BaseModel):
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
+    # VACE continuation (resolved API-side). "vace" => generate this segment as a
+    # video-conditioned continuation of previous_output_path's tail (vace_overlap_frames
+    # kept frames). Daemon falls back to the traditional i2v path if not VACE-capable.
+    continuation_mode: str = "traditional"
+    previous_output_path: Optional[str] = None
+    vace_overlap_frames: int = 12
     width: int
     height: int
     fps: int

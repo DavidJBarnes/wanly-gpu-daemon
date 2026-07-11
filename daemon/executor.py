@@ -14,9 +14,11 @@ On error → report failure to queue
 """
 
 import asyncio
+import glob
 import io
 import logging
 import os
+import shutil
 import tempfile
 import time
 
@@ -30,7 +32,13 @@ from daemon.motion_analyzer import measure_motion_magnitude
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
-from daemon.workflow_builder import build_workflow, build_faceswap_workflow
+from daemon.workflow_builder import (
+    GENERATION_FPS,
+    build_workflow,
+    build_faceswap_workflow,
+    build_vace_workflow,
+    vace_num_frames,
+)
 from daemon.config import settings
 
 logger = logging.getLogger(__name__)
@@ -164,6 +172,211 @@ async def _extract_last_frame(video_data: bytes) -> bytes:
                 pass
 
 
+async def _run_ffmpeg(args: list[str]) -> None:
+    """Run ffmpeg (with -y) and raise RuntimeError on failure."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", *args,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-500:]}")
+
+
+async def _trim_video_start(video_data: bytes, seconds: float) -> bytes:
+    """Drop the first `seconds` from a video (frame-accurate, re-encoded). Returns bytes."""
+    if seconds <= 0:
+        return video_data
+    tmpdir = tempfile.mkdtemp(prefix="trim_")
+    try:
+        src = os.path.join(tmpdir, "in.mp4")
+        out = os.path.join(tmpdir, "out.mp4")
+        with open(src, "wb") as f:
+            f.write(video_data)
+        # -ss AFTER -i = frame-accurate output seeking.
+        await _run_ffmpeg(["-i", src, "-ss", f"{seconds:.4f}",
+                           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "15", out])
+        with open(out, "rb") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def _build_vace_control(
+    video_data: bytes, keep_n: int, num_frames: int, width: int, height: int
+) -> tuple[bytes, bytes]:
+    """From a previous segment's video, build the VACE control clip (last keep_n frames at
+    GENERATION_FPS + grey pad to num_frames) and the mask (black=keep tail, white=generate).
+    The wrapper's WanVideoVACEEncode does NOT auto-pad, so both must be full num_frames long.
+    Returns (control_mp4_bytes, mask_mp4_bytes)."""
+    tmpdir = tempfile.mkdtemp(prefix="vace_")
+    try:
+        prev = os.path.join(tmpdir, "prev.mp4")
+        with open(prev, "wb") as f:
+            f.write(video_data)
+        frames_dir = os.path.join(tmpdir, "frames")
+        os.makedirs(frames_dir)
+        await _run_ffmpeg(["-i", prev, "-vf", f"fps={GENERATION_FPS},scale={width}:{height}",
+                           os.path.join(frames_dir, "%05d.png")])
+        allf = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
+        if not allf:
+            raise RuntimeError("no frames extracted from previous segment video")
+        keep_n = max(1, min(keep_n, len(allf)))
+        tail_dir = os.path.join(tmpdir, "tail")
+        os.makedirs(tail_dir)
+        for i, src in enumerate(allf[-keep_n:]):
+            shutil.copy(src, os.path.join(tail_dir, f"{i:05d}.png"))
+        pad = max(num_frames - keep_n, 0)
+
+        tail_clip = os.path.join(tmpdir, "tail.mp4")
+        await _run_ffmpeg(["-framerate", str(GENERATION_FPS), "-i", os.path.join(tail_dir, "%05d.png"),
+                           "-c:v", "libx264", "-pix_fmt", "yuv420p", tail_clip])
+        grey_clip = os.path.join(tmpdir, "grey.mp4")
+        await _run_ffmpeg(["-f", "lavfi", "-i", f"color=c=0x808080:s={width}x{height}:r={GENERATION_FPS}",
+                           "-frames:v", str(pad), "-c:v", "libx264", "-pix_fmt", "yuv420p", grey_clip])
+        control = os.path.join(tmpdir, "control.mp4")
+        cc = os.path.join(tmpdir, "cc.txt")
+        with open(cc, "w") as f:
+            f.write(f"file '{tail_clip}'\nfile '{grey_clip}'\n")
+        await _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", cc, "-c:v", "libx264", "-pix_fmt", "yuv420p", control])
+
+        black_clip = os.path.join(tmpdir, "black.mp4")
+        await _run_ffmpeg(["-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={GENERATION_FPS}",
+                           "-frames:v", str(keep_n), "-c:v", "libx264", "-pix_fmt", "yuv420p", black_clip])
+        white_clip = os.path.join(tmpdir, "white.mp4")
+        await _run_ffmpeg(["-f", "lavfi", "-i", f"color=c=white:s={width}x{height}:r={GENERATION_FPS}",
+                           "-frames:v", str(pad), "-c:v", "libx264", "-pix_fmt", "yuv420p", white_clip])
+        mask = os.path.join(tmpdir, "mask.mp4")
+        mm = os.path.join(tmpdir, "mm.txt")
+        with open(mm, "w") as f:
+            f.write(f"file '{black_clip}'\nfile '{white_clip}'\n")
+        await _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", mm, "-c:v", "libx264", "-pix_fmt", "yuv420p", mask])
+
+        with open(control, "rb") as f:
+            control_bytes = f.read()
+        with open(mask, "rb") as f:
+            mask_bytes = f.read()
+        return control_bytes, mask_bytes
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def _vace_capable(comfyui: ComfyUIClient) -> bool:
+    """True if this worker's ComfyUI has the WanVideoWrapper VACE node + the Fun-VACE modules."""
+    try:
+        resp = await comfyui.http.get("/object_info/WanVideoVACEModelSelect")
+        if resp.status_code != 200:
+            return False
+        info = resp.json().get("WanVideoVACEModelSelect", {})
+        spec = info.get("input", {}).get("required", {}).get("vace_model", [[]])
+        choices = spec[0] if spec and isinstance(spec[0], list) else []
+        return settings.vace_module_high in choices and settings.vace_module_low in choices
+    except Exception as e:
+        logger.warning("VACE capability check failed (%s) — treating as not capable", e)
+        return False
+
+
+async def _execute_vace_continuation(
+    segment: SegmentClaim,
+    comfyui: ComfyUIClient,
+    queue: QueueClient,
+) -> None:
+    """Generate a segment as a VACE video-conditioned continuation of the previous
+    segment's tail (seamless), instead of the traditional single-frame i2v handoff."""
+    logger.info("=== VACE continuation segment %d (job %s) === overlap=%d",
+                segment.index, str(segment.job_id)[:8], segment.vace_overlap_frames)
+    progress = ProgressLog(segment.id, queue)
+    segment_start = time.monotonic()
+    try:
+        if not segment.previous_output_path:
+            raise RuntimeError("VACE continuation requires previous_output_path")
+        if segment.loras:
+            await ensure_loras_available(segment.loras, queue)
+
+        # 1. Download previous segment video (tail source)
+        await progress.log("[1/7] Downloading previous segment video...")
+        prev_data = await _download_with_retry(
+            lambda: queue.download_file(segment.previous_output_path), "prev_video"
+        )
+        await progress.log(f"[1/7] Downloaded ({len(prev_data) / (1024 * 1024):.1f} MB)")
+
+        # 2. Build control (kept tail + grey pad) + mask (keep + generate)
+        await progress.log("[2/7] Building VACE control from tail...")
+        base_frames = vace_num_frames(segment)
+        keep_n = max(1, min(segment.vace_overlap_frames, base_frames - 4))
+        # Generate keep_n extra (reconstructed lead-in) frames, trimmed after decode, so the
+        # segment keeps its intended duration AND butts seamlessly onto the previous one.
+        num_frames = ((base_frames + keep_n - 1) // 4) * 4 + 1
+        control_data, mask_data = await _build_vace_control(
+            prev_data, keep_n, num_frames, segment.width, segment.height
+        )
+
+        # 3. Reference image (identity anchor): job start image, else prev last frame
+        ref_source = segment.initial_reference_image
+        if ref_source and ref_source.startswith("s3://"):
+            ref_data = await _download_with_retry(
+                lambda: queue.download_file(ref_source), "vace_reference"
+            )
+        else:
+            ref_data = await _extract_last_frame(prev_data)
+
+        # 4. Upload control assets to ComfyUI
+        await progress.log("[3/7] Uploading control assets to ComfyUI...")
+        control_fn = await comfyui.upload_video(control_data, f"vace_control_{segment.id}.mp4")
+        mask_fn = await comfyui.upload_video(mask_data, f"vace_mask_{segment.id}.mp4")
+        ref_fn = await comfyui.upload_image(ref_data, f"vace_ref_{segment.id}.png")
+
+        # 5. Build + submit
+        await progress.log("[4/7] Building VACE workflow...")
+        workflow = build_vace_workflow(segment, control_fn, mask_fn, ref_fn, num_frames)
+        prompt_id, client_id = await comfyui.submit_workflow(workflow)
+        await progress.log(f"[5/7] Submitted (prompt_id={prompt_id[:8]}, {num_frames} frames)")
+
+        # 6. Monitor
+        await progress.log("[6/7] Waiting for VACE execution...")
+        await comfyui.monitor_execution(prompt_id, client_id, progress=progress)
+
+        # 7. Download output, extract last frame, upload
+        await progress.log("[7/7] Downloading result and uploading...")
+        history = await comfyui.get_history(prompt_id)
+        video_info = comfyui.find_video_output(history)
+        if not video_info:
+            raise RuntimeError("No video output found in ComfyUI history")
+        result_data = await comfyui.download_output(
+            filename=video_info["filename"],
+            subfolder=video_info.get("subfolder", ""),
+            output_type=video_info.get("type", "output"),
+        )
+        # Trim the reconstructed lead-in tail (keep_n frames @ GENERATION_FPS) so this segment
+        # butts seamlessly onto the previous one — stitch stays a plain concat, no dup tail.
+        result_data = await _trim_video_start(result_data, keep_n / GENERATION_FPS)
+        last_frame_data = await _extract_last_frame(result_data)
+        await queue.upload_segment_output(
+            segment.id, result_data, last_frame_data, SegmentResult(status="completed")
+        )
+        logger.info("VACE continuation segment %d complete in %.1fs",
+                    segment.index, time.monotonic() - segment_start)
+
+    except ComfyUIExecutionError as e:
+        error_msg = f"ComfyUI error: {e}"
+        if e.node_id:
+            error_msg += f" (node {e.node_id} [{e.node_type}])"
+        logger.error(error_msg)
+        if e.traceback:
+            logger.error("Traceback:\n%s", e.traceback)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        logger.exception("VACE continuation segment %s failed", segment.id)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+
+
 async def _execute_faceswap_reprocess(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -262,6 +475,16 @@ async def execute_segment(
     """Execute a single segment end-to-end."""
     if segment.reprocess_type == "faceswap":
         return await _execute_faceswap_reprocess(segment, comfyui, queue)
+
+    # VACE video-conditioned continuation (resolved API-side). Capability-gated: a worker
+    # without the Fun-VACE models/nodes silently falls through to the traditional i2v path.
+    if segment.continuation_mode == "vace":
+        if await _vace_capable(comfyui):
+            return await _execute_vace_continuation(segment, comfyui, queue)
+        logger.info(
+            "Segment %d requested VACE but worker is not VACE-capable — falling back to traditional i2v",
+            segment.index,
+        )
 
     lora_names = ", ".join(l.high_file or l.low_file or "?" for l in (segment.loras or []))
 

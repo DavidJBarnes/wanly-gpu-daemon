@@ -414,6 +414,132 @@ def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
     return workflow
 
 
+def vace_num_frames(segment: SegmentClaim) -> int:
+    """WAN generation frame count for a VACE segment, rounded to a valid 4n+1."""
+    gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
+    n = max(gen["wan_frames"], 5)
+    return ((n - 1) // 4) * 4 + 1
+
+
+def _build_vace_lora_chains(workflow: dict, segment: SegmentClaim) -> tuple[list | None, list | None]:
+    """Build per-expert WanVideoLoraSelect chains: Lightning distill (optional) + user
+    character/motion LoRAs, chained via prev_lora. Returns (high_ref, low_ref) node refs."""
+    counter = [700]
+
+    def add(lora_name: str, strength: float, prev: list | None) -> list:
+        nid = str(counter[0]); counter[0] += 1
+        inputs = {"lora": lora_name, "strength": float(strength), "merge_loras": True}
+        if prev is not None:
+            inputs["prev_lora"] = prev
+        workflow[nid] = {"class_type": "WanVideoLoraSelect", "inputs": inputs}
+        return [nid, 0]
+
+    high_ref = low_ref = None
+    if settings.vace_lightning:
+        high_ref = add(settings.vace_lightning_high, 1.0, None)
+        low_ref = add(settings.vace_lightning_low, 1.0, None)
+    for lora in (segment.loras or []):
+        if lora.high_file:
+            high_ref = add(lora.high_file, lora.high_weight, high_ref)
+        if lora.low_file:
+            low_ref = add(lora.low_file, lora.low_weight, low_ref)
+    return high_ref, low_ref
+
+
+def build_vace_workflow(
+    segment: SegmentClaim,
+    control_filename: str,
+    mask_filename: str,
+    reference_filename: str,
+    num_frames: int,
+) -> dict:
+    """Fun-VACE (Wan2.2 T2V-A14B) continuation workflow via WanVideoWrapper.
+
+    control_filename = num_frames-long video (kept tail + grey pad); mask_filename =
+    matching mask (black=keep tail, white=generate); reference = identity anchor image.
+    Dual-expert (high/low) T2V base each fed its Fun-VACE module via extra_model, with
+    Lightning + user LoRAs. Output is RIFE-interpolated to the segment's target fps so
+    it stitches with traditional segments. Validated on the 3090 bench.
+    """
+    gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
+    neg = segment.negative_prompt or ""
+    vhs = {"force_rate": 0, "custom_width": 0, "custom_height": 0,
+           "frame_load_cap": 0, "skip_first_frames": 0, "select_every_nth": 1}
+    wf: dict[str, Any] = {}
+
+    # VACE module selectors -> each loader's extra_model
+    wf["501"] = {"class_type": "WanVideoVACEModelSelect", "inputs": {"vace_model": settings.vace_module_high}}
+    wf["502"] = {"class_type": "WanVideoVACEModelSelect", "inputs": {"vace_model": settings.vace_module_low}}
+    wf["503"] = {"class_type": "WanVideoBlockSwap", "inputs": {
+        "blocks_to_swap": settings.vace_blocks_to_swap, "offload_img_emb": False,
+        "offload_txt_emb": False, "vace_blocks_to_swap": 0}}
+
+    high_lora, low_lora = _build_vace_lora_chains(wf, segment)
+
+    high_in = {"model": settings.vace_t2v_high_model, "base_precision": "fp16",
+               "quantization": "fp8_e4m3fn_scaled", "load_device": "offload_device",
+               "attention_mode": "sdpa", "extra_model": ["501", 0], "block_swap_args": ["503", 0]}
+    if high_lora:
+        high_in["lora"] = high_lora
+    wf["510"] = {"class_type": "WanVideoModelLoader", "inputs": high_in}
+
+    low_in = {"model": settings.vace_t2v_low_model, "base_precision": "fp16",
+              "quantization": "fp8_e4m3fn_scaled", "load_device": "offload_device",
+              "attention_mode": "sdpa", "extra_model": ["502", 0], "block_swap_args": ["503", 0]}
+    if low_lora:
+        low_in["lora"] = low_lora
+    wf["511"] = {"class_type": "WanVideoModelLoader", "inputs": low_in}
+
+    wf["520"] = {"class_type": "WanVideoVAELoader", "inputs": {"model_name": settings.vae_model, "precision": "bf16"}}
+    wf["521"] = {"class_type": "WanVideoTextEncodeCached", "inputs": {
+        "model_name": settings.vace_t5_model, "precision": "bf16",
+        "positive_prompt": segment.prompt, "negative_prompt": neg,
+        "quantization": "disabled", "use_disk_cache": False, "device": "gpu"}}
+
+    wf["530"] = {"class_type": "VHS_LoadVideo", "inputs": {"video": control_filename, **vhs}}
+    wf["531"] = {"class_type": "VHS_LoadVideo", "inputs": {"video": mask_filename, **vhs}}
+    wf["532"] = {"class_type": "ImageToMask", "inputs": {"image": ["531", 0], "channel": "red"}}
+    wf["533"] = {"class_type": "LoadImage", "inputs": {"image": reference_filename}}
+
+    wf["540"] = {"class_type": "WanVideoVACEEncode", "inputs": {
+        "vae": ["520", 0], "width": segment.width, "height": segment.height,
+        "num_frames": num_frames, "strength": 1.0, "vace_start_percent": 0.0,
+        "vace_end_percent": 1.0, "input_frames": ["530", 0], "ref_images": ["533", 0],
+        "input_masks": ["532", 0]}}
+
+    steps, cfg, boundary, shift = settings.vace_steps, settings.vace_cfg, settings.vace_boundary, settings.vace_shift
+    wf["550"] = {"class_type": "WanVideoSampler", "inputs": {
+        "model": ["510", 0], "image_embeds": ["540", 0], "text_embeds": ["521", 0],
+        "steps": steps, "cfg": cfg, "shift": shift, "seed": segment.seed, "force_offload": True,
+        "scheduler": "unipc", "riflex_freq_index": 0, "start_step": 0, "end_step": boundary}}
+    wf["551"] = {"class_type": "WanVideoSampler", "inputs": {
+        "model": ["511", 0], "image_embeds": ["540", 0], "text_embeds": ["521", 0],
+        "samples": ["550", 0], "steps": steps, "cfg": cfg, "shift": shift, "seed": segment.seed,
+        "force_offload": True, "scheduler": "unipc", "riflex_freq_index": 0,
+        "start_step": boundary, "end_step": -1}}
+
+    wf["560"] = {"class_type": "WanVideoDecode", "inputs": {
+        "vae": ["520", 0], "samples": ["551", 0], "enable_vae_tiling": False,
+        "tile_x": 272, "tile_y": 272, "tile_stride_x": 144, "tile_stride_y": 128}}
+
+    rife_mult = gen["rife_multiplier"]
+    final_images = ["560", 0]
+    if rife_mult > 1:
+        wf["570"] = {"class_type": "RIFE VFI", "inputs": {
+            "ckpt_name": "rife49.pth", "clear_cache_after_n_frames": 10, "multiplier": rife_mult,
+            "fast_mode": True, "ensemble": True, "scale_factor": 1.0, "dtype": "float16",
+            "torch_compile": False, "batch_size": 1, "frames": ["560", 0]}}
+        final_images = ["570", 0]
+    wf["580"] = {"class_type": "VHS_VideoCombine", "inputs": {
+        "frame_rate": gen["output_fps"], "loop_count": 0, "filename_prefix": "output",
+        "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 15, "save_metadata": True,
+        "trim_to_audio": False, "pingpong": False, "save_output": True, "images": final_images}}
+
+    logger.info("Built VACE continuation workflow (%d nodes, %d frames, rife %dx)",
+                len(wf), num_frames, rife_mult)
+    return wf
+
+
 def build_workflow(
     segment: SegmentClaim,
     start_image_filename: str | None = None,
