@@ -30,6 +30,23 @@ class Settings(BaseSettings):
     flow_shift: float = 5.0  # ModelSamplingSD3 schedule shift; higher = more high-noise steps = more motion
     clip_vision_model: str = "clip_vision_h.safetensors"
 
+    # VACE continuation (Fun-VACE modules on the Wan2.2 T2V-A14B base, via WanVideoWrapper).
+    # Validated defaults from the 3090 bench (Lightning 4-step / cfg 1). The T2V base differs
+    # from the I2V unet_* models above; WanVideoTextEncodeCached needs the bf16 .pth T5.
+    vace_t2v_high_model: str = "wan2.2_t2v_high_noise_14B_fp16.safetensors"
+    vace_t2v_low_model: str = "wan2.2_t2v_low_noise_14B_fp16.safetensors"
+    vace_module_high: str = "Wan2_2_Fun_VACE_module_A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors"
+    vace_module_low: str = "Wan2_2_Fun_VACE_module_A14B_LOW_fp8_e4m3fn_scaled_KJ.safetensors"
+    vace_lightning_high: str = "Wan2.2-Lightning_T2V-A14B-4steps-lora_HIGH_fp16.safetensors"
+    vace_lightning_low: str = "Wan2.2-Lightning_T2V-A14B-4steps-lora_LOW_fp16.safetensors"
+    vace_t5_model: str = "models_t5_umt5-xxl-enc-bf16.pth"
+    vace_steps: int = 6
+    vace_cfg: float = 1.0
+    vace_boundary: int = 3  # high expert runs [0, boundary], low runs [boundary, end]
+    vace_shift: float = 8.0
+    vace_blocks_to_swap: int = 25
+    vace_lightning: bool = True  # use the 4-step distill LoRAs (fast path)
+
     # PainterLongVideo motion parameters (identity anchoring)
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
     painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
