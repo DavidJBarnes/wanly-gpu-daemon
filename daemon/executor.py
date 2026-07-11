@@ -183,6 +183,25 @@ async def _run_ffmpeg(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-500:]}")
 
 
+async def _trim_video_start(video_data: bytes, seconds: float) -> bytes:
+    """Drop the first `seconds` from a video (frame-accurate, re-encoded). Returns bytes."""
+    if seconds <= 0:
+        return video_data
+    tmpdir = tempfile.mkdtemp(prefix="trim_")
+    try:
+        src = os.path.join(tmpdir, "in.mp4")
+        out = os.path.join(tmpdir, "out.mp4")
+        with open(src, "wb") as f:
+            f.write(video_data)
+        # -ss AFTER -i = frame-accurate output seeking.
+        await _run_ffmpeg(["-i", src, "-ss", f"{seconds:.4f}",
+                           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "15", out])
+        with open(out, "rb") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 async def _build_vace_control(
     video_data: bytes, keep_n: int, num_frames: int, width: int, height: int
 ) -> tuple[bytes, bytes]:
@@ -283,8 +302,11 @@ async def _execute_vace_continuation(
 
         # 2. Build control (kept tail + grey pad) + mask (keep + generate)
         await progress.log("[2/7] Building VACE control from tail...")
-        num_frames = vace_num_frames(segment)
-        keep_n = max(1, min(segment.vace_overlap_frames, num_frames - 4))
+        base_frames = vace_num_frames(segment)
+        keep_n = max(1, min(segment.vace_overlap_frames, base_frames - 4))
+        # Generate keep_n extra (reconstructed lead-in) frames, trimmed after decode, so the
+        # segment keeps its intended duration AND butts seamlessly onto the previous one.
+        num_frames = ((base_frames + keep_n - 1) // 4) * 4 + 1
         control_data, mask_data = await _build_vace_control(
             prev_data, keep_n, num_frames, segment.width, segment.height
         )
@@ -325,6 +347,9 @@ async def _execute_vace_continuation(
             subfolder=video_info.get("subfolder", ""),
             output_type=video_info.get("type", "output"),
         )
+        # Trim the reconstructed lead-in tail (keep_n frames @ GENERATION_FPS) so this segment
+        # butts seamlessly onto the previous one — stitch stays a plain concat, no dup tail.
+        result_data = await _trim_video_start(result_data, keep_n / GENERATION_FPS)
         last_frame_data = await _extract_last_frame(result_data)
         await queue.upload_segment_output(
             segment.id, result_data, last_frame_data, SegmentResult(status="completed")
