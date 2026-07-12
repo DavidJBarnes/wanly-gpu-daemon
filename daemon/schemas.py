@@ -70,3 +70,7 @@ class SegmentResult(BaseModel):
     progress_log: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
+    # Set by the VACE continuation path: length (seconds) of the reconstructed lead-in this
+    # segment carries. Stitch trims this much off the *previous* segment's tail so the
+    # reconstruction replaces it seamlessly.
+    vace_overlap_seconds: Optional[float] = None
