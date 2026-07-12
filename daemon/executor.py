@@ -484,6 +484,47 @@ async def _execute_faceswap_reprocess(
         )
 
 
+def _holo_process_frames_sync(
+    frame_files: list[str], packed_dir: str, key_color: str,
+    subject_height_m: float, rvm_model_path: str, fps: float,
+) -> tuple[str, int, int, bytes, dict]:
+    """CPU-heavy hologram work: load -> matte (chroma/RVM) -> crop -> pack -> poster + manifest.
+
+    Runs in a worker thread (asyncio.to_thread) so the daemon event loop stays free for the GPU
+    loop + heartbeat while a hologram builds. Writes packed frames to packed_dir; returns
+    (matte_mode, packed_w, packed_h, poster_png_bytes, manifest_dict).
+    """
+    arrs = [np.asarray(Image.open(ff).convert("RGB")) for ff in frame_files]
+    if detect_greenscreen(arrs[0], key_color):
+        mode = "chroma"
+        rgbs: list[np.ndarray] = []
+        alphas: list[np.ndarray] = []
+        for arr in arrs:
+            rgb, alpha = chroma_key_despill(arr, key_color)
+            rgbs.append(rgb)
+            alphas.append(alpha)
+    else:
+        mode = "rvm"
+        rgbs, alphas = rvm_matte(arrs, ensure_rvm_model(rvm_model_path))
+
+    x, y, cw, ch = union_alpha_bbox(alphas)
+    packed_w = packed_h = 0
+    for i, (rgb, alpha) in enumerate(zip(rgbs, alphas)):
+        crgb = edge_extend_color(rgb[y:y + ch, x:x + cw], alpha[y:y + ch, x:x + cw])
+        packed = pack_sbs(crgb, alpha[y:y + ch, x:x + cw])
+        if packed_w == 0:
+            packed_h, packed_w = packed.shape[0], packed.shape[1]
+        Image.fromarray(packed).save(os.path.join(packed_dir, f"{i:05d}.png"))
+
+    pal = (np.clip(alphas[0][y:y + ch, x:x + cw], 0.0, 1.0) * 255).astype(np.uint8)
+    poster_rgba = np.dstack([rgbs[0][y:y + ch, x:x + cw], pal])
+    poster_buf = io.BytesIO()
+    Image.fromarray(poster_rgba, "RGBA").save(poster_buf, format="PNG")
+
+    manifest = build_manifest(packed_w, packed_h, cw, GUARD_PX, fps, (x, y, cw, ch), subject_height_m)
+    return mode, packed_w, packed_h, poster_buf.getvalue(), manifest
+
+
 async def _execute_ar_hologram(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -525,37 +566,18 @@ async def _execute_ar_hologram(
         if not frame_files:
             raise RuntimeError("No frames extracted from source video")
 
-        # Auto-select the matte backend: chroma-key if the clip is on a green screen (cleanest
-        # edges), else Robust Video Matting for an arbitrary background (no green needed).
-        arrs = [np.asarray(Image.open(ff).convert("RGB")) for ff in frame_files]
-        rgbs: list[np.ndarray]
-        alphas: list[np.ndarray]
-        if detect_greenscreen(arrs[0], key_color):
-            await progress.log(f"[3/6] Green screen detected — chroma-key matting {len(arrs)} frames...")
-            rgbs, alphas = [], []
-            for arr in arrs:
-                rgb, alpha = chroma_key_despill(arr, key_color)
-                rgbs.append(rgb)
-                alphas.append(alpha)
-        else:
-            await progress.log(f"[3/6] No green screen — RVM matting {len(arrs)} frames...")
-            rgbs, alphas = rvm_matte(arrs, ensure_rvm_model(settings.rvm_model_path))
-
-        await progress.log("[4/6] Cropping + packing color+alpha...")
-        x, y, cw, ch = union_alpha_bbox(alphas)
+        # Heavy CPU work (load -> matte -> crop -> pack -> poster + manifest) runs in a thread so
+        # this hologram track runs concurrently with GPU generation without stalling the event loop.
+        await progress.log(f"[3/6] Matting + cropping + packing {len(frame_files)} frames...")
         packed_dir = os.path.join(tmpdir, "packed")
         os.makedirs(packed_dir)
-        packed_w = packed_h = 0
-        for i, (rgb, alpha) in enumerate(zip(rgbs, alphas)):
-            crgb = edge_extend_color(rgb[y:y + ch, x:x + cw], alpha[y:y + ch, x:x + cw])
-            packed = pack_sbs(crgb, alpha[y:y + ch, x:x + cw])
-            if packed_w == 0:
-                packed_h, packed_w = packed.shape[0], packed.shape[1]
-            Image.fromarray(packed).save(os.path.join(packed_dir, f"{i:05d}.png"))
-            if i and i % 100 == 0:
-                await progress.log(f"[4/6] Packed {i}/{len(rgbs)} frames...")
+        mode, packed_w, packed_h, poster_bytes, manifest = await asyncio.to_thread(
+            _holo_process_frames_sync, frame_files, packed_dir, key_color,
+            subject_height_m, settings.rvm_model_path, fps,
+        )
+        await progress.log(f"[4/6] Matted ({mode}) + packed {len(frame_files)} frames")
 
-        await progress.log("[5/6] Encoding packed mp4 + manifest + poster...")
+        await progress.log("[5/6] Encoding packed mp4...")
         packed_mp4 = os.path.join(tmpdir, "hologram.mp4")
         await _run_ffmpeg([
             "-framerate", f"{fps}", "-i", os.path.join(packed_dir, "%05d.png"),
@@ -564,15 +586,6 @@ async def _execute_ar_hologram(
         ])
         with open(packed_mp4, "rb") as f:
             packed_bytes = f.read()
-
-        # Poster: first frame's cropped subject on straight alpha (transparent PNG).
-        pal = (np.clip(alphas[0][y:y + ch, x:x + cw], 0.0, 1.0) * 255).astype(np.uint8)
-        poster_rgba = np.dstack([rgbs[0][y:y + ch, x:x + cw], pal])
-        poster_buf = io.BytesIO()
-        Image.fromarray(poster_rgba, "RGBA").save(poster_buf, format="PNG")
-        poster_bytes = poster_buf.getvalue()
-
-        manifest = build_manifest(packed_w, packed_h, cw, GUARD_PX, fps, (x, y, cw, ch), subject_height_m)
         manifest_bytes = json.dumps(manifest).encode("utf-8")
 
         await progress.log("[6/6] Uploading hologram...")

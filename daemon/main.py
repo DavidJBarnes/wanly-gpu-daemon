@@ -190,7 +190,7 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
             continue
 
         try:
-            segment = await queue.claim_next(worker_id, friendly_name_ref[0])
+            segment = await queue.claim_next(worker_id, friendly_name_ref[0], kind="gpu")
         except Exception as e:
             logger.error("Poll failed: %s", e)
             continue
@@ -250,6 +250,41 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
                         await queue.update_status(worker_id, "online-idle")
                     except Exception as e:
                         logger.error("Failed to update status to idle: %s", e)
+
+
+async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event):
+    """Poll for CPU-only AR hologram work and run it CONCURRENTLY with GPU generation.
+
+    Holograms never touch ComfyUI/the GPU, so this loop skips the ComfyUI-busy gate and runs
+    alongside job_poll_loop. _execute_ar_hologram offloads its heavy numpy/RVM/ffmpeg work to a
+    thread, keeping the event loop free for the GPU loop + heartbeat.
+    """
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=settings.poll_interval)
+        except asyncio.TimeoutError:
+            pass
+        if shutdown_event.is_set():
+            break
+        try:
+            segment = await queue.claim_next(worker_id, friendly_name_ref[0], kind="hologram")
+        except Exception as e:
+            logger.error("Hologram poll failed: %s", e)
+            continue
+        if segment is None:
+            continue
+        try:
+            await execute_segment(segment, comfyui, queue)
+        except Exception as e:
+            logger.exception("Unexpected error executing hologram segment %s", segment.id)
+            try:
+                from daemon.schemas import SegmentResult
+                await queue.update_segment(
+                    segment.id,
+                    SegmentResult(status="failed", error_message=f"{type(e).__name__}: {e}"[:2000]),
+                )
+            except Exception as report_err:
+                logger.error("Failed to report hologram failure: %s", report_err)
 
 
 async def _stop_runpod_pod():
@@ -406,8 +441,11 @@ async def run():
         job_task = asyncio.create_task(
             job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event)
         )
+        holo_task = asyncio.create_task(
+            hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event)
+        )
 
-        await asyncio.gather(heartbeat_task, job_task)
+        await asyncio.gather(heartbeat_task, job_task, holo_task)
     finally:
         # Graceful shutdown: wait for current segment if executing
         if executing_event.is_set():
