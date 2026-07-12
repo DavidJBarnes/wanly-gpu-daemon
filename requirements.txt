@@ -1,4 +1,6 @@
 httpx
+numpy
+onnxruntime
 opencv-python-headless
 Pillow
 pydantic-settings

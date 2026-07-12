@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     vace_blocks_to_swap: int = 25
     vace_lightning: bool = True  # use the 4-step distill LoRAs (fast path)
 
+    # AR hologram: Robust Video Matting ONNX model (auto-used when a clip is NOT green-screen).
+    # ~15MB; auto-downloaded on first use if missing. Path is relative to the daemon workdir.
+    rvm_model_path: str = "models/rvm_mobilenetv3_fp32.onnx"
+
     # PainterLongVideo motion parameters (identity anchoring)
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
     painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
