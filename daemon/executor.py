@@ -347,12 +347,16 @@ async def _execute_vace_continuation(
             subfolder=video_info.get("subfolder", ""),
             output_type=video_info.get("type", "output"),
         )
-        # Trim the reconstructed lead-in tail (keep_n frames @ GENERATION_FPS) so this segment
-        # butts seamlessly onto the previous one — stitch stays a plain concat, no dup tail.
-        result_data = await _trim_video_start(result_data, keep_n / GENERATION_FPS)
+        # Do NOT trim the reconstructed lead-in here: those keep_n frames are the smooth
+        # bridge to the previous segment (the generation follows the reconstruction, which
+        # drifts slightly from the previous segment's actual tail — dropping the bridge and
+        # jumping to the first generated frame left a boundary hitch). Instead report the
+        # overlap so stitch trims the *previous* segment's tail, letting this reconstruction
+        # replace it (consecutive frames = seamless).
         last_frame_data = await _extract_last_frame(result_data)
         await queue.upload_segment_output(
-            segment.id, result_data, last_frame_data, SegmentResult(status="completed")
+            segment.id, result_data, last_frame_data,
+            SegmentResult(status="completed", vace_overlap_seconds=keep_n / GENERATION_FPS),
         )
         logger.info("VACE continuation segment %d complete in %.1fs",
                     segment.index, time.monotonic() - segment_start)
