@@ -77,6 +77,23 @@ class QueueClient:
         ):
             await self.update_segment(segment_id, result)
 
+    async def upload_hologram_output(
+        self, segment_id: uuid.UUID, video_data: bytes, manifest_data: bytes, poster_data: bytes
+    ) -> None:
+        """Upload AR hologram artifacts (packed color+alpha mp4 + manifest + poster) to the API."""
+        resp = await self.client.post(
+            f"/segments/{segment_id}/hologram_upload",
+            files={
+                "video": ("hologram.mp4", video_data, "video/mp4"),
+                "manifest": ("hologram.json", manifest_data, "application/json"),
+                "poster": ("poster.png", poster_data, "image/png"),
+            },
+            timeout=300,
+        )
+        if not resp.is_success:
+            _raise_with_details(resp, f"upload_hologram_output {segment_id}")
+        logger.info("Uploaded hologram output via API for %s", segment_id)
+
     async def download_file(self, s3_path: str) -> bytes:
         """Download a file from S3 via a presigned URL redirect.
 
