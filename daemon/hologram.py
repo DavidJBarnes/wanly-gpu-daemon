@@ -9,6 +9,8 @@ drop-in: implement `rvm_matte(frames) -> alphas` and branch in the executor.
 """
 from __future__ import annotations
 
+import os
+
 import cv2
 import numpy as np
 
@@ -132,6 +134,64 @@ def pack_sbs(rgb: np.ndarray, alpha: np.ndarray, guard_px: int = GUARD_PX) -> np
     if packed.shape[1] % 2:
         packed = np.concatenate([packed, np.zeros((h, 1, 3), dtype=np.uint8)], axis=1)
     return packed
+
+
+RVM_MODEL_URL = (
+    "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/"
+    "rvm_mobilenetv3_fp32.onnx"
+)
+_RVM_SESSION = None
+
+
+def ensure_rvm_model(path: str) -> str:
+    """Return the RVM ONNX model path, downloading it (~15MB) on first use if missing."""
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        import urllib.request
+
+        urllib.request.urlretrieve(RVM_MODEL_URL, path)
+    return path
+
+
+def _rvm_session(model_path: str):
+    global _RVM_SESSION
+    if _RVM_SESSION is None:
+        import onnxruntime as ort
+
+        _RVM_SESSION = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    return _RVM_SESSION
+
+
+def rvm_matte(
+    frames_rgb: list[np.ndarray], model_path: str
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Robust Video Matting (ONNX) — mattes arbitrary backgrounds, no green screen needed.
+
+    Sequential with carried recurrent state (r1..r4) for temporal stability; resetting the
+    state mid-clip causes visible alpha pops. Returns (decontaminated foreground RGB uint8,
+    straight alpha float32 0..1) per frame — same shape as chroma_key_despill so the crop +
+    pack stages are identical.
+    """
+    sess = _rvm_session(model_path)
+    rec: list[np.ndarray] = [np.zeros([1, 1, 1, 1], dtype=np.float32) for _ in range(4)]
+    h, w = frames_rgb[0].shape[:2]
+    ratio = float(np.clip(512.0 / max(h, w), 0.1, 1.0))  # RVM: downsample longer side to ~512px
+    downsample = np.array([ratio], dtype=np.float32)
+    rgbs: list[np.ndarray] = []
+    alphas: list[np.ndarray] = []
+    for frame in frames_rgb:
+        src = (frame.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]  # [1,3,H,W]
+        fgr, pha, *rec = sess.run(
+            ["fgr", "pha", "r1o", "r2o", "r3o", "r4o"],
+            {
+                "src": src,
+                "r1i": rec[0], "r2i": rec[1], "r3i": rec[2], "r4i": rec[3],
+                "downsample_ratio": downsample,
+            },
+        )
+        rgbs.append((np.clip(fgr[0].transpose(1, 2, 0), 0.0, 1.0) * 255).astype(np.uint8))
+        alphas.append(pha[0, 0].astype(np.float32))
+    return rgbs, alphas
 
 
 def build_manifest(packed_w: int, packed_h: int, color_w: int, guard_px: int, fps: float,

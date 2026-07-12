@@ -46,8 +46,11 @@ from daemon.hologram import (
     GUARD_PX,
     build_manifest,
     chroma_key_despill,
+    detect_greenscreen,
     edge_extend_color,
+    ensure_rvm_model,
     pack_sbs,
+    rvm_matte,
     union_alpha_bbox,
 )
 
@@ -522,14 +525,21 @@ async def _execute_ar_hologram(
         if not frame_files:
             raise RuntimeError("No frames extracted from source video")
 
-        await progress.log(f"[3/6] Matting {len(frame_files)} frames (chroma-key + despill)...")
-        rgbs: list[np.ndarray] = []
-        alphas: list[np.ndarray] = []
-        for ff in frame_files:
-            arr = np.asarray(Image.open(ff).convert("RGB"))
-            rgb, alpha = chroma_key_despill(arr, key_color)
-            rgbs.append(rgb)
-            alphas.append(alpha)
+        # Auto-select the matte backend: chroma-key if the clip is on a green screen (cleanest
+        # edges), else Robust Video Matting for an arbitrary background (no green needed).
+        arrs = [np.asarray(Image.open(ff).convert("RGB")) for ff in frame_files]
+        rgbs: list[np.ndarray]
+        alphas: list[np.ndarray]
+        if detect_greenscreen(arrs[0], key_color):
+            await progress.log(f"[3/6] Green screen detected — chroma-key matting {len(arrs)} frames...")
+            rgbs, alphas = [], []
+            for arr in arrs:
+                rgb, alpha = chroma_key_despill(arr, key_color)
+                rgbs.append(rgb)
+                alphas.append(alpha)
+        else:
+            await progress.log(f"[3/6] No green screen — RVM matting {len(arrs)} frames...")
+            rgbs, alphas = rvm_matte(arrs, ensure_rvm_model(settings.rvm_model_path))
 
         await progress.log("[4/6] Cropping + packing color+alpha...")
         x, y, cw, ch = union_alpha_bbox(alphas)
