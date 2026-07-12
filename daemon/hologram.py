@@ -109,19 +109,31 @@ def union_alpha_bbox(alphas: list[np.ndarray], thresh: float = 0.5, pad_frac: fl
     return (x0, y0, cw, ch)
 
 
-def edge_extend_color(rgb: np.ndarray, alpha: np.ndarray, radius: int = 6) -> np.ndarray:
-    """Fill the background (alpha<0.5) with edge-extended subject color.
+def edge_extend_color(rgb: np.ndarray, alpha: np.ndarray, grow_px: int = 8) -> np.ndarray:
+    """Grow the subject's edge color a few px into the background (alpha<0.5).
 
-    Straight alpha means the color under alpha=0 is otherwise garbage; extending the
-    subject's edge color outward stops 4:2:0 chroma subsampling from bleeding a hard
-    background color across the matte edge (dark/colored halos). Shader premultiplies later.
+    Straight alpha means the color under alpha=0 is otherwise garbage; pushing the subject's
+    edge color outward stops 4:2:0 chroma subsampling from bleeding a hard background color
+    across the matte edge (dark/colored halos). Shader premultiplies later.
+
+    Cheap dilation-based push (iteratively dilate the known/foreground region, filling newly
+    covered pixels from a local blur) — ~15x faster than cv2.inpaint and plenty since the
+    shader cuts on alpha and only needs the near-edge band clean.
     """
-    bg_mask = (alpha < 0.5).astype(np.uint8) * 255
-    if int(bg_mask.max()) == 0:
+    known = (alpha >= 0.5).astype(np.uint8)
+    if not known.any() or known.all():
         return rgb
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    filled = cv2.inpaint(bgr, bg_mask, radius, cv2.INPAINT_TELEA)
-    return cv2.cvtColor(filled, cv2.COLOR_BGR2RGB)
+    filled = rgb.copy()
+    kernel = np.ones((3, 3), np.uint8)
+    for _ in range(grow_px):
+        dilated = cv2.dilate(known, kernel)
+        newly = dilated > known
+        if not newly.any():
+            break
+        blurred = cv2.blur(filled, (3, 3))
+        filled[newly] = blurred[newly]
+        known = dilated
+    return filled
 
 
 def pack_sbs(rgb: np.ndarray, alpha: np.ndarray, guard_px: int = GUARD_PX) -> np.ndarray:

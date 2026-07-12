@@ -552,6 +552,8 @@ async def _execute_ar_hologram(
             if packed_w == 0:
                 packed_h, packed_w = packed.shape[0], packed.shape[1]
             Image.fromarray(packed).save(os.path.join(packed_dir, f"{i:05d}.png"))
+            if i and i % 100 == 0:
+                await progress.log(f"[4/6] Packed {i}/{len(rgbs)} frames...")
 
         await progress.log("[5/6] Encoding packed mp4 + manifest + poster...")
         packed_mp4 = os.path.join(tmpdir, "hologram.mp4")
