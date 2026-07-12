@@ -16,6 +16,7 @@ On error → report failure to queue
 import asyncio
 import glob
 import io
+import json
 import logging
 import os
 import shutil
@@ -23,6 +24,7 @@ import tempfile
 import time
 
 import httpx
+import numpy as np
 from PIL import Image
 
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
@@ -40,6 +42,14 @@ from daemon.workflow_builder import (
     vace_num_frames,
 )
 from daemon.config import settings
+from daemon.hologram import (
+    GUARD_PX,
+    build_manifest,
+    chroma_key_despill,
+    edge_extend_color,
+    pack_sbs,
+    union_alpha_bbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -471,6 +481,103 @@ async def _execute_faceswap_reprocess(
         )
 
 
+async def _execute_ar_hologram(
+    segment: SegmentClaim,
+    comfyui: ComfyUIClient,
+    queue: QueueClient,
+) -> None:
+    """Matte a finalized clip into a packed color+alpha 'hologram' + manifest + poster.
+
+    Tier-0 (flat/mono), chroma-key only in v1. Pure ffmpeg/numpy/cv2 — no ComfyUI. The
+    source is the job's finalized stitched video (hologram_source_path), NOT this carrier
+    segment's own output.
+    """
+    key_color = segment.hologram_key_color or "0x00b140"
+    subject_height_m = segment.hologram_subject_height_m or 1.70
+    logger.info(
+        "=== AR hologram segment %d (job %s) === key=%s height=%.2fm",
+        segment.index, str(segment.job_id)[:8], key_color, subject_height_m,
+    )
+    progress = ProgressLog(segment.id, queue)
+    t0 = time.monotonic()
+    tmpdir = tempfile.mkdtemp(prefix="holo_")
+    try:
+        if not segment.hologram_source_path:
+            raise RuntimeError("No hologram_source_path — job has no finalized video to source from")
+        fps = float(segment.fps) or 30.0
+
+        await progress.log("[1/6] Downloading source video...")
+        video_data = await _download_with_retry(
+            lambda: queue.download_file(segment.hologram_source_path), "hologram_source"
+        )
+        src = os.path.join(tmpdir, "src.mp4")
+        with open(src, "wb") as f:
+            f.write(video_data)
+
+        await progress.log("[2/6] Extracting frames...")
+        frames_dir = os.path.join(tmpdir, "frames")
+        os.makedirs(frames_dir)
+        await _run_ffmpeg(["-i", src, "-vsync", "0", os.path.join(frames_dir, "%05d.png")])
+        frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
+        if not frame_files:
+            raise RuntimeError("No frames extracted from source video")
+
+        await progress.log(f"[3/6] Matting {len(frame_files)} frames (chroma-key + despill)...")
+        rgbs: list[np.ndarray] = []
+        alphas: list[np.ndarray] = []
+        for ff in frame_files:
+            arr = np.asarray(Image.open(ff).convert("RGB"))
+            rgb, alpha = chroma_key_despill(arr, key_color)
+            rgbs.append(rgb)
+            alphas.append(alpha)
+
+        await progress.log("[4/6] Cropping + packing color+alpha...")
+        x, y, cw, ch = union_alpha_bbox(alphas)
+        packed_dir = os.path.join(tmpdir, "packed")
+        os.makedirs(packed_dir)
+        packed_w = packed_h = 0
+        for i, (rgb, alpha) in enumerate(zip(rgbs, alphas)):
+            crgb = edge_extend_color(rgb[y:y + ch, x:x + cw], alpha[y:y + ch, x:x + cw])
+            packed = pack_sbs(crgb, alpha[y:y + ch, x:x + cw])
+            if packed_w == 0:
+                packed_h, packed_w = packed.shape[0], packed.shape[1]
+            Image.fromarray(packed).save(os.path.join(packed_dir, f"{i:05d}.png"))
+
+        await progress.log("[5/6] Encoding packed mp4 + manifest + poster...")
+        packed_mp4 = os.path.join(tmpdir, "hologram.mp4")
+        await _run_ffmpeg([
+            "-framerate", f"{fps}", "-i", os.path.join(packed_dir, "%05d.png"),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "12",
+            "-movflags", "+faststart", packed_mp4,
+        ])
+        with open(packed_mp4, "rb") as f:
+            packed_bytes = f.read()
+
+        # Poster: first frame's cropped subject on straight alpha (transparent PNG).
+        pal = (np.clip(alphas[0][y:y + ch, x:x + cw], 0.0, 1.0) * 255).astype(np.uint8)
+        poster_rgba = np.dstack([rgbs[0][y:y + ch, x:x + cw], pal])
+        poster_buf = io.BytesIO()
+        Image.fromarray(poster_rgba, "RGBA").save(poster_buf, format="PNG")
+        poster_bytes = poster_buf.getvalue()
+
+        manifest = build_manifest(packed_w, packed_h, cw, GUARD_PX, fps, (x, y, cw, ch), subject_height_m)
+        manifest_bytes = json.dumps(manifest).encode("utf-8")
+
+        await progress.log("[6/6] Uploading hologram...")
+        await queue.upload_hologram_output(segment.id, packed_bytes, manifest_bytes, poster_bytes)
+        logger.info("AR hologram segment %d complete in %.1fs", segment.index, time.monotonic() - t0)
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        logger.exception("AR hologram segment %s failed", segment.id)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 async def execute_segment(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -479,6 +586,9 @@ async def execute_segment(
     """Execute a single segment end-to-end."""
     if segment.reprocess_type == "faceswap":
         return await _execute_faceswap_reprocess(segment, comfyui, queue)
+
+    if segment.reprocess_type == "ar_hologram":
+        return await _execute_ar_hologram(segment, comfyui, queue)
 
     # VACE video-conditioned continuation (resolved API-side). Capability-gated: a worker
     # without the Fun-VACE models/nodes silently falls through to the traditional i2v path.

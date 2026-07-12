@@ -54,6 +54,10 @@ class SegmentClaim(BaseModel):
     continuation_mode: str = "traditional"
     previous_output_path: Optional[str] = None
     vace_overlap_frames: int = 12
+    # AR hologram (reprocess_type="ar_hologram"): source = the job's finalized stitched video.
+    hologram_source_path: Optional[str] = None
+    hologram_key_color: Optional[str] = None
+    hologram_subject_height_m: Optional[float] = None
     width: int
     height: int
     fps: int
