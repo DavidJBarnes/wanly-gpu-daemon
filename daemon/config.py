@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     # ~15MB; auto-downloaded on first use if missing. Path is relative to the daemon workdir.
     rvm_model_path: str = "models/rvm_mobilenetv3_fp32.onnx"
 
+    # AR hologram "2.5d_depth" flavor: monocular depth model (Depth Anything V2 small, ONNX).
+    # ~100MB; auto-downloaded on first use. Runs on GPU when onnxruntime-gpu is present, else CPU.
+    depth_model_path: str = "models/depth_anything_v2_vits.onnx"
+    depth_model_url: str = (
+        "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"
+    )
+    # Relief depth in meters: how far the nearest subject pixels are pushed toward the viewer
+    # in the displaced mesh. Aesthetic knob — tune by eye on the Quest 3.
+    depth_scale_m: float = 0.12
+
     # PainterLongVideo motion parameters (identity anchoring)
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
     painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length

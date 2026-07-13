@@ -148,6 +148,21 @@ def pack_sbs(rgb: np.ndarray, alpha: np.ndarray, guard_px: int = GUARD_PX) -> np
     return packed
 
 
+def pack_sbs_depth(
+    rgb: np.ndarray, alpha: np.ndarray, depth_u8: np.ndarray, guard_px: int = GUARD_PX
+) -> np.ndarray:
+    """Pack one frame: [ color | guard | alpha-in-luma | guard | depth-in-luma ]. Even width."""
+    h = rgb.shape[0]
+    a8 = (np.clip(alpha, 0.0, 1.0) * 255).astype(np.uint8)
+    a3 = np.repeat(a8[:, :, None], 3, axis=2)
+    d3 = np.repeat(depth_u8[:, :, None], 3, axis=2)
+    guard = np.zeros((h, guard_px, 3), dtype=np.uint8)
+    packed = np.concatenate([rgb, guard, a3, guard, d3], axis=1)
+    if packed.shape[1] % 2:
+        packed = np.concatenate([packed, np.zeros((h, 1, 3), dtype=np.uint8)], axis=1)
+    return packed
+
+
 RVM_MODEL_URL = (
     "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/"
     "rvm_mobilenetv3_fp32.onnx"
@@ -207,18 +222,25 @@ def rvm_matte(
 
 
 def build_manifest(packed_w: int, packed_h: int, color_w: int, guard_px: int, fps: float,
-                   crop_rect: tuple[int, int, int, int], subject_height_m: float) -> dict:
-    """Player manifest. UV rects (top-left origin, normalized) so the shader is resolution-agnostic."""
+                   crop_rect: tuple[int, int, int, int], subject_height_m: float,
+                   flavor: str = "2d_matte", depth_scale_m: float | None = None) -> dict:
+    """Player manifest. UV rects (top-left origin, normalized) so the shader is resolution-agnostic.
+
+    "2d_matte" packs [color | guard | alpha]; "2.5d_depth" appends [guard | depth] and adds the
+    depth region + relief scale so the player can displace a subdivided mesh (bright = near).
+    """
     total = float(packed_w)
-    return {
-        "tier": 0,
-        "layout": "sbs_color_alpha",
+    cw_uv = color_w / total
+    manifest = {
+        "tier": 1 if flavor == "2.5d_depth" else 0,
+        "flavor": flavor,
+        "layout": "sbs_color_alpha_depth" if flavor == "2.5d_depth" else "sbs_color_alpha",
         "codec": "h264",
         "fps": round(float(fps), 3),
         "video_width": int(packed_w),
         "video_height": int(packed_h),
-        "region_color_uv": {"x": 0.0, "y": 0.0, "w": color_w / total, "h": 1.0},
-        "region_alpha_uv": {"x": (color_w + guard_px) / total, "y": 0.0, "w": color_w / total, "h": 1.0},
+        "region_color_uv": {"x": 0.0, "y": 0.0, "w": cw_uv, "h": 1.0},
+        "region_alpha_uv": {"x": (color_w + guard_px) / total, "y": 0.0, "w": cw_uv, "h": 1.0},
         "guard_px": int(guard_px),
         "crop_rect": {"x": int(crop_rect[0]), "y": int(crop_rect[1]), "w": int(crop_rect[2]), "h": int(crop_rect[3])},
         "subject_px_height": int(crop_rect[3]),
@@ -226,3 +248,11 @@ def build_manifest(packed_w: int, packed_h: int, color_w: int, guard_px: int, fp
         "premultiplied": False,
         "alpha_encoding": "luma",
     }
+    if flavor == "2.5d_depth":
+        manifest["region_depth_uv"] = {
+            "x": (2 * color_w + 2 * guard_px) / total, "y": 0.0, "w": cw_uv, "h": 1.0,
+        }
+        manifest["depth_encoding"] = "disparity_luma"
+        manifest["depth_near_is"] = "bright"
+        manifest["depth_scale_m"] = float(depth_scale_m if depth_scale_m is not None else 0.12)
+    return manifest
