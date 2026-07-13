@@ -508,8 +508,15 @@ def build_vace_workflow(
         "input_masks": ["532", 0]}}
 
     steps, cfg, boundary, shift = settings.vace_steps, settings.vace_cfg, settings.vace_boundary, settings.vace_shift
-    # VACE sampler has no sampler_name (WanVideoSampler); only the scheduler is preset-driven.
-    vace_scheduler = segment.scheduler or "unipc"
+    # WanVideoSampler has no sampler_name and its own scheduler set — NOT the KSampler names
+    # (e.g. "simple") the preset carries for the traditional path. Only honor the preset's
+    # scheduler if WanVideoSampler accepts it; otherwise keep unipc (else ComfyUI 400s).
+    _VACE_SCHEDULERS = {
+        "unipc", "unipc/beta", "dpm++", "dpm++/beta", "dpm++_sde", "dpm++_sde/beta",
+        "euler", "euler/beta", "deis", "lcm", "lcm/beta", "res_multistep",
+        "flowmatch_causvid", "flowmatch_distill", "flowmatch_pusa", "multitalk",
+    }
+    vace_scheduler = segment.scheduler if segment.scheduler in _VACE_SCHEDULERS else "unipc"
     wf["550"] = {"class_type": "WanVideoSampler", "inputs": {
         "model": ["510", 0], "image_embeds": ["540", 0], "text_embeds": ["521", 0],
         "steps": steps, "cfg": cfg, "shift": shift, "seed": segment.seed, "force_offload": True,
