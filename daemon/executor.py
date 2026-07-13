@@ -57,6 +57,14 @@ from daemon.hologram import (
 from daemon.depth import ensure_depth_model, estimate_depth, normalize_depth_clip
 from daemon.face_crop import extract_best_face
 
+# HACK (temp): the auto face-crop for the VACE identity reference is unreliable, so feed VACE a
+# known-good canonical face per character LoRA instead, keyed by char lora_id. Remove once the
+# crop is fixed (or replaced with insightface).
+_HARDCODE_VACE_FACE = {
+    "b86c19a9-20aa-44de-85e9-aab2a4ca4809": "s3://wanly-loras/hardcode/k3lly2026_face.png",
+    "5427b202-76da-4a15-aa8a-75e375c4d7d0": "s3://wanly-loras/hardcode/k3llydw_face.png",
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -334,7 +342,19 @@ async def _execute_vace_continuation(
         ref_source = segment.initial_reference_image
         is_persisted_crop = bool(ref_source) and "identity_reference.png" in ref_source
         ref_data = None
-        if not is_persisted_crop:
+        # HACK: if the segment uses a character LoRA we have a canonical face for, use that face
+        # as the VACE identity reference (bypasses the unreliable auto-crop).
+        hardcode_uri = next(
+            (_HARDCODE_VACE_FACE[l.lora_id] for l in (segment.loras or [])
+             if l.lora_id in _HARDCODE_VACE_FACE),
+            None,
+        )
+        if hardcode_uri:
+            await progress.log("[3/7] Using hardcoded canonical identity face (VACE ref override)")
+            ref_data = await _download_with_retry(
+                lambda: queue.download_file(hardcode_uri), "vace_ref_hardcode"
+            )
+        elif not is_persisted_crop:
             face_png = await asyncio.to_thread(extract_best_face, prev_data)
             if face_png:
                 await progress.log("[3/7] Cropped canonical identity face from seg0")
