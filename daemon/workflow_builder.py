@@ -508,14 +508,16 @@ def build_vace_workflow(
         "input_masks": ["532", 0]}}
 
     steps, cfg, boundary, shift = settings.vace_steps, settings.vace_cfg, settings.vace_boundary, settings.vace_shift
+    # VACE sampler has no sampler_name (WanVideoSampler); only the scheduler is preset-driven.
+    vace_scheduler = segment.scheduler or "unipc"
     wf["550"] = {"class_type": "WanVideoSampler", "inputs": {
         "model": ["510", 0], "image_embeds": ["540", 0], "text_embeds": ["521", 0],
         "steps": steps, "cfg": cfg, "shift": shift, "seed": segment.seed, "force_offload": True,
-        "scheduler": "unipc", "riflex_freq_index": 0, "start_step": 0, "end_step": boundary}}
+        "scheduler": vace_scheduler, "riflex_freq_index": 0, "start_step": 0, "end_step": boundary}}
     wf["551"] = {"class_type": "WanVideoSampler", "inputs": {
         "model": ["511", 0], "image_embeds": ["540", 0], "text_embeds": ["521", 0],
         "samples": ["550", 0], "steps": steps, "cfg": cfg, "shift": shift, "seed": segment.seed,
-        "force_offload": True, "scheduler": "unipc", "riflex_freq_index": 0,
+        "force_offload": True, "scheduler": vace_scheduler, "riflex_freq_index": 0,
         "start_step": boundary, "end_step": -1}}
 
     wf["560"] = {"class_type": "WanVideoDecode", "inputs": {
@@ -607,6 +609,14 @@ def build_workflow(
     flow_shift = segment.flow_shift if segment.flow_shift is not None else settings.flow_shift
     workflow["104"]["inputs"]["shift"] = flow_shift  # high expert ModelSamplingSD3
     workflow["103"]["inputs"]["shift"] = flow_shift  # low expert ModelSamplingSD3
+
+    # Optional sampler/scheduler from the preset (empty -> keep the template's euler/simple).
+    if segment.sampler_name:
+        workflow["86"]["inputs"]["sampler_name"] = segment.sampler_name
+        workflow["85"]["inputs"]["sampler_name"] = segment.sampler_name
+    if segment.scheduler:
+        workflow["86"]["inputs"]["scheduler"] = segment.scheduler
+        workflow["85"]["inputs"]["scheduler"] = segment.scheduler
 
     # De-distill bypass: when a lightx2v strength is 0, drop that Lightning LoRA from the graph
     # (repoint its consumer past it) so the expert runs raw and CFG > 1 does real work.
