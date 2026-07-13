@@ -45,6 +45,8 @@ class SegmentClaim(BaseModel):
     steps_total: Optional[int] = None       # per-job sampler schedule length (None -> daemon default)
     high_noise_steps: Optional[int] = None   # high/low split boundary (None -> daemon default)
     flow_shift: Optional[float] = None       # ModelSamplingSD3 shift (None -> daemon default)
+    sampler_name: Optional[str] = None       # KSampler sampler (None/"" -> daemon default euler)
+    scheduler: Optional[str] = None          # KSampler/VACE scheduler (None/"" -> euler:simple, vace:unipc)
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
