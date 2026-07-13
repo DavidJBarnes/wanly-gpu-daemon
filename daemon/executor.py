@@ -55,6 +55,7 @@ from daemon.hologram import (
     union_alpha_bbox,
 )
 from daemon.depth import ensure_depth_model, estimate_depth, normalize_depth_clip
+from daemon.face_crop import extract_best_face
 
 logger = logging.getLogger(__name__)
 
@@ -326,14 +327,29 @@ async def _execute_vace_continuation(
             prev_data, keep_n, num_frames, segment.width, segment.height
         )
 
-        # 3. Reference image (identity anchor): job start image, else prev last frame
+        # 3. Reference image (identity anchor). Canonical seg0 face crop, persisted on the job and
+        # reused for every downstream segment so identity re-anchors at each cut. On the FIRST
+        # continuation the job has no crop yet (ref_source is the job's start image), so derive it
+        # from seg0 (= prev_data here) and persist it for the segments that follow.
         ref_source = segment.initial_reference_image
-        if ref_source and ref_source.startswith("s3://"):
-            ref_data = await _download_with_retry(
-                lambda: queue.download_file(ref_source), "vace_reference"
-            )
-        else:
-            ref_data = await _extract_last_frame(prev_data)
+        is_persisted_crop = bool(ref_source) and "identity_reference.png" in ref_source
+        ref_data = None
+        if not is_persisted_crop:
+            face_png = await asyncio.to_thread(extract_best_face, prev_data)
+            if face_png:
+                await progress.log("[3/7] Cropped canonical identity face from seg0")
+                try:
+                    await queue.upload_identity_reference(str(segment.job_id), face_png)
+                except Exception:
+                    logger.exception("identity reference upload failed (non-fatal)")
+                ref_data = face_png
+        if ref_data is None:
+            if ref_source and ref_source.startswith("s3://"):
+                ref_data = await _download_with_retry(
+                    lambda: queue.download_file(ref_source), "vace_reference"
+                )
+            else:
+                ref_data = await _extract_last_frame(prev_data)
 
         # 4. Upload control assets to ComfyUI
         await progress.log("[3/7] Uploading control assets to ComfyUI...")
