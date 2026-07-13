@@ -50,9 +50,11 @@ from daemon.hologram import (
     edge_extend_color,
     ensure_rvm_model,
     pack_sbs,
+    pack_sbs_depth,
     rvm_matte,
     union_alpha_bbox,
 )
+from daemon.depth import ensure_depth_model, estimate_depth, normalize_depth_clip
 
 logger = logging.getLogger(__name__)
 
@@ -487,12 +489,15 @@ async def _execute_faceswap_reprocess(
 def _holo_process_frames_sync(
     frame_files: list[str], packed_dir: str, key_color: str,
     subject_height_m: float, rvm_model_path: str, fps: float,
+    flavor: str = "2d_matte", depth_model_path: str = "", depth_model_url: str = "",
+    depth_scale_m: float = 0.12,
 ) -> tuple[str, int, int, bytes, dict]:
-    """CPU-heavy hologram work: load -> matte (chroma/RVM) -> crop -> pack -> poster + manifest.
+    """CPU-heavy hologram work: load -> matte (chroma/RVM) -> [depth] -> crop -> pack -> poster + manifest.
 
     Runs in a worker thread (asyncio.to_thread) so the daemon event loop stays free for the GPU
     loop + heartbeat while a hologram builds. Writes packed frames to packed_dir; returns
-    (matte_mode, packed_w, packed_h, poster_png_bytes, manifest_dict).
+    (matte_mode, packed_w, packed_h, poster_png_bytes, manifest_dict). For "2.5d_depth" each frame
+    additionally carries a depth region (bright = near) for the player's displaced mesh.
     """
     arrs = [np.asarray(Image.open(ff).convert("RGB")) for ff in frame_files]
     if detect_greenscreen(arrs[0], key_color):
@@ -508,10 +513,23 @@ def _holo_process_frames_sync(
         rgbs, alphas = rvm_matte(arrs, ensure_rvm_model(rvm_model_path))
 
     x, y, cw, ch = union_alpha_bbox(alphas)
+
+    depth_u8: list[np.ndarray] = []
+    if flavor == "2.5d_depth":
+        mode += "+depth"
+        dpath = ensure_depth_model(depth_model_path, depth_model_url)
+        # Depth on the full frame (scene context); normalize_depth_clip crops to the subject bbox.
+        raw_depths = [estimate_depth(arr, dpath) for arr in arrs]
+        depth_u8 = normalize_depth_clip(raw_depths, alphas, (x, y, cw, ch))
+
     packed_w = packed_h = 0
     for i, (rgb, alpha) in enumerate(zip(rgbs, alphas)):
         crgb = edge_extend_color(rgb[y:y + ch, x:x + cw], alpha[y:y + ch, x:x + cw])
-        packed = pack_sbs(crgb, alpha[y:y + ch, x:x + cw])
+        acrop = alpha[y:y + ch, x:x + cw]
+        if flavor == "2.5d_depth":
+            packed = pack_sbs_depth(crgb, acrop, depth_u8[i])
+        else:
+            packed = pack_sbs(crgb, acrop)
         if packed_w == 0:
             packed_h, packed_w = packed.shape[0], packed.shape[1]
         Image.fromarray(packed).save(os.path.join(packed_dir, f"{i:05d}.png"))
@@ -521,7 +539,10 @@ def _holo_process_frames_sync(
     poster_buf = io.BytesIO()
     Image.fromarray(poster_rgba, "RGBA").save(poster_buf, format="PNG")
 
-    manifest = build_manifest(packed_w, packed_h, cw, GUARD_PX, fps, (x, y, cw, ch), subject_height_m)
+    manifest = build_manifest(
+        packed_w, packed_h, cw, GUARD_PX, fps, (x, y, cw, ch), subject_height_m,
+        flavor=flavor, depth_scale_m=depth_scale_m,
+    )
     return mode, packed_w, packed_h, poster_buf.getvalue(), manifest
 
 
@@ -538,9 +559,10 @@ async def _execute_ar_hologram(
     """
     key_color = segment.hologram_key_color or "0x00b140"
     subject_height_m = segment.hologram_subject_height_m or 1.70
+    flavor = segment.hologram_flavor or "2d_matte"
     logger.info(
-        "=== AR hologram segment %d (job %s) === key=%s height=%.2fm",
-        segment.index, str(segment.job_id)[:8], key_color, subject_height_m,
+        "=== AR hologram segment %d (job %s) === key=%s height=%.2fm flavor=%s",
+        segment.index, str(segment.job_id)[:8], key_color, subject_height_m, flavor,
     )
     progress = ProgressLog(segment.id, queue)
     t0 = time.monotonic()
@@ -574,6 +596,7 @@ async def _execute_ar_hologram(
         mode, packed_w, packed_h, poster_bytes, manifest = await asyncio.to_thread(
             _holo_process_frames_sync, frame_files, packed_dir, key_color,
             subject_height_m, settings.rvm_model_path, fps,
+            flavor, settings.depth_model_path, settings.depth_model_url, settings.depth_scale_m,
         )
         await progress.log(f"[4/6] Matted ({mode}) + packed {len(frame_files)} frames")
 

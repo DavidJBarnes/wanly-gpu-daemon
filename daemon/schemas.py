@@ -60,6 +60,7 @@ class SegmentClaim(BaseModel):
     hologram_source_path: Optional[str] = None
     hologram_key_color: Optional[str] = None
     hologram_subject_height_m: Optional[float] = None
+    hologram_flavor: Optional[str] = None  # "2d_matte" (default) or "2.5d_depth"
     width: int
     height: int
     fps: int
