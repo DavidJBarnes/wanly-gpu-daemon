@@ -414,6 +414,31 @@ def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
     return workflow
 
 
+def build_seed_faceswap_workflow(segment: SegmentClaim, seed_filename: str) -> dict:
+    """Single-image faceswap of a continuation SEED frame (the extracted last frame),
+    re-anchoring identity to the canonical face before it seeds the next i2v segment.
+
+    Reuses the FaceFusion/ReActor node stack (node 183) on one still image instead of a
+    video. `segment.faceswap_image` must already point at the canonical face (the caller
+    sets it). If FaceFusion finds no face it passes the frame through unchanged — the
+    caller diffs the result to detect that and falls back to the raw seed.
+    """
+    workflow: dict[str, Any] = {}
+    workflow["400"] = {
+        "class_type": "LoadImage",
+        "inputs": {"image": seed_filename},
+        "_meta": {"title": "Seed frame (last frame)"},
+    }
+    _add_faceswap(workflow, segment, input_node="400")
+    workflow["186"] = {
+        "class_type": "SaveImage",
+        "inputs": {"filename_prefix": "seed_swap", "images": ["183", 0]},
+        "_meta": {"title": "Re-anchored seed"},
+    }
+    logger.info("Built seed-faceswap workflow (%d nodes) for seed: %s", len(workflow), seed_filename)
+    return workflow
+
+
 def vace_num_frames(segment: SegmentClaim) -> int:
     """WAN generation frame count for a VACE segment, rounded to a valid 4n+1."""
     gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
