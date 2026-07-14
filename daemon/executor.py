@@ -38,6 +38,7 @@ from daemon.workflow_builder import (
     GENERATION_FPS,
     build_workflow,
     build_faceswap_workflow,
+    build_seed_faceswap_workflow,
     build_vace_workflow,
     vace_num_frames,
 )
@@ -157,6 +158,86 @@ async def _resolve_faceswap_image(
         return comfyui_filename
 
     return faceswap_image
+
+
+def _find_image_output(history: dict) -> dict | None:
+    """Find a SaveImage output (node 186) in ComfyUI history. Returns filename info or None."""
+    outputs = history.get("outputs", {})
+    node = outputs.get("186", {})
+    if node.get("images"):
+        return node["images"][0]
+    for _nid, out in outputs.items():
+        for im in out.get("images", []):
+            return im
+    return None
+
+
+def _images_differ(a: bytes, b: bytes, threshold: float = 1.0) -> bool:
+    """True if two PNGs differ perceptually. FaceFusion re-saves the SAME pixels (lossless
+    PNG) when it finds no face, so a near-zero mean pixel diff => no swap happened."""
+    import cv2
+    import numpy as np
+    ia = cv2.imdecode(np.frombuffer(a, np.uint8), cv2.IMREAD_COLOR)
+    ib = cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
+    if ia is None or ib is None or ia.shape != ib.shape:
+        return True
+    return float(np.abs(ia.astype(np.int16) - ib.astype(np.int16)).mean()) > threshold
+
+
+async def _reanchor_seed_frame(
+    segment: SegmentClaim,
+    last_frame_data: bytes,
+    comfyui: ComfyUIClient,
+    queue: QueueClient,
+    progress: "ProgressLog",
+) -> bytes:
+    """Re-anchor the continuation seed (last frame) to the canonical identity face before
+    it seeds the next i2v segment. FaceFusion passes the frame through unchanged when no
+    face is detected, so we diff the result and fall back to the raw seed on no-op/error.
+    NEVER raises — always returns a usable seed frame (swapped or raw), and logs which."""
+    try:
+        source_s3 = next(
+            (_HARDCODE_VACE_FACE[l.lora_id] for l in (segment.loras or [])
+             if l.lora_id in _HARDCODE_VACE_FACE),
+            None,
+        )
+        if not source_s3:
+            logger.info("Seed re-anchor: no canonical face for segment %d LoRAs — kept raw seed", segment.index)
+            await progress.log("[seed] No canonical face for these LoRAs — kept raw frame")
+            return last_frame_data
+
+        face_data = await _download_with_retry(lambda: queue.download_file(source_s3), "seed_face")
+        _validate_image_data(face_data, "seed_face")
+        face_fn = await comfyui.upload_image(face_data, f"seedface_{segment.id}.png")
+        seed_fn = await comfyui.upload_image(last_frame_data, f"seed_{segment.id}.png")
+
+        seg = segment.model_copy(update={
+            "faceswap_image": face_fn,
+            "faceswap_method": segment.faceswap_method or "facefusion",
+        })
+        workflow = build_seed_faceswap_workflow(seg, seed_fn)
+        prompt_id, client_id = await comfyui.submit_workflow(workflow)
+        await comfyui.monitor_execution(prompt_id, client_id, progress=progress)
+        history = await comfyui.get_history(prompt_id)
+        img = _find_image_output(history)
+        if not img:
+            raise RuntimeError("no image output from seed faceswap")
+        swapped = await comfyui.download_output(
+            img["filename"], img.get("subfolder", ""), img.get("type", "output"),
+        )
+        _validate_image_data(swapped, "swapped_seed")
+
+        if _images_differ(last_frame_data, swapped):
+            logger.info("Seed re-anchor: identity faceswapped onto segment %d seed", segment.index)
+            await progress.log("[seed] Re-anchored identity via faceswap")
+            return swapped
+        logger.info("Seed re-anchor: no face detected on segment %d seed — kept raw", segment.index)
+        await progress.log("[seed] No face detected on seed — kept raw frame")
+        return last_frame_data
+    except Exception as e:  # graceful fallback — a bad swap must never break continuation
+        logger.warning("Seed re-anchor failed on segment %d (%s) — kept raw seed", segment.index, e)
+        await progress.log(f"[seed] Faceswap errored ({type(e).__name__}) — kept raw frame")
+        return last_frame_data
 
 
 async def _extract_last_frame(video_data: bytes) -> bytes:
@@ -827,6 +908,13 @@ async def execute_segment(
         t0 = time.monotonic()
         await progress.log("[7/7] Extracting last frame and uploading...")
         last_frame_data = await _extract_last_frame(video_data)
+
+        # Seed re-anchor: faceswap the last frame to the canonical identity before it seeds
+        # the next segment (only fires when API resolved seed_faceswap=True). Never raises.
+        if getattr(segment, "seed_faceswap", False):
+            last_frame_data = await _reanchor_seed_frame(
+                segment, last_frame_data, comfyui, queue, progress,
+            )
 
         # Measure motion magnitude using optical flow
         motion_magnitude = measure_motion_magnitude(video_data)
