@@ -100,6 +100,17 @@ class QueueClient:
             _raise_with_details(resp, f"upload_hologram_output {segment_id}")
         logger.info("Uploaded hologram output via API for %s", segment_id)
 
+    async def upload_smashcut_output(self, segment_id: uuid.UUID, video_data: bytes) -> None:
+        """Upload the concatenated smashcut video; the API creates the container job's Video."""
+        resp = await self.client.post(
+            f"/segments/{segment_id}/smashcut_upload",
+            files={"video": ("smashcut.mp4", video_data, "video/mp4")},
+            timeout=300,
+        )
+        if not resp.is_success:
+            _raise_with_details(resp, f"upload_smashcut_output {segment_id}")
+        logger.info("Uploaded smashcut output via API for %s", segment_id)
+
     async def upload_identity_reference(self, job_id: str, image_data: bytes) -> None:
         """Upload a job's canonical VACE identity reference (a face crop from seg0)."""
         resp = await self.client.post(

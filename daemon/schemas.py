@@ -65,6 +65,9 @@ class SegmentClaim(BaseModel):
     hologram_key_color: Optional[str] = None
     hologram_subject_height_m: Optional[float] = None
     hologram_flavor: Optional[str] = None  # "2d_matte" (default) or "2.5d_depth"
+    # Foundry smashcut (reprocess_type="smashcut_concat"): ordered clip paths + transition.
+    smashcut_clip_paths: Optional[list[str]] = None
+    smashcut_transition: Optional[str] = None
     width: int
     height: int
     fps: int
