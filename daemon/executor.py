@@ -743,6 +743,75 @@ async def _execute_ar_hologram(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+async def _generate_black(path: str, duration: float, width: int, height: int, fps: int) -> None:
+    """Generate a black mp4 clip for dip-to-black smashcut transitions."""
+    await _run_ffmpeg([
+        "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={duration}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", path,
+    ])
+
+
+async def _execute_smashcut_concat(segment: SegmentClaim, queue: QueueClient) -> None:
+    """Concatenate hand-picked clips (same resolution) into one montage. Pure ffmpeg, no ComfyUI.
+
+    seamless = stream-copy concat (fast, lossless); black = insert black dips + re-encode concat.
+    """
+    paths = segment.smashcut_clip_paths or []
+    black = segment.smashcut_transition == "black"
+    logger.info("=== Smashcut concat %s: %d clips, transition=%s ===",
+                str(segment.id)[:8], len(paths), segment.smashcut_transition)
+    progress = ProgressLog(segment.id, queue)
+    start = time.monotonic()
+    try:
+        if len(paths) < 2:
+            raise RuntimeError("smashcut needs at least 2 clips")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            await progress.log(f"[1/3] Downloading {len(paths)} clips...")
+            local = []
+            for i, p in enumerate(paths):
+                data = await _download_with_retry(lambda p=p: queue.download_file(p), "smashcut_clip")
+                fn = os.path.join(tmp, f"clip_{i:03d}.mp4")
+                with open(fn, "wb") as f:
+                    f.write(data)
+                local.append(fn)
+
+            await progress.log("[2/3] Concatenating...")
+            items = []
+            for i, fn in enumerate(local):
+                items.append(fn)
+                if black and i < len(local) - 1:
+                    bp = os.path.join(tmp, f"black_{i:03d}.mp4")
+                    await _generate_black(bp, 0.4, segment.width, segment.height, segment.fps)
+                    items.append(bp)
+
+            # concat demuxer resolves relative paths against the list file's dir → basenames in tmp.
+            list_path = os.path.join(tmp, "concat.txt")
+            with open(list_path, "w") as f:
+                for fn in items:
+                    f.write(f"file '{os.path.basename(fn)}'\n")
+
+            out = os.path.join(tmp, "smashcut.mp4")
+            if black:
+                await _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_path,
+                                   "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", out])
+            else:
+                await _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out])
+
+            with open(out, "rb") as f:
+                result = f.read()
+
+            await progress.log("[3/3] Uploading...")
+            await queue.upload_smashcut_output(segment.id, result)
+        logger.info("Smashcut %s complete in %.1fs", str(segment.id)[:8], time.monotonic() - start)
+    except Exception as e:
+        logger.exception("Smashcut concat failed: %s", e)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=str(e)[:2000], progress_log=progress.text),
+        )
+
+
 async def execute_segment(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -754,6 +823,9 @@ async def execute_segment(
 
     if segment.reprocess_type == "ar_hologram":
         return await _execute_ar_hologram(segment, comfyui, queue)
+
+    if segment.reprocess_type == "smashcut_concat":
+        return await _execute_smashcut_concat(segment, queue)
 
     # VACE video-conditioned continuation (resolved API-side). Capability-gated: a worker
     # without the Fun-VACE models/nodes silently falls through to the traditional i2v path.
