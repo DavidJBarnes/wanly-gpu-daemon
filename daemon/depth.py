@@ -21,29 +21,34 @@ _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _DEFAULT_INPUT = 518  # Depth Anything V2 default square input
 
-_SESSION = None
+_SESSIONS: dict[str, object] = {}
 
 
 def ensure_depth_model(path: str, url: str) -> str:
-    """Return the depth ONNX path, downloading it (~100MB) on first use if missing."""
+    """Return the depth ONNX path, downloading it (~100MB) on first use if missing.
+
+    Downloads to a temp name then renames atomically — an interrupted download must not
+    leave a truncated file at `path` (existence is the only cache check).
+    """
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         import urllib.request
 
-        urllib.request.urlretrieve(url, path)
+        tmp = f"{path}.tmp"
+        urllib.request.urlretrieve(url, tmp)
+        os.replace(tmp, path)
     return path
 
 
 def _session(model_path: str):
-    global _SESSION
-    if _SESSION is None:
+    if model_path not in _SESSIONS:
         import onnxruntime as ort
 
         # Prefer GPU; onnxruntime silently falls back to CPU when CUDA isn't available.
-        _SESSION = ort.InferenceSession(
+        _SESSIONS[model_path] = ort.InferenceSession(
             model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
         )
-    return _SESSION
+    return _SESSIONS[model_path]
 
 
 def _input_size(sess) -> tuple[int, int]:
@@ -53,21 +58,41 @@ def _input_size(sess) -> tuple[int, int]:
     return int(h), int(w)
 
 
-def estimate_depth(frame_rgb: np.ndarray, model_path: str) -> np.ndarray:
+def estimate_depth(
+    frame_rgb: np.ndarray, model_path: str, alpha: np.ndarray | None = None
+) -> np.ndarray:
     """Relative depth (float32 HxW, larger = nearer) at the frame's native resolution.
 
-    Run on the full frame (scene context) — the caller crops the result to the subject bbox.
+    When `alpha` (the matte) is given, background pixels are replaced with mid-gray before
+    estimation: a flat chroma plate is a degenerate scene for the model and compresses the
+    subject's own disparity range. The frame is letterboxed (not squashed) into the model's
+    square input so subject proportions — the geometry the relief comes from — are preserved.
     """
     sess = _session(model_path)
     inp = sess.get_inputs()[0]
     ih, iw = _input_size(sess)
     H, W = frame_rgb.shape[:2]
 
-    img = cv2.resize(frame_rgb, (iw, ih), interpolation=cv2.INTER_CUBIC).astype(np.float32) / 255.0
+    src = frame_rgb
+    if alpha is not None:
+        src = src.copy()
+        src[alpha <= 0.5] = 128
+
+    scale = min(iw / W, ih / H)
+    rw, rh = max(1, round(W * scale)), max(1, round(H * scale))
+    resized = cv2.resize(src, (rw, rh), interpolation=cv2.INTER_CUBIC)
+    canvas = np.full((ih, iw, 3), 128, dtype=np.uint8)
+    ox, oy = (iw - rw) // 2, (ih - rh) // 2
+    canvas[oy:oy + rh, ox:ox + rw] = resized
+
+    img = canvas.astype(np.float32) / 255.0
     img = (img - _MEAN) / _STD
     x = img.transpose(2, 0, 1)[None].astype(np.float32)  # [1,3,ih,iw]
 
     out = np.asarray(sess.run(None, {inp.name: x})[0]).squeeze()  # -> HxW (model resolution)
+    oh, ow = out.shape[:2]
+    sy, sx = oh / ih, ow / iw  # output may not be at input resolution
+    out = out[int(oy * sy):int(round((oy + rh) * sy)), int(ox * sx):int(round((ox + rw) * sx))]
     return cv2.resize(out.astype(np.float32), (W, H), interpolation=cv2.INTER_CUBIC)
 
 
@@ -99,9 +124,11 @@ def normalize_depth_clip(
     prev: np.ndarray | None = None
     for c, m in zip(cd, ca):
         n = np.clip((c - lo) / rng, 0.0, 1.0)  # larger raw depth -> brighter -> nearer
-        n = np.where(m > 0.5, n, 0.0)  # background pinned to far/black
         if prev is not None:
             n = ema * n + (1.0 - ema) * prev
         prev = n
+        # Pin background AFTER the EMA: pinning first leaks (1-ema) of the previous frame's
+        # subject depth into background pixels, displacing a ghost skirt around motion.
+        n = np.where(m > 0.5, n, 0.0)
         out.append((n * 255.0).astype(np.uint8))
     return out

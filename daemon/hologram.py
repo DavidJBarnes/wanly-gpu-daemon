@@ -254,5 +254,5 @@ def build_manifest(packed_w: int, packed_h: int, color_w: int, guard_px: int, fp
         }
         manifest["depth_encoding"] = "disparity_luma"
         manifest["depth_near_is"] = "bright"
-        manifest["depth_scale_m"] = float(depth_scale_m if depth_scale_m is not None else 0.12)
+        manifest["depth_scale_m"] = float(depth_scale_m if depth_scale_m is not None else 0.30)
     return manifest

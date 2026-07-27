@@ -635,8 +635,9 @@ def _holo_process_frames_sync(
     if flavor == "2.5d_depth":
         mode += "+depth"
         dpath = ensure_depth_model(depth_model_path, depth_model_url)
-        # Depth on the full frame (scene context); normalize_depth_clip crops to the subject bbox.
-        raw_depths = [estimate_depth(arr, dpath) for arr in arrs]
+        # Depth on the full frame with the backdrop neutralized via the matte (a flat chroma
+        # plate flattens the model's subject disparity); normalize_depth_clip crops to the bbox.
+        raw_depths = [estimate_depth(arr, dpath, alpha=a) for arr, a in zip(arrs, alphas)]
         depth_u8 = normalize_depth_clip(raw_depths, alphas, (x, y, cw, ch))
 
     packed_w = packed_h = 0
@@ -677,9 +678,10 @@ async def _execute_ar_hologram(
     key_color = segment.hologram_key_color or "0x00b140"
     subject_height_m = segment.hologram_subject_height_m or 1.70
     flavor = segment.hologram_flavor or "2d_matte"
+    depth_scale_m = segment.hologram_depth_scale_m or settings.depth_scale_m
     logger.info(
-        "=== AR hologram segment %d (job %s) === key=%s height=%.2fm flavor=%s",
-        segment.index, str(segment.job_id)[:8], key_color, subject_height_m, flavor,
+        "=== AR hologram segment %d (job %s) === key=%s height=%.2fm flavor=%s depth_scale=%.2fm",
+        segment.index, str(segment.job_id)[:8], key_color, subject_height_m, flavor, depth_scale_m,
     )
     progress = ProgressLog(segment.id, queue)
     t0 = time.monotonic()
@@ -713,15 +715,19 @@ async def _execute_ar_hologram(
         mode, packed_w, packed_h, poster_bytes, manifest = await asyncio.to_thread(
             _holo_process_frames_sync, frame_files, packed_dir, key_color,
             subject_height_m, settings.rvm_model_path, fps,
-            flavor, settings.depth_model_path, settings.depth_model_url, settings.depth_scale_m,
+            flavor, settings.depth_model_path, settings.depth_model_url, depth_scale_m,
         )
         await progress.log(f"[4/6] Matted ({mode}) + packed {len(frame_files)} frames")
 
         await progress.log("[5/6] Encoding packed mp4...")
         packed_mp4 = os.path.join(tmpdir, "hologram.mp4")
+        # Explicit limited-range + bt709 tags: untagged output makes some decoders (Quest
+        # included) guess the range, which crushes/clips the depth + alpha luma regions.
         await _run_ffmpeg([
             "-framerate", f"{fps}", "-i", os.path.join(packed_dir, "%05d.png"),
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "12",
+            "-color_range", "tv", "-colorspace", "bt709",
+            "-color_primaries", "bt709", "-color_trc", "bt709",
             "-movflags", "+faststart", packed_mp4,
         ])
         with open(packed_mp4, "rb") as f:
