@@ -58,8 +58,9 @@ class Settings(BaseSettings):
         "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"
     )
     # Relief depth in meters: how far the nearest subject pixels are pushed toward the viewer
-    # in the displaced mesh. Aesthetic knob — tune by eye on the Quest 3.
-    depth_scale_m: float = 0.12
+    # in the displaced mesh. Fallback only — the per-request value from the claim
+    # (hologram_depth_scale_m, set in the console dialog) wins when present.
+    depth_scale_m: float = 0.30
 
     # PainterLongVideo motion parameters (identity anchoring)
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
