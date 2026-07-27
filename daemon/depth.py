@@ -100,7 +100,7 @@ def normalize_depth_clip(
     depths: list[np.ndarray],
     alphas: list[np.ndarray],
     crop_rect: tuple[int, int, int, int],
-    ema: float = 0.7,
+    ema: float = 0.85,
 ) -> list[np.ndarray]:
     """Crop each depth to the subject bbox and normalize the whole clip to uint8 (bright = near).
 
@@ -125,8 +125,13 @@ def normalize_depth_clip(
     for c, m in zip(cd, ca):
         n = np.clip((c - lo) / rng, 0.0, 1.0)  # larger raw depth -> brighter -> nearer
         if prev is not None:
+            # Light EMA only: a heavier blend makes depth visibly lag the color frames,
+            # which reads as waves rippling across the subject during motion.
             n = ema * n + (1.0 - ema) * prev
         prev = n
+        # Spatial smoothing kills model speckle + quantization banding that the player's
+        # depth-gradient shading would otherwise amplify into contour streaks.
+        n = cv2.GaussianBlur(n, (5, 5), 1.2)
         # Pin background AFTER the EMA: pinning first leaks (1-ema) of the previous frame's
         # subject depth into background pixels, displacing a ghost skirt around motion.
         n = np.where(m > 0.5, n, 0.0)
