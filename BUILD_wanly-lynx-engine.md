@@ -184,6 +184,27 @@ Upgrading the 3090's wrapper is deferred deliberately: its ComfyUI core is pinne
 Apr-28 rollback for the activation-memory fix, and a 6-month wrapper jump risks disturbing
 that. Revisit only if the POC's identity numbers justify it.
 
+### Pod provisioning
+
+A Lynx pod is booted from the `Wanly22-GPU` template with **`MODEL_PROFILE=lynx` overridden
+at launch** — not set on the template itself, which would break normal Wan 2.2 jobs booted
+from the same template.
+
+The lean profile matters for more than speed: the full stack is ~135 GB against the
+template's 80 GB `/workspace` volume, so a `full`-profile pod cannot even complete its
+download. Lynx alone is ~36 GB and fits comfortably.
+
+`download_models.sh` and the daemon's `model_validator` both read `MODEL_PROFILE`; a
+mismatch means the daemon validates models the pod was never provisioned with and exits
+before registering. `start.sh` writes the value into the daemon `.env` so the two cannot
+silently diverge.
+
+Note the daemon is **re-cloned from `main` at every boot** (`start.sh` step 2), so a pod
+restart is enough to pick up daemon changes — no image rebuild needed. Changes to
+`start.sh` or `download_models.sh` *do* require a rebuild, since those are baked in.
+
+### Preflight
+
 `_lynx_preflight` fails fast with a diagnosis rather than a bare "node not found", because
 two very different causes present identically:
 
@@ -198,18 +219,50 @@ a worker that cannot run it must say so.
 
 ## 6. VRAM
 
-**UNMEASURED.** No Lynx generation has run yet. To be filled from
-`lynx.generate.end` → `vram_peak_mb` on the first pod run.
+| Config | Peak VRAM | Card | Status |
+|---|---|---|---|
+| 832×480, 81f, fp8 + block swap 35 | **11.8 GB / 24 GB** | RTX 4090 | MEASURED 2026-07-28 |
+| 1280×720, 81f | — | | pending |
 
-| Config | Peak VRAM | Status |
+The 832×480 figure comes from a run that loaded the model fully (727/727 blocks) and then
+failed downstream, so it covers model + adapter residency but **not** peak sampling
+activation — the true peak will be somewhat higher. Even so, ~12 GB against 24 GB is far
+more headroom than expected, which suggests two things worth testing: 720p should fit
+comfortably, and `lynx_blocks_to_swap` (35, from Kijai's workflow — higher than our VACE
+path's 25) can probably come down, trading resident VRAM for speed.
+
+**Measurement caveat:** the daemon is a *separate process* from ComfyUI, so
+`torch.cuda.max_memory_allocated()` would report the daemon's own empty allocator. We poll
+device-level usage via `nvidia-smi` on a background thread (0.5 s) and report the peak.
+That figure includes anything else resident on the card — which is the number that
+actually matters for "does this fit in 24 GB", but is not directly comparable to a
+PyTorch allocator figure.
+
+### Loader configuration — three traps, all hit in the first live run
+
+The loader settings are the fiddliest part of this engine. All three of these produced
+confident-looking failures on a paid GPU:
+
+| Setting | Wrong value | Symptom |
 |---|---|---|
-| 832×480, 81f, fp8 + block swap 35 | — | pending |
-| 1280×720, 81f | — | pending |
+| `quantization` | `fp8_e4m3fn_scaled` | `self and mat2 must have the same dtype, but got Half and Float8_e4m3fn` at `WanVideoSampler` |
+| `base_precision` | `fp16_fast` | `allow_fp16_accumulation is not available in this version of torch` at `WanVideoModelLoader` |
+| `MODEL_PROFILE` vs validator | mismatched | `Model validation FAILED — cannot start`, daemon exits before registering |
 
-Budget sketch, for expectations only: 14.5 GB fp8 base (block-swapped, so resident share
-is well under that) + ~5 GB adapters + VAE + latents. `lynx_blocks_to_swap` is 35, from
-Kijai's reference workflow — higher than our VACE path's 25, because the adapters add
-resident weight on top of the base.
+1. **Do not re-quantize.** The base file is *already* scaled fp8 (`_scaled_KJ`).
+   `quantization: "disabled"` does **not** mean unquantized — the node autoselects from the
+   weights, which is what you want. Setting `fp8_e4m3fn_scaled` quantizes a second time and
+   leaves the fp16 adapters meeting fp8 base weights at matmul. (The VACE path *does* use
+   `fp8_e4m3fn_scaled`, correctly, because its checkpoints are unquantized fp16 — copying
+   that config across is what caused this.)
+2. **`fp16_fast` needs a torch 2.7 nightly.** Kijai's reference workflow uses it, but it
+   enables `torch.backends.cuda.matmul.allow_fp16_accumulation`, which our RunPod image's
+   torch lacks. Plain `fp16` is the same math without the fast-accumulate speedup.
+3. **The download profile and the validation profile must agree.** See §5.
+
+A unit test pins every loader enum we emit (`base_precision`, `quantization`,
+`load_device`, `attention_mode`) to the values `WanVideoModelLoader` actually declares, so
+an unsupported value fails locally rather than on a pod.
 
 **Measurement caveat:** the daemon is a *separate process* from ComfyUI, so
 `torch.cuda.max_memory_allocated()` would report the daemon's own empty allocator. We poll
