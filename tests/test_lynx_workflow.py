@@ -175,7 +175,26 @@ class TestGraphTopology:
         """
         wf = build_lynx_workflow(segment, "subject.png", 81)
         assert wf["610"]["inputs"]["quantization"] == "disabled"
-        assert wf["610"]["inputs"]["base_precision"] == "fp16_fast"
+
+    def test_base_precision_is_supported_by_the_pinned_torch(self, segment):
+        """fp16_fast enables fp16 accumulation, which needs a torch 2.7 nightly the
+        RunPod image does not ship — it fails at WanVideoModelLoader."""
+        wf = build_lynx_workflow(segment, "subject.png", 81)
+        assert wf["610"]["inputs"]["base_precision"] == "fp16"
+
+    def test_loader_values_are_accepted_by_the_wrapper(self, segment):
+        """Guard the enum values WanVideoModelLoader actually accepts."""
+        wf = build_lynx_workflow(segment, "subject.png", 81)
+        i = wf["610"]["inputs"]
+        assert i["base_precision"] in {"fp32", "bf16", "fp16", "fp16_fast"}
+        assert i["quantization"] in {
+            "disabled", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e4m3fn_scaled",
+            "fp8_e4m3fn_scaled_fast", "fp8_e5m2", "fp8_e5m2_fast",
+            "fp8_e5m2_scaled", "fp8_e5m2_scaled_fast"}
+        assert i["load_device"] in {"main_device", "offload_device"}
+        assert i["attention_mode"] in {
+            "sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3",
+            "radial_sage_attention", "sageattn_compiled"}
 
     def test_loader_precision_is_configurable(self, monkeypatch, segment):
         monkeypatch.setattr(settings, "lynx_base_precision", "fp16")
