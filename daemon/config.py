@@ -70,13 +70,17 @@ class Settings(BaseSettings):
     lynx_resampler: str = "lynx_lite_resampler_fp32.safetensors"
     lynx_ref_layers: str = "Wan2_1-T2V-14B-Lynx_full_ref_layers_fp16.safetensors"
     lynx_resampler_precision: str = "fp16"
-    # The base model file is ALREADY scaled-fp8 (_scaled_KJ), so the loader must not
-    # quantize it again: doing so leaves the fp16 Lynx adapter weights meeting fp8 base
-    # weights and the sampler dies with "self and mat2 must have the same dtype, but got
-    # Half and Float8_e4m3fn". These two values match Kijai's reference workflow.
-    # If you ever point lynx_t2v_model at an unquantized fp16 checkpoint, this is the
-    # pair to change (base_precision=fp16, quantization=fp8_e4m3fn_scaled).
-    lynx_base_precision: str = "fp16_fast"
+    # Loader precision pair. "disabled" does NOT mean unquantized — the node autoselects
+    # from the weights, which is what we want for an already-scaled fp8 checkpoint
+    # (_scaled_KJ). Quantizing it again leaves the fp16 Lynx adapters meeting fp8 base
+    # weights and the sampler dies with "self and mat2 must have the same dtype".
+    #
+    # Kijai's reference workflow pairs this with "fp16_fast", but that enables fp16
+    # accumulation via torch.backends.cuda.matmul.allow_fp16_accumulation, which needs a
+    # torch >= 2.7.0.dev2025-02-26 nightly. Our RunPod image ships an older torch, so
+    # fp16_fast fails at load. Plain fp16 is the same math without the fast-accumulate
+    # speedup. Valid values: fp32 | bf16 | fp16 | fp16_fast.
+    lynx_base_precision: str = "fp16"
     lynx_quantization: str = "disabled"
     # Wan2.1 T2V cfg-step-distill LoRA (the i2v lightx2v_* above are a different family and
     # do NOT apply to the 2.1 T2V base). Strength 0 drops it -> de-distilled path.

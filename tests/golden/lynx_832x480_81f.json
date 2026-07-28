@@ -28,7 +28,7 @@
     "class_type": "WanVideoModelLoader",
     "inputs": {
       "attention_mode": "sdpa",
-      "base_precision": "fp16_fast",
+      "base_precision": "fp16",
       "block_swap_args": [
         "600",
         0
