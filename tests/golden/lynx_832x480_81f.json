@@ -42,7 +42,7 @@
         "700",
         0
       ],
-      "model": "Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors",
+      "model": "wan2.1_t2v_14B_fp16.safetensors",
       "quantization": "disabled"
     }
   },
