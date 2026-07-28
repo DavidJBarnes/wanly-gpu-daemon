@@ -160,12 +160,29 @@ class TestGraphTopology:
             assert wf[nid]["class_type"] == "WanVideoTextEncodeCached"
             assert wf[nid]["inputs"]["model_name"] == settings.lynx_t5_model
 
-    def test_block_swap_and_fp8_quantisation(self, segment):
+    def test_block_swap_and_offload(self, segment):
         wf = build_lynx_workflow(segment, "subject.png", 81)
-        assert wf["610"]["inputs"]["quantization"] == "fp8_e4m3fn_scaled"
         assert wf["610"]["inputs"]["load_device"] == "offload_device"
         assert wf["610"]["inputs"]["block_swap_args"] == ["600", 0]
         assert wf["600"]["inputs"]["blocks_to_swap"] == settings.lynx_blocks_to_swap
+
+    def test_does_not_requantise_an_already_scaled_fp8_checkpoint(self, segment):
+        """Regression: the base file is already _scaled_KJ fp8.
+
+        Quantizing it again leaves the fp16 Lynx adapters meeting fp8 base weights and
+        WanVideoSampler dies with "self and mat2 must have the same dtype, but got Half
+        and Float8_e4m3fn". Kijai's reference workflow pairs fp16_fast with disabled.
+        """
+        wf = build_lynx_workflow(segment, "subject.png", 81)
+        assert wf["610"]["inputs"]["quantization"] == "disabled"
+        assert wf["610"]["inputs"]["base_precision"] == "fp16_fast"
+
+    def test_loader_precision_is_configurable(self, monkeypatch, segment):
+        monkeypatch.setattr(settings, "lynx_base_precision", "fp16")
+        monkeypatch.setattr(settings, "lynx_quantization", "fp8_e4m3fn_scaled")
+        wf = build_lynx_workflow(segment, "subject.png", 81)
+        assert wf["610"]["inputs"]["base_precision"] == "fp16"
+        assert wf["610"]["inputs"]["quantization"] == "fp8_e4m3fn_scaled"
 
     def test_sampler_consumes_lynx_embeds_not_raw_latents(self, segment):
         wf = build_lynx_workflow(segment, "subject.png", 81)

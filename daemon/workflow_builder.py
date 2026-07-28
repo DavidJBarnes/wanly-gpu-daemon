@@ -734,8 +734,8 @@ def build_lynx_workflow(
         lora_counter += 1
 
     loader_inputs: dict[str, Any] = {
-        "model": settings.lynx_t2v_model, "base_precision": "fp16",
-        "quantization": "fp8_e4m3fn_scaled", "load_device": "offload_device",
+        "model": settings.lynx_t2v_model, "base_precision": settings.lynx_base_precision,
+        "quantization": settings.lynx_quantization, "load_device": "offload_device",
         "attention_mode": "sdpa", "extra_model": ["602", 0], "block_swap_args": ["600", 0]}
     if lora_ref is not None:
         loader_inputs["lora"] = lora_ref
