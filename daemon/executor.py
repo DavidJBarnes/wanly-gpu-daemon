@@ -22,6 +22,7 @@ import os
 import shutil
 import tempfile
 import time
+from typing import Any
 
 import httpx
 import numpy as np
@@ -36,12 +37,17 @@ from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
 from daemon.workflow_builder import (
     GENERATION_FPS,
+    LynxValidationError,
     build_workflow,
     build_faceswap_workflow,
+    build_lynx_workflow,
     build_seed_faceswap_workflow,
     build_vace_workflow,
+    lynx_num_frames,
     vace_num_frames,
 )
+from daemon.identity_check import measure_identity
+from daemon.stage_log import log_event, stage
 from daemon.config import settings
 from daemon.hologram import (
     GUARD_PX,
@@ -197,8 +203,8 @@ async def _reanchor_seed_frame(
     NEVER raises — always returns a usable seed frame (swapped or raw), and logs which."""
     try:
         source_s3 = next(
-            (_HARDCODE_VACE_FACE[l.lora_id] for l in (segment.loras or [])
-             if l.lora_id in _HARDCODE_VACE_FACE),
+            (_HARDCODE_VACE_FACE[item.lora_id] for item in (segment.loras or [])
+             if item.lora_id in _HARDCODE_VACE_FACE),
             None,
         )
         if not source_s3:
@@ -426,8 +432,8 @@ async def _execute_vace_continuation(
         # HACK: if the segment uses a character LoRA we have a canonical face for, use that face
         # as the VACE identity reference (bypasses the unreliable auto-crop).
         hardcode_uri = next(
-            (_HARDCODE_VACE_FACE[l.lora_id] for l in (segment.loras or [])
-             if l.lora_id in _HARDCODE_VACE_FACE),
+            (_HARDCODE_VACE_FACE[item.lora_id] for item in (segment.loras or [])
+             if item.lora_id in _HARDCODE_VACE_FACE),
             None,
         )
         if hardcode_uri:
@@ -664,6 +670,163 @@ def _holo_process_frames_sync(
     return mode, packed_w, packed_h, poster_buf.getvalue(), manifest
 
 
+async def _resolve_lynx_subject(
+    segment: SegmentClaim, comfyui: ComfyUIClient, queue: QueueClient
+) -> tuple[str, bytes]:
+    """Resolve lynx_subject_image to a ComfyUI-local filename, returning its bytes too.
+
+    The bytes are kept so identity QA can embed the same reference the graph conditioned
+    on, without a second download.
+    """
+    subject = segment.lynx_subject_image
+    if not subject:
+        raise LynxValidationError("Lynx segment has no lynx_subject_image")
+    if subject.startswith("s3://"):
+        data = await _download_with_retry(
+            lambda: queue.download_file(subject), "lynx_subject_image"
+        )
+        _validate_image_data(data, "lynx_subject_image")
+        ext = os.path.splitext(subject)[1] or ".png"
+        filename = await comfyui.upload_image(data, f"lynx_subject_{segment.id}{ext}")
+        return filename, data
+    return subject, b""
+
+
+async def _execute_lynx(
+    segment: SegmentClaim,
+    comfyui: ComfyUIClient,
+    queue: QueueClient,
+) -> None:
+    """Generate a segment with the Lynx identity-preserving engine.
+
+    Wan2.1 T2V-14B conditioned on a subject image via the Lynx ID/Ref adapters. Unlike the
+    i2v paths there is no start frame: the subject drives identity only. After the render,
+    identity QA measures how well that worked and records the scores (no gating).
+    """
+    correlation_id = str(segment.id)
+    progress = ProgressLog(segment.id, queue)
+    segment_start = time.monotonic()
+    log_event(
+        logger, "lynx.segment_start", correlation_id,
+        job_id=str(segment.job_id), segment_index=segment.index,
+        resolution=f"{segment.width}x{segment.height}",
+    )
+    try:
+        if segment.loras:
+            await ensure_loras_available(segment.loras, queue)
+
+        # 1. Subject image -> ComfyUI
+        await progress.log("[1/5] Resolving subject image...")
+        with stage(logger, "lynx.subject_upload", correlation_id):
+            subject_fn, subject_bytes = await _resolve_lynx_subject(segment, comfyui, queue)
+
+        # 2. Build (validates resolution / frame grid / adapter pairing — raises, no clamping)
+        await progress.log("[2/5] Building Lynx workflow...")
+        num_frames = lynx_num_frames(segment)
+        with stage(logger, "lynx.build", correlation_id, num_frames=num_frames) as extra:
+            workflow = build_lynx_workflow(segment, subject_fn, num_frames)
+            extra["nodes"] = len(workflow)
+
+        # 3. Submit + monitor
+        with stage(logger, "lynx.generate", correlation_id, num_frames=num_frames):
+            prompt_id, client_id = await comfyui.submit_workflow(workflow)
+            await progress.log(f"[3/5] Submitted (prompt_id={prompt_id[:8]}, {num_frames} frames)")
+            await progress.log("[4/5] Waiting for Lynx execution...")
+            await comfyui.monitor_execution(prompt_id, client_id, progress=progress)
+
+        # 4. Collect output
+        await progress.log("[5/5] Downloading result and uploading...")
+        history = await comfyui.get_history(prompt_id)
+        video_info = comfyui.find_video_output(history)
+        if not video_info:
+            raise RuntimeError("No video output found in ComfyUI history")
+        result_data = await comfyui.download_output(
+            filename=video_info["filename"],
+            subfolder=video_info.get("subfolder", ""),
+            output_type=video_info.get("type", "output"),
+        )
+
+        # 5. Identity QA — measurement only, never fatal
+        identity_scores = await _measure_lynx_identity(
+            result_data, subject_bytes, correlation_id
+        )
+
+        last_frame_data = await _extract_last_frame(result_data)
+        await queue.upload_segment_output(
+            segment.id, result_data, last_frame_data,
+            SegmentResult(status="completed", lynx_identity_scores=identity_scores),
+        )
+        log_event(
+            logger, "lynx.segment_complete", correlation_id,
+            duration_sec=round(time.monotonic() - segment_start, 1),
+            identity_mean=(identity_scores or {}).get("mean"),
+        )
+
+    except LynxValidationError as e:
+        # Invalid job parameters (bad bucket / frame grid / adapter pair / missing subject).
+        error_msg = f"Lynx validation error: {e}"
+        log_event(logger, "lynx.validation_failed", correlation_id,
+                  level=logging.ERROR, error=str(e))
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+    except ComfyUIExecutionError as e:
+        error_msg = f"ComfyUI error: {e}"
+        if e.node_id:
+            error_msg += f" (node {e.node_id} [{e.node_type}])"
+        # A faceless subject surfaces here, raised by LynxInsightFaceCrop inside ComfyUI.
+        if "No face detected" in str(e):
+            error_msg = (
+                "Lynx subject image has no detectable face — identity is ArcFace-conditioned, "
+                f"so this job cannot produce a likeness. ({e})"
+            )
+        log_event(logger, "lynx.execution_failed", correlation_id,
+                  level=logging.ERROR, error=error_msg, node_id=e.node_id, node_type=e.node_type)
+        if e.traceback:
+            logger.error("Traceback:\n%s", e.traceback)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        logger.exception("Lynx segment %s failed", segment.id)
+        log_event(logger, "lynx.segment_failed", correlation_id,
+                  level=logging.ERROR, error=error_msg)
+        await queue.update_segment(
+            segment.id,
+            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
+        )
+
+
+async def _measure_lynx_identity(
+    result_data: bytes, subject_bytes: bytes, correlation_id: str
+) -> dict[str, Any] | None:
+    """Run identity QA on the rendered clip against the subject image.
+
+    Both arrive as bytes, so they are staged to temp files for OpenCV/InsightFace. Returns
+    None when QA could not run; never raises.
+    """
+    if not subject_bytes:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, "output.mp4")
+            subject_path = os.path.join(tmp, "subject.png")
+            with open(video_path, "wb") as fh:
+                fh.write(result_data)
+            with open(subject_path, "wb") as fh:
+                fh.write(subject_bytes)
+            with stage(logger, "lynx.identity_qa", correlation_id):
+                return await asyncio.to_thread(
+                    measure_identity, video_path, subject_path, correlation_id
+                )
+    except Exception:
+        logger.warning("Lynx identity QA could not run", exc_info=True)
+        return None
+
+
 async def _execute_ar_hologram(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -833,6 +996,12 @@ async def execute_segment(
     if segment.reprocess_type == "smashcut_concat":
         return await _execute_smashcut_concat(segment, queue)
 
+    # Lynx identity-preserving engine. Explicitly selected per job (not capability-inferred):
+    # it is a different base model family (Wan2.1 T2V) from the 2.2 i2v default, so there is
+    # no sensible silent fallback — a worker without the models must fail loudly.
+    if segment.generation_engine == "lynx":
+        return await _execute_lynx(segment, comfyui, queue)
+
     # VACE video-conditioned continuation (resolved API-side). Capability-gated: a worker
     # without the Fun-VACE models/nodes silently falls through to the traditional i2v path.
     if segment.continuation_mode == "vace":
@@ -843,7 +1012,7 @@ async def execute_segment(
             segment.index,
         )
 
-    lora_names = ", ".join(l.high_file or l.low_file or "?" for l in (segment.loras or []))
+    lora_names = ", ".join(item.high_file or item.low_file or "?" for item in (segment.loras or []))
 
     augmented_prompt = segment.prompt
     if segment.previous_motion_keywords:
@@ -916,7 +1085,7 @@ async def execute_segment(
         if segment.reference_frames:
             for ref_s3_path in segment.reference_frames:
                 ref_data = await _download_with_retry(
-                    lambda: queue.download_file(ref_s3_path), f"reference_frame"
+                    lambda: queue.download_file(ref_s3_path), "reference_frame"
                 )
                 _validate_image_data(ref_data, "reference_frame")
                 ext = os.path.splitext(ref_s3_path)[1] or ".png"

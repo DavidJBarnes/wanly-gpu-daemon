@@ -12,6 +12,7 @@ from typing import Any
 from daemon.config import settings
 from daemon.schemas import SegmentClaim
 from daemon.motion_analyzer import estimate_motion_from_flow
+from daemon.stage_log import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,24 @@ LORA_NODE_IDS = {
     "high": ["118", "120", "122"],
     "low": ["119", "121", "123"],
 }
+
+# Schedulers WanVideoSampler (WanVideoWrapper) accepts. These are NOT the KSampler
+# names ("simple", "karras", ...) the traditional path uses — passing one of those
+# makes ComfyUI reject the prompt with a 400. Shared by the VACE and Lynx builders.
+WANVIDEO_SCHEDULERS = frozenset({
+    "unipc", "unipc/beta", "dpm++", "dpm++/beta", "dpm++_sde", "dpm++_sde/beta",
+    "euler", "euler/beta", "deis", "lcm", "lcm/beta", "res_multistep",
+    "flowmatch_causvid", "flowmatch_distill", "flowmatch_pusa", "multitalk",
+})
+
+# Wan native resolution buckets Lynx is validated at. Anything else is rejected rather
+# than snapped, because an off-bucket latent grid degrades identity silently.
+LYNX_RESOLUTIONS = frozenset({(832, 480), (1280, 720)})
+
+# Lynx adapter arms. The ip layers and the resampler are a matched pair — the
+# resampler's proj_out dimension must match the ip layers it feeds. A mismatched pair
+# loads without raising and yields garbage identity, so it is validated up front.
+LYNX_ARMS = ("lite", "full")
 
 # Base Wan2.2 14B Image-to-Video workflow in ComfyUI API format.
 # Dynamic nodes (RIFE, VHS_VideoCombine, faceswap, user LoRAs) are added at runtime.
@@ -221,7 +240,7 @@ def _calculate_motion_amplitude(
 
 def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
     """Add user LoRA nodes and rewire the lightx2v chain."""
-    loras = [l for l in loras if l.get("high_file") or l.get("low_file")]
+    loras = [item for item in loras if item.get("high_file") or item.get("low_file")]
     if not loras:
         return
 
@@ -452,7 +471,8 @@ def _build_vace_lora_chains(workflow: dict, segment: SegmentClaim) -> tuple[list
     counter = [700]
 
     def add(lora_name: str, strength: float, prev: list | None) -> list:
-        nid = str(counter[0]); counter[0] += 1
+        nid = str(counter[0])
+        counter[0] += 1
         inputs = {"lora": lora_name, "strength": float(strength), "merge_loras": True}
         if prev is not None:
             inputs["prev_lora"] = prev
@@ -536,12 +556,7 @@ def build_vace_workflow(
     # WanVideoSampler has no sampler_name and its own scheduler set — NOT the KSampler names
     # (e.g. "simple") the preset carries for the traditional path. Only honor the preset's
     # scheduler if WanVideoSampler accepts it; otherwise keep unipc (else ComfyUI 400s).
-    _VACE_SCHEDULERS = {
-        "unipc", "unipc/beta", "dpm++", "dpm++/beta", "dpm++_sde", "dpm++_sde/beta",
-        "euler", "euler/beta", "deis", "lcm", "lcm/beta", "res_multistep",
-        "flowmatch_causvid", "flowmatch_distill", "flowmatch_pusa", "multitalk",
-    }
-    vace_scheduler = segment.scheduler if segment.scheduler in _VACE_SCHEDULERS else "unipc"
+    vace_scheduler = segment.scheduler if segment.scheduler in WANVIDEO_SCHEDULERS else "unipc"
     wf["550"] = {"class_type": "WanVideoSampler", "inputs": {
         "model": ["510", 0], "image_embeds": ["540", 0], "text_embeds": ["521", 0],
         "steps": steps, "cfg": cfg, "shift": shift, "seed": segment.seed, "force_offload": True,
@@ -571,6 +586,234 @@ def build_vace_workflow(
 
     logger.info("Built VACE continuation workflow (%d nodes, %d frames, rife %dx)",
                 len(wf), num_frames, rife_mult)
+    return wf
+
+
+class LynxValidationError(ValueError):
+    """A Lynx job asked for something the graph cannot honour.
+
+    Raised instead of silently clamping: an off-bucket resolution or an off-grid
+    frame count degrades identity in ways that are hard to attribute after the fact,
+    so the job fails loudly with the offending value named.
+    """
+
+
+def _pick(override: Any, default: Any) -> Any:
+    """Per-job-override -> settings-default precedence.
+
+    ``None`` means "not set for this job"; every other value (including 0 and "")
+    is an intentional override and wins.
+    """
+    return default if override is None else override
+
+
+def _lynx_arm(filename: str) -> str | None:
+    """Classify a Lynx adapter file as the 'lite' or 'full' arm by filename marker."""
+    lowered = filename.lower()
+    found = [arm for arm in LYNX_ARMS if arm in lowered]
+    return found[0] if len(found) == 1 else None
+
+
+def lynx_num_frames(segment: SegmentClaim) -> int:
+    """WAN generation frame count for a Lynx segment, rounded to a valid 4n+1."""
+    gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
+    n = max(int(gen["wan_frames"]), 5)
+    return ((n - 1) // 4) * 4 + 1
+
+
+def _validate_lynx(
+    segment: SegmentClaim,
+    subject_filename: str | None,
+    num_frames: int,
+    ip_layers: str,
+    resampler: str,
+) -> None:
+    """Reject unsupported Lynx parameters with named values. No clamping."""
+    if not subject_filename:
+        raise LynxValidationError(
+            "Lynx requires a subject_image: identity is conditioned on an ArcFace "
+            "embedding of that image, so there is nothing to condition on without it."
+        )
+    if (segment.width, segment.height) not in LYNX_RESOLUTIONS:
+        allowed = ", ".join(f"{w}x{h}" for w, h in sorted(LYNX_RESOLUTIONS))
+        raise LynxValidationError(
+            f"Lynx supports only the Wan native buckets ({allowed}); "
+            f"got {segment.width}x{segment.height}."
+        )
+    if num_frames < 5 or (num_frames - 1) % 4 != 0:
+        raise LynxValidationError(
+            f"Lynx frame count must be on the 4n+1 grid and >= 5 (e.g. 81); got {num_frames}."
+        )
+    ip_arm, res_arm = _lynx_arm(ip_layers), _lynx_arm(resampler)
+    if ip_arm is None or res_arm is None or ip_arm != res_arm:
+        raise LynxValidationError(
+            "Lynx ip layers and resampler must be the same arm (both 'lite' or both "
+            f"'full'); got ip_layers={ip_layers!r} (arm={ip_arm}), "
+            f"resampler={resampler!r} (arm={res_arm})."
+        )
+
+
+def build_lynx_workflow(
+    segment: SegmentClaim,
+    subject_filename: str,
+    num_frames: int,
+) -> dict[str, Any]:
+    """Lynx identity-preserving workflow (Wan2.1 T2V-14B + Lynx adapters) via WanVideoWrapper.
+
+    Lynx conditions a *text-to-video* base on a subject image through two adapters, both
+    re-applied at every denoising step (unlike a character LoRA, which bakes identity into
+    the weights):
+
+      ip_scale  — strength of the ID-adapter: ArcFace embedding of a 112x112 aligned face
+                  crop, mapped to identity tokens by a Perceiver resampler. Controls *who*
+                  the face is; pushing it too high tends to freeze expression.
+      ref_scale — strength of the Ref-adapter: dense VAE features of a larger (256px) face
+                  crop, cross-attended in the DiT blocks. Controls fine appearance detail
+                  (skin, hair, lighting); too high drags the reference's pose/lighting in.
+
+    The subject image is NOT a first frame — this is not i2v, and the subject never appears
+    as frame 0. Character LoRAs remain supported and stack on top of the adapters.
+
+    ``num_frames`` must be on the 4n+1 grid and the resolution a Wan native bucket; both are
+    validated rather than clamped. Output is RIFE-interpolated to the segment's target fps so
+    Lynx segments stitch alongside traditional ones.
+    """
+    gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
+
+    ip_layers = _pick(segment.lynx_ip_layers, settings.lynx_ip_layers)
+    resampler = _pick(segment.lynx_resampler, settings.lynx_resampler)
+    _validate_lynx(segment, subject_filename, num_frames, ip_layers, resampler)
+
+    ip_scale = _pick(segment.lynx_ip_scale, settings.lynx_ip_scale)
+    ref_scale = _pick(segment.lynx_ref_scale, settings.lynx_ref_scale)
+    lynx_cfg_scale = _pick(segment.lynx_cfg_scale, settings.lynx_lynx_cfg_scale)
+    start_percent = _pick(segment.lynx_start_percent, settings.lynx_start_percent)
+    end_percent = _pick(segment.lynx_end_percent, settings.lynx_end_percent)
+    ref_blocks = _pick(segment.lynx_ref_blocks_to_use, settings.lynx_ref_blocks_to_use)
+    steps = _pick(segment.lynx_steps, settings.lynx_steps)
+    cfg = _pick(segment.lynx_cfg, settings.lynx_cfg)
+    shift = _pick(segment.lynx_shift, settings.lynx_shift)
+    distill_strength = _pick(segment.lynx_distill_strength, settings.lynx_distill_strength)
+    scheduler_pref = _pick(segment.lynx_scheduler, settings.lynx_scheduler)
+    scheduler = scheduler_pref if scheduler_pref in WANVIDEO_SCHEDULERS else settings.lynx_scheduler
+
+    wf: dict[str, Any] = {}
+
+    # --- Adapters + block swap -------------------------------------------------
+    # Both adapters reach the model through one chained extra_model list; the loader
+    # merges them into the base state dict at load time.
+    wf["600"] = {"class_type": "WanVideoBlockSwap", "inputs": {
+        "blocks_to_swap": settings.lynx_blocks_to_swap, "offload_img_emb": False,
+        "offload_txt_emb": False, "vace_blocks_to_swap": 0}}
+    wf["601"] = {"class_type": "WanVideoExtraModelSelect", "inputs": {"extra_model": ip_layers}}
+    wf["602"] = {"class_type": "WanVideoExtraModelSelect", "inputs": {
+        "extra_model": settings.lynx_ref_layers, "prev_model": ["601", 0]}}
+
+    # --- LoRA chain: distill first, then optional character LoRAs on top --------
+    # Wan2.1 T2V is a single-expert model, so unlike the 2.2 dual-expert path there is
+    # one chain; a LoRA's high_file is used, falling back to low_file.
+    lora_ref: list[Any] | None = None
+    lora_counter = 700
+    if distill_strength:
+        wf[str(lora_counter)] = {"class_type": "WanVideoLoraSelect", "inputs": {
+            "lora": settings.lynx_distill_lora, "strength": float(distill_strength),
+            "merge_loras": True}}
+        lora_ref = [str(lora_counter), 0]
+        lora_counter += 1
+    for lora in (segment.loras or []):
+        lora_file = lora.high_file or lora.low_file
+        if not lora_file:
+            continue
+        weight = lora.high_weight if lora.high_file else lora.low_weight
+        inputs: dict[str, Any] = {
+            "lora": lora_file, "strength": float(weight), "merge_loras": True}
+        if lora_ref is not None:
+            inputs["prev_lora"] = lora_ref
+        wf[str(lora_counter)] = {"class_type": "WanVideoLoraSelect", "inputs": inputs}
+        lora_ref = [str(lora_counter), 0]
+        lora_counter += 1
+
+    loader_inputs: dict[str, Any] = {
+        "model": settings.lynx_t2v_model, "base_precision": "fp16",
+        "quantization": "fp8_e4m3fn_scaled", "load_device": "offload_device",
+        "attention_mode": "sdpa", "extra_model": ["602", 0], "block_swap_args": ["600", 0]}
+    if lora_ref is not None:
+        loader_inputs["lora"] = lora_ref
+    wf["610"] = {"class_type": "WanVideoModelLoader", "inputs": loader_inputs}
+
+    # --- VAE + text encoders ---------------------------------------------------
+    wf["620"] = {"class_type": "WanVideoVAELoader", "inputs": {
+        "model_name": settings.vae_model, "precision": "bf16"}}
+    # Cached encode keeps umt5-xxl off the GPU between jobs — the residency that has
+    # OOM'd this box before. Same handling as the VACE path.
+    wf["621"] = {"class_type": "WanVideoTextEncodeCached", "inputs": {
+        "model_name": settings.lynx_t5_model, "precision": "bf16",
+        "positive_prompt": segment.prompt, "negative_prompt": segment.negative_prompt or "",
+        "quantization": "disabled", "use_disk_cache": False, "device": "gpu"}}
+    # Second, separate embed for the reference-extraction pass. ByteDance hardcode this
+    # prompt; WanVideoAddLynxEmbeds raises if ref_image is supplied without it.
+    wf["622"] = {"class_type": "WanVideoTextEncodeCached", "inputs": {
+        "model_name": settings.lynx_t5_model, "precision": "bf16",
+        "positive_prompt": settings.lynx_ref_prompt, "negative_prompt": "",
+        "quantization": "disabled", "use_disk_cache": False, "device": "gpu"}}
+
+    # --- Subject conditioning --------------------------------------------------
+    # One crop node yields both faces: a 112x112 ArcFace-aligned crop for the ID adapter
+    # and a wider 256px crop for the ref adapter. Raises "No face detected" upstream,
+    # which the executor surfaces as a job validation failure.
+    wf["630"] = {"class_type": "LoadImage", "inputs": {"image": subject_filename}}
+    wf["631"] = {"class_type": "LynxInsightFaceCrop", "inputs": {"image": ["630", 0]}}
+    wf["632"] = {"class_type": "LoadLynxResampler", "inputs": {
+        "model_name": resampler, "precision": settings.lynx_resampler_precision}}
+    wf["633"] = {"class_type": "LynxEncodeFaceIP", "inputs": {
+        "resampler": ["632", 0], "ip_image": ["631", 0]}}
+
+    # --- Empty latents + Lynx embed injection ----------------------------------
+    wf["640"] = {"class_type": "WanVideoEmptyEmbeds", "inputs": {
+        "width": segment.width, "height": segment.height, "num_frames": num_frames}}
+    embed_inputs: dict[str, Any] = {
+        "embeds": ["640", 0], "ip_scale": float(ip_scale), "ref_scale": float(ref_scale),
+        "lynx_cfg_scale": float(lynx_cfg_scale), "start_percent": float(start_percent),
+        "end_percent": float(end_percent), "vae": ["620", 0],
+        "lynx_ip_embeds": ["633", 0], "ref_image": ["631", 1], "ref_text_embed": ["622", 0]}
+    # Omit when empty: the node treats "" as "all blocks", and sending the key at all
+    # would need it wired as a link (it is declared forceInput).
+    if ref_blocks:
+        embed_inputs["ref_blocks_to_use"] = ref_blocks
+    wf["641"] = {"class_type": "WanVideoAddLynxEmbeds", "inputs": embed_inputs}
+
+    # --- Sample / decode / output ----------------------------------------------
+    wf["650"] = {"class_type": "WanVideoSampler", "inputs": {
+        "model": ["610", 0], "image_embeds": ["641", 0], "text_embeds": ["621", 0],
+        "steps": steps, "cfg": cfg, "shift": shift, "seed": segment.seed,
+        "force_offload": True, "scheduler": scheduler, "riflex_freq_index": 0,
+        "start_step": 0, "end_step": -1}}
+    wf["660"] = {"class_type": "WanVideoDecode", "inputs": {
+        "vae": ["620", 0], "samples": ["650", 0], "enable_vae_tiling": False,
+        "tile_x": 272, "tile_y": 272, "tile_stride_x": 144, "tile_stride_y": 128}}
+
+    rife_mult = gen["rife_multiplier"]
+    final_images = ["660", 0]
+    if rife_mult > 1:
+        wf["670"] = {"class_type": "RIFE VFI", "inputs": {
+            "ckpt_name": "rife49.pth", "clear_cache_after_n_frames": 10, "multiplier": rife_mult,
+            "fast_mode": True, "ensemble": True, "scale_factor": 1.0, "dtype": "float16",
+            "torch_compile": False, "batch_size": 1, "frames": ["660", 0]}}
+        final_images = ["670", 0]
+    wf["680"] = {"class_type": "VHS_VideoCombine", "inputs": {
+        "frame_rate": gen["output_fps"], "loop_count": 0, "filename_prefix": "output",
+        "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 15, "save_metadata": True,
+        "trim_to_audio": False, "pingpong": False, "save_output": True, "images": final_images}}
+
+    log_event(
+        logger, "lynx.graph_built", str(segment.id),
+        nodes=len(wf), num_frames=num_frames,
+        resolution=f"{segment.width}x{segment.height}",
+        arm=_lynx_arm(ip_layers), ip_scale=ip_scale, ref_scale=ref_scale,
+        steps=steps, cfg=cfg, shift=shift, scheduler=scheduler,
+        distill_strength=distill_strength, character_loras=len(segment.loras or []),
+        rife_multiplier=rife_mult,
+    )
     return wf
 
 
@@ -733,7 +976,7 @@ def build_workflow(
 
     # User LoRAs
     if segment.loras:
-        _add_user_loras(workflow, [l.model_dump() for l in segment.loras])
+        _add_user_loras(workflow, [item.model_dump() for item in segment.loras])
 
     # Face swap (before RIFE so it processes only native WAN frames, not
     # interpolated ones — cuts faceswap frame count by 50-75%)

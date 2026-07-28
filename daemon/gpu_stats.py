@@ -2,11 +2,12 @@
 
 import logging
 import subprocess
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def get_gpu_stats() -> dict | None:
+def get_gpu_stats() -> dict[str, Any] | None:
     """Query nvidia-smi for GPU stats. Returns None on failure."""
     try:
         result = subprocess.run(

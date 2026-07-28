@@ -47,6 +47,52 @@ class Settings(BaseSettings):
     vace_blocks_to_swap: int = 25
     vace_lightning: bool = True  # use the 4-step distill LoRAs (fast path)
 
+    # === Lynx identity-preserving generation (ByteDance Lynx on Wan2.1 T2V-14B) ===
+    # Lynx re-asserts identity at EVERY denoising step via two adapters, unlike a
+    # character LoRA which bakes it into the weights:
+    #   ip  (ID-adapter)  ArcFace embedding -> Perceiver resampler -> identity tokens
+    #   ref (Ref-adapter) dense VAE features of the reference face, cross-attended in DiT blocks
+    # This is a T2V base conditioned on a subject image — NOT first-frame i2v, so the
+    # subject image never appears as frame 0.
+    lynx_t2v_model: str = "Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors"
+    # ip layers and resampler are a MATCHED PAIR (the resampler's proj_out dim must match
+    # the ip layers). Default is Kijai's shipped combination — lite ip + full ref — because
+    # his own workflow note reports the full ip adapter as "very weak". full ip + full ref
+    # is the A/B arm; swap BOTH lynx_ip_layers and lynx_resampler together.
+    lynx_ip_layers: str = "Wan2_1-T2V-14B-Lynx_lite_ip_layers_fp16.safetensors"
+    lynx_resampler: str = "lynx_lite_resampler_fp32.safetensors"
+    lynx_ref_layers: str = "Wan2_1-T2V-14B-Lynx_full_ref_layers_fp16.safetensors"
+    lynx_resampler_precision: str = "fp16"
+    # Wan2.1 T2V cfg-step-distill LoRA (the i2v lightx2v_* above are a different family and
+    # do NOT apply to the 2.1 T2V base). Strength 0 drops it -> de-distilled path.
+    lynx_distill_lora: str = "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"
+    lynx_distill_strength: float = 1.0
+    lynx_t5_model: str = "models_t5_umt5-xxl-enc-bf16.pth"
+    # Adapter strengths. Kijai's reference workflow ships 0.7/0.6 rather than the 1.0/1.0
+    # implied by the model card; treated as the calibration starting point, not gospel.
+    lynx_ip_scale: float = 0.7
+    lynx_ref_scale: float = 0.6
+    # Only takes effect when the main cfg is also > 1.0 (it triggers an extra pass). With the
+    # distill LoRA on, cfg is 1.0, so this is inert until you de-distill.
+    lynx_lynx_cfg_scale: float = 2.0
+    # Denoise window over which the ref adapter is applied (fraction of total steps).
+    lynx_start_percent: float = 0.0
+    lynx_end_percent: float = 1.0
+    # Comma-separated DiT block indices/ranges for the ref feature, e.g. "0-20, 25, 35-39".
+    # Empty = all blocks.
+    lynx_ref_blocks_to_use: str = ""
+    # Reference-extraction pass prompt. Hardcoded in ByteDance's original implementation;
+    # Kijai's node requires it whenever ref_image is supplied.
+    lynx_ref_prompt: str = "image of a face"
+    lynx_steps: int = 6
+    lynx_cfg: float = 1.0
+    lynx_shift: float = 8.0
+    lynx_scheduler: str = "lcm"
+    lynx_blocks_to_swap: int = 35
+    # Identity QA: sample N frames from the render and cosine-compare their InsightFace
+    # embeddings against the subject crop. Measurement only — nothing gates on the score.
+    lynx_identity_sample_frames: int = 5
+
     # AR hologram: Robust Video Matting ONNX model (auto-used when a clip is NOT green-screen).
     # ~15MB; auto-downloaded on first use if missing. Path is relative to the daemon workdir.
     rvm_model_path: str = "models/rvm_mobilenetv3_fp32.onnx"
