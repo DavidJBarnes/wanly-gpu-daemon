@@ -28,7 +28,7 @@
     "class_type": "WanVideoModelLoader",
     "inputs": {
       "attention_mode": "sdpa",
-      "base_precision": "fp16",
+      "base_precision": "fp16_fast",
       "block_swap_args": [
         "600",
         0
@@ -43,7 +43,7 @@
         0
       ],
       "model": "Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors",
-      "quantization": "fp8_e4m3fn_scaled"
+      "quantization": "disabled"
     }
   },
   "620": {
