@@ -14,7 +14,12 @@ from PIL import Image
 
 from daemon import executor
 from daemon.comfyui_client import ComfyUIExecutionError
-from daemon.executor import _execute_lynx, _measure_lynx_identity, _resolve_lynx_subject
+from daemon.executor import (
+    _execute_lynx,
+    _lynx_preflight,
+    _measure_lynx_identity,
+    _resolve_lynx_subject,
+)
 from daemon.workflow_builder import LynxValidationError
 from tests.conftest import make_segment
 
@@ -30,12 +35,47 @@ def png_bytes(size=(256, 256)) -> bytes:
     return buf.getvalue()
 
 
+class FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class FakeHTTP:
+    """Stands in for the ComfyUI /object_info probes the preflight makes."""
+
+    def __init__(self, lynx_available=True, resamplers=None, raises=False):
+        self._lynx_available = lynx_available
+        self._resamplers = resamplers
+        self._raises = raises
+
+    async def get(self, path):
+        if self._raises:
+            raise ConnectionError("comfyui unreachable")
+        if path.endswith("WanVideoAddLynxEmbeds"):
+            if not self._lynx_available:
+                return FakeResponse({}, status_code=404)
+            return FakeResponse({"WanVideoAddLynxEmbeds": {}})
+        if path.endswith("LoadLynxResampler"):
+            choices = self._resamplers if self._resamplers is not None else [
+                "lynx_lite_resampler_fp32.safetensors",
+                "lynx_full_resampler_fp32.safetensors",
+            ]
+            return FakeResponse({"LoadLynxResampler": {
+                "input": {"required": {"model_name": [choices]}}}})
+        return FakeResponse({}, status_code=404)
+
+
 class FakeComfyUI:
-    def __init__(self, video_output=True, execution_error=None):
+    def __init__(self, video_output=True, execution_error=None, http=None):
         self.submitted = None
         self.uploaded = []
         self._video_output = video_output
         self._execution_error = execution_error
+        self.http = http or FakeHTTP()
 
     async def upload_image(self, data, filename):
         self.uploaded.append(filename)
@@ -225,6 +265,51 @@ class TestExecuteLynx:
                             FakeComfyUI(), queue)
         assert queue.outputs[0].status == "completed"
         assert queue.outputs[0].lynx_identity_scores is None
+
+
+class TestPreflight:
+    """A worker that cannot run Lynx must say why — there is no silent fallback."""
+
+    async def test_passes_when_nodes_and_resampler_present(self):
+        await _lynx_preflight(FakeComfyUI(), make_segment())
+
+    async def test_missing_lynx_nodes_names_both_causes(self):
+        comfy = FakeComfyUI(http=FakeHTTP(lynx_available=False))
+        with pytest.raises(LynxValidationError) as exc:
+            await _lynx_preflight(comfy, make_segment())
+        message = str(exc.value)
+        assert "1.3.5" in message           # wrapper too old
+        assert "insightface" in message     # or the import failed
+
+    async def test_unreachable_comfyui_is_reported(self):
+        comfy = FakeComfyUI(http=FakeHTTP(raises=True))
+        with pytest.raises(LynxValidationError, match="could not query ComfyUI"):
+            await _lynx_preflight(comfy, make_segment())
+
+    async def test_missing_resampler_file_is_caught_before_submitting(self):
+        comfy = FakeComfyUI(http=FakeHTTP(resamplers=["something_else.safetensors"]))
+        with pytest.raises(LynxValidationError, match="not in this worker's diffusion_models"):
+            await _lynx_preflight(comfy, make_segment())
+
+    async def test_unenumerable_resamplers_are_tolerated(self):
+        """Node exists but we cannot list files — let the run surface any real problem."""
+        class OddHTTP(FakeHTTP):
+            async def get(self, path):
+                if path.endswith("LoadLynxResampler"):
+                    raise RuntimeError("weird")
+                return await super().get(path)
+
+        await _lynx_preflight(FakeComfyUI(http=OddHTTP()), make_segment())
+
+    async def test_empty_choice_list_is_tolerated(self):
+        await _lynx_preflight(FakeComfyUI(http=FakeHTTP(resamplers=[])), make_segment())
+
+    async def test_preflight_failure_fails_the_segment_without_submitting(self):
+        comfy = FakeComfyUI(http=FakeHTTP(lynx_available=False))
+        queue = FakeQueue()
+        await _execute_lynx(make_segment(lynx_subject_image="s3://b/f.png"), comfy, queue)
+        assert comfy.submitted is None
+        assert "1.3.5" in _failure(queue).error_message
 
 
 class TestMeasureLynxIdentity:

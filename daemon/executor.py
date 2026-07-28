@@ -38,6 +38,7 @@ from daemon.schemas import SegmentClaim, SegmentResult
 from daemon.workflow_builder import (
     GENERATION_FPS,
     LynxValidationError,
+    _pick,
     build_workflow,
     build_faceswap_workflow,
     build_lynx_workflow,
@@ -670,6 +671,47 @@ def _holo_process_frames_sync(
     return mode, packed_w, packed_h, poster_buf.getvalue(), manifest
 
 
+async def _lynx_preflight(comfyui: ComfyUIClient, segment: SegmentClaim) -> None:
+    """Fail fast with a diagnosis when the worker cannot run Lynx.
+
+    Two failure modes are easy to confuse and both present as "node not found":
+      * the wrapper predates Lynx (added in WanVideoWrapper 1.3.5), or
+      * the wrapper is new enough but its Lynx import raised — most often a missing
+        insightface — in which case it logs a warning and registers nothing.
+    Either way the node is absent, so that is what we probe, and we separately confirm
+    the adapters this job names are actually on disk.
+    """
+    try:
+        resp = await comfyui.http.get("/object_info/WanVideoAddLynxEmbeds")
+        available = resp.status_code == 200 and "WanVideoAddLynxEmbeds" in resp.json()
+    except Exception as e:
+        raise LynxValidationError(
+            f"could not query ComfyUI for Lynx node support: {e}"
+        ) from e
+    if not available:
+        raise LynxValidationError(
+            "this worker's ComfyUI has no Lynx nodes. Either WanVideoWrapper is older "
+            "than 1.3.5 (which first shipped Lynx), or its Lynx import failed — the "
+            "wrapper logs 'Lynx nodes not available' and registers nothing when, for "
+            "example, insightface is missing. Check the ComfyUI startup log."
+        )
+    # The resampler must be present under the name this job asked for; a missing file
+    # would otherwise surface as an opaque loader error mid-run.
+    resampler = _pick(segment.lynx_resampler, settings.lynx_resampler)
+    try:
+        resp = await comfyui.http.get("/object_info/LoadLynxResampler")
+        spec = resp.json().get("LoadLynxResampler", {}).get(
+            "input", {}).get("required", {}).get("model_name", [[]])
+        choices = spec[0] if spec and isinstance(spec[0], list) else []
+    except Exception:
+        return  # node exists; if we cannot enumerate files, let the run surface it
+    if choices and resampler not in choices:
+        raise LynxValidationError(
+            f"Lynx resampler {resampler!r} is not in this worker's diffusion_models "
+            f"directory. Available: {sorted(choices)[:10]}"
+        )
+
+
 async def _resolve_lynx_subject(
     segment: SegmentClaim, comfyui: ComfyUIClient, queue: QueueClient
 ) -> tuple[str, bytes]:
@@ -712,6 +754,10 @@ async def _execute_lynx(
         resolution=f"{segment.width}x{segment.height}",
     )
     try:
+        # 0. Preflight: no silent fallback — Lynx is a different base model family
+        # from the 2.2 i2v default, so a worker that cannot run it must say why.
+        await _lynx_preflight(comfyui, segment)
+
         if segment.loras:
             await ensure_loras_available(segment.loras, queue)
 
