@@ -166,15 +166,19 @@ class TestGraphTopology:
         assert wf["610"]["inputs"]["block_swap_args"] == ["600", 0]
         assert wf["600"]["inputs"]["blocks_to_swap"] == settings.lynx_blocks_to_swap
 
-    def test_does_not_requantise_an_already_scaled_fp8_checkpoint(self, segment):
-        """Regression: the base file is already _scaled_KJ fp8.
+    def test_no_fp8_anywhere_in_the_graph(self, segment):
+        """Regression: an fp8 base is incompatible with the Lynx adapters here.
 
-        Quantizing it again leaves the fp16 Lynx adapters meeting fp8 base weights and
-        WanVideoSampler dies with "self and mat2 must have the same dtype, but got Half
-        and Float8_e4m3fn". Kijai's reference workflow pairs fp16_fast with disabled.
+        The adapters are plain nn.Linear, so they are not wrapped by the wrapper's
+        fp8-aware linear. With an fp8 base their weights get cast to fp8 while
+        activations stay fp16 and WanVideoSampler dies with "self and mat2 must have the
+        same dtype, but got Half and Float8_e4m3fn" — identically for
+        quantization=fp8_e4m3fn_scaled and =disabled.
         """
         wf = build_lynx_workflow(segment, "subject.png", 81)
         assert wf["610"]["inputs"]["quantization"] == "disabled"
+        assert "fp8" not in wf["610"]["inputs"]["model"], (
+            "Lynx needs a non-fp8 base checkpoint")
 
     def test_base_precision_is_supported_by_the_pinned_torch(self, segment):
         """fp16_fast enables fp16 accumulation, which needs a torch 2.7 nightly the

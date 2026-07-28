@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     #   ref (Ref-adapter) dense VAE features of the reference face, cross-attended in DiT blocks
     # This is a T2V base conditioned on a subject image — NOT first-frame i2v, so the
     # subject image never appears as frame 0.
-    lynx_t2v_model: str = "Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors"
+    lynx_t2v_model: str = "wan2.1_t2v_14B_fp16.safetensors"
     # ip layers and resampler are a MATCHED PAIR (the resampler's proj_out dim must match
     # the ip layers). Default is Kijai's shipped combination — lite ip + full ref — because
     # his own workflow note reports the full ip adapter as "very weak". full ip + full ref
@@ -70,16 +70,22 @@ class Settings(BaseSettings):
     lynx_resampler: str = "lynx_lite_resampler_fp32.safetensors"
     lynx_ref_layers: str = "Wan2_1-T2V-14B-Lynx_full_ref_layers_fp16.safetensors"
     lynx_resampler_precision: str = "fp16"
-    # Loader precision pair. "disabled" does NOT mean unquantized — the node autoselects
-    # from the weights, which is what we want for an already-scaled fp8 checkpoint
-    # (_scaled_KJ). Quantizing it again leaves the fp16 Lynx adapters meeting fp8 base
-    # weights and the sampler dies with "self and mat2 must have the same dtype".
+    # Loader precision. Everything stays fp16: no fp8 anywhere in the graph.
     #
-    # Kijai's reference workflow pairs this with "fp16_fast", but that enables fp16
-    # accumulation via torch.backends.cuda.matmul.allow_fp16_accumulation, which needs a
-    # torch >= 2.7.0.dev2025-02-26 nightly. Our RunPod image ships an older torch, so
-    # fp16_fast fails at load. Plain fp16 is the same math without the fast-accumulate
-    # speedup. Valid values: fp32 | bf16 | fp16 | fp16_fast.
+    # An fp8 base does NOT work with Lynx on this stack. The adapters are plain
+    # nn.Linear (lynx/modules.py: to_k_ip, to_v_ip, to_k_ref, to_v_ref), so they are not
+    # wrapped by the wrapper's fp8-aware linear. With an fp8 base their weights get cast
+    # to fp8 while activations stay fp16, and WanVideoSampler dies with
+    # "self and mat2 must have the same dtype, but got Half and Float8_e4m3fn".
+    # Both fp8 settings fail identically (quantization=fp8_e4m3fn_scaled AND =disabled),
+    # so quantization is not the lever — the base checkpoint's dtype is.
+    #
+    # Kijai's reference workflow gets away with an fp8 base only via base_precision
+    # "fp16_fast", which needs torch >= 2.7.0.dev2025-02-26 (our image is older).
+    #
+    # Cost of fp16: a 28GB checkpoint instead of 14.5GB. Block swap carries it, exactly
+    # as the VACE path already runs 28GB fp16 models on a 24GB card.
+    # Valid base_precision: fp32 | bf16 | fp16 | fp16_fast.
     lynx_base_precision: str = "fp16"
     lynx_quantization: str = "disabled"
     # Wan2.1 T2V cfg-step-distill LoRA (the i2v lightx2v_* above are a different family and
