@@ -85,7 +85,7 @@ All Lynx files live in `models/diffusion_models/` — both `LoadLynxResampler` a
 
 | Setting | File | Size | Purpose |
 |---|---|---|---|
-| `lynx_t2v_model` | `Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ.safetensors` | 14.5 GB | Base |
+| `lynx_t2v_model` | `wan2.1_t2v_14B_fp16.safetensors` | 28 GB | Base (**fp16, not fp8** — see §6) |
 | `lynx_ref_layers` | `Wan2_1-T2V-14B-Lynx_full_ref_layers_fp16.safetensors` | 4.2 GB | Ref-adapter |
 | `lynx_ip_layers` | `Wan2_1-T2V-14B-Lynx_lite_ip_layers_fp16.safetensors` | 0.84 GB | ID-adapter (**default**) |
 | `lynx_resampler` | `lynx_lite_resampler_fp32.safetensors` | 0.33 GB | Resampler (**default**) |
@@ -93,15 +93,18 @@ All Lynx files live in `models/diffusion_models/` — both `LoadLynxResampler` a
 | — | `lynx_full_resampler_fp32.safetensors` | 0.34 GB | Resampler (A/B arm) |
 | `lynx_distill_lora` | `lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors` | 0.63 GB | cfg-step distill |
 
-Total **25 GB**, plus the shared `models_t5_umt5-xxl-enc-bf16.pth` (11 GB) and
+Total **~50 GB**, plus the shared `models_t5_umt5-xxl-enc-bf16.pth` (11 GB) and
 `wan_2.1_vae.safetensors`.
 
 ### Why Kijai's repacks, not `Wan-AI` / `ByteDance/lynx`
 
 The original task named the upstream repos. Those ship sharded diffusers-format weights;
 WanVideoWrapper's loaders want a single file. Kijai publishes exactly that, already in our
-layout, and his `_scaled_KJ` fp8 quant is the same family as our `Wan2_2-Animate-14B` model.
-Using upstream would mean a conversion step for no benefit.
+layout, Using upstream would mean a conversion step for no benefit.
+
+The **base** is the exception: it comes from Comfy-Org's repackage rather than Kijai's,
+because Kijai only publishes fp8 builds of the plain 2.1 T2V base and Lynx needs fp16
+(see §6). The adapters and the distill LoRA are still Kijai's.
 
 ### The `lite` vs `full` ip trap
 
@@ -245,19 +248,27 @@ confident-looking failures on a paid GPU:
 
 | Setting | Wrong value | Symptom |
 |---|---|---|
-| `quantization` | `fp8_e4m3fn_scaled` | `self and mat2 must have the same dtype, but got Half and Float8_e4m3fn` at `WanVideoSampler` |
+| base checkpoint | any `_fp8_*` build | `self and mat2 must have the same dtype, but got Half and Float8_e4m3fn` at `WanVideoSampler` — **regardless of the `quantization` flag** |
 | `base_precision` | `fp16_fast` | `allow_fp16_accumulation is not available in this version of torch` at `WanVideoModelLoader` |
 | `MODEL_PROFILE` vs validator | mismatched | `Model validation FAILED — cannot start`, daemon exits before registering |
 
-1. **Do not re-quantize.** The base file is *already* scaled fp8 (`_scaled_KJ`).
-   `quantization: "disabled"` does **not** mean unquantized — the node autoselects from the
-   weights, which is what you want. Setting `fp8_e4m3fn_scaled` quantizes a second time and
-   leaves the fp16 adapters meeting fp8 base weights at matmul. (The VACE path *does* use
-   `fp8_e4m3fn_scaled`, correctly, because its checkpoints are unquantized fp16 — copying
-   that config across is what caused this.)
-2. **`fp16_fast` needs a torch 2.7 nightly.** Kijai's reference workflow uses it, but it
-   enables `torch.backends.cuda.matmul.allow_fp16_accumulation`, which our RunPod image's
-   torch lacks. Plain `fp16` is the same math without the fast-accumulate speedup.
+1. **No fp8 base. This is the big one.** Lynx's adapters are plain `nn.Linear`
+   (`lynx/modules.py`: `to_k_ip`, `to_v_ip`, `to_k_ref`, `to_v_ref`), so they are **not**
+   wrapped by the wrapper's fp8-aware linear. With an fp8 base their weights get cast to
+   fp8 while activations stay fp16, and the sampler dies on `Half × Float8_e4m3fn`.
+
+   The loader flag is **not** the lever — `quantization: fp8_e4m3fn_scaled` and
+   `quantization: disabled` fail *identically*. Only the base checkpoint's dtype matters.
+   Hence `wan2.1_t2v_14B_fp16` (28 GB) rather than any `_fp8_*` build, and a test asserts
+   no fp8 appears anywhere in the loader inputs.
+
+   Kijai's reference workflow *does* run an fp8 base — but only in combination with
+   `base_precision: fp16_fast`, so do not read his graph as evidence fp8 works here.
+2. **`fp16_fast` needs a torch 2.7 nightly.** It enables
+   `torch.backends.cuda.matmul.allow_fp16_accumulation`, which our RunPod image's torch
+   lacks — it fails at `WanVideoModelLoader`. Plain `fp16` is the same math without the
+   fast-accumulate speedup. This is *why* we can't simply copy Kijai's fp8 setup: the two
+   traps are linked, and fp16_fast is the load-bearing piece we can't have.
 3. **The download profile and the validation profile must agree.** See §5.
 
 A unit test pins every loader enum we emit (`base_precision`, `quantization`,
