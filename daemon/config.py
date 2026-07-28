@@ -12,6 +12,13 @@ class Settings(BaseSettings):
     queue_api_key: str = ""
     poll_interval: int = 5
 
+    # Which model families this worker was provisioned with. Mirrors MODEL_PROFILE in
+    # wanly-runpod's download_models.sh, and drives startup model validation:
+    #   "full" — Wan 2.2 i2v + VACE + Lynx (the default)
+    #   "lynx" — Wan2.1 T2V + Lynx adapters only (a lean pod; no 2.2 i2v weights)
+    # A mismatch here fails startup on a perfectly healthy worker, so the two must agree.
+    model_profile: str = "full"
+
     # Model filenames (vary per GPU worker — override in .env)
     clip_model: str = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
     vae_model: str = "wan_2.1_vae.safetensors"
