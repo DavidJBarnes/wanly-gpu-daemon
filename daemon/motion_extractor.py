@@ -1,9 +1,5 @@
 """Extract motion keywords from generated video for context propagation."""
 
-import asyncio
-import json
-import subprocess
-from pathlib import Path
 
 
 MOTION_KEYWORDS = {

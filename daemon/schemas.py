@@ -69,6 +69,26 @@ class SegmentClaim(BaseModel):
     # Foundry smashcut (reprocess_type="smashcut_concat"): ordered clip paths + transition.
     smashcut_clip_paths: Optional[list[str]] = None
     smashcut_transition: Optional[str] = None
+    # === Lynx identity-preserving generation ===
+    # Set generation_engine="lynx" to route this segment to build_lynx_workflow. The subject
+    # image conditions identity via ArcFace + VAE reference features; it is NOT a start frame.
+    # Every lynx_* tunable below is a per-job override: None => the daemon settings default.
+    generation_engine: Optional[str] = None
+    lynx_subject_image: Optional[str] = None
+    lynx_ip_scale: Optional[float] = None
+    lynx_ref_scale: Optional[float] = None
+    lynx_cfg_scale: Optional[float] = None
+    lynx_start_percent: Optional[float] = None
+    lynx_end_percent: Optional[float] = None
+    lynx_ref_blocks_to_use: Optional[str] = None
+    # A/B arm: overrides the matched ip-layers + resampler pair (both or neither).
+    lynx_ip_layers: Optional[str] = None
+    lynx_resampler: Optional[str] = None
+    lynx_steps: Optional[int] = None
+    lynx_cfg: Optional[float] = None
+    lynx_shift: Optional[float] = None
+    lynx_scheduler: Optional[str] = None
+    lynx_distill_strength: Optional[float] = None
     width: int
     height: int
     fps: int
@@ -89,3 +109,7 @@ class SegmentResult(BaseModel):
     # segment carries. Stitch trims this much off the *previous* segment's tail so the
     # reconstruction replaces it seamlessly.
     vace_overlap_seconds: Optional[float] = None
+    # Lynx identity QA: per-frame cosine similarities of sampled output frames against the
+    # subject crop, plus summary stats. Measurement only — no gating. Shape:
+    # {"scores": [...], "mean": f, "min": f, "max": f, "frames_sampled": n, "frames_with_face": n}
+    lynx_identity_scores: Optional[dict[str, Any]] = None
