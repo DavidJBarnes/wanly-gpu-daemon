@@ -288,12 +288,25 @@ async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutd
 
 
 async def _stop_runpod_pod():
-    """Call RunPod API to stop this pod (if running on RunPod)."""
+    """Call RunPod API to stop this pod (if running on RunPod).
+
+    Missing credentials are logged loudly rather than ignored: this runs at the end of a
+    drain, and if the pod does not actually stop the container respawns, the daemon
+    re-registers and the worker goes straight back to claiming work. Returning silently
+    made a drain look like it had simply been ignored, with nothing in the log to say why.
+    """
     import httpx as _httpx
 
     pod_id = settings.runpod_pod_id
     api_key = settings.runpod_api_key
     if not pod_id or not api_key:
+        logger.warning(
+            "Drained, but cannot stop the pod: RUNPOD_POD_ID=%s, RUNPOD_API_KEY=%s. "
+            "The container will respawn and this worker will start claiming work again. "
+            "Set both as pod environment variables to make drain actually stop the pod.",
+            "set" if pod_id else "MISSING",
+            "set" if api_key else "MISSING",
+        )
         return
 
     logger.info("Stopping RunPod pod %s ...", pod_id)
