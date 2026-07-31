@@ -77,10 +77,7 @@ class QueueClient:
             _raise_with_details(resp, f"upload_segment_output {segment_id}")
         logger.info("Uploaded segment output via API for %s", segment_id)
 
-        if result and (
-            result.motion_keywords or result.motion_magnitude
-            or result.vace_overlap_seconds is not None
-        ):
+        if result and (result.motion_keywords or result.motion_magnitude):
             await self.update_segment(segment_id, result)
 
     async def upload_hologram_output(
@@ -111,16 +108,6 @@ class QueueClient:
             _raise_with_details(resp, f"upload_smashcut_output {segment_id}")
         logger.info("Uploaded smashcut output via API for %s", segment_id)
 
-    async def upload_identity_reference(self, job_id: str, image_data: bytes) -> None:
-        """Upload a job's canonical VACE identity reference (a face crop from seg0)."""
-        resp = await self.client.post(
-            f"/jobs/{job_id}/identity_reference",
-            files={"image": ("identity_reference.png", image_data, "image/png")},
-            timeout=120,
-        )
-        if not resp.is_success:
-            _raise_with_details(resp, f"upload_identity_reference {job_id}")
-        logger.info("Uploaded identity reference via API for job %s", job_id)
 
     async def download_file(self, s3_path: str) -> bytes:
         """Download a file from S3 via a presigned URL redirect.

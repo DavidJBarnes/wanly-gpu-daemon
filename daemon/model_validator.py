@@ -24,14 +24,11 @@ MIN_SIZES = {
 # Map config setting names → (ComfyUI loader node, subfolder search list, min size key)
 # Multiple subfolders because ComfyUI searches several dirs per model type
 # (e.g. CLIPLoader searches both clip/ and text_encoders/)
-
-# Shared by every profile.
-_COMMON_CHECKS = [
+#
+# One engine, one list: the native Wan 2.2 i2v path. Mirrors what wanly-runpod's
+# download_models.sh stages — a worker validates exactly what it was provisioned with.
+MODEL_CHECKS = [
     ("vae_model",           "VAELoader",            ["vae"],                    MIN_SIZES["vae"]),
-]
-
-# Default Wan 2.2 i2v generation path.
-_WAN22_CHECKS = [
     ("clip_model",          "CLIPLoader",           ["clip", "text_encoders"],  MIN_SIZES["clip"]),
     ("unet_high_model",     "UNETLoader",           ["diffusion_models", "unet"], MIN_SIZES["unet"]),
     ("unet_low_model",      "UNETLoader",           ["diffusion_models", "unet"], MIN_SIZES["unet"]),
@@ -39,34 +36,10 @@ _WAN22_CHECKS = [
     ("lightx2v_lora_low",   "LoraLoaderModelOnly",  ["loras"],                  MIN_SIZES["loras"]),
 ]
 
-# Lynx-only worker: Wan2.1 T2V base + adapters. The 2.2 i2v models are absent by
-# design, so requiring them here would block startup on a correctly-provisioned pod.
-# The Lynx models load through WanVideoWrapper's own loaders (which read
-# diffusion_models/), not UNETLoader, so they are size-checked on disk rather than
-# looked up in a ComfyUI loader's dropdown.
-_LYNX_CHECKS = [
-    ("lynx_t2v_model",      None,                   ["diffusion_models"],       MIN_SIZES["unet"]),
-    ("lynx_ip_layers",      None,                   ["diffusion_models"],       MIN_SIZES["loras"]),
-    ("lynx_ref_layers",     None,                   ["diffusion_models"],       MIN_SIZES["loras"]),
-    ("lynx_resampler",      None,                   ["diffusion_models"],       MIN_SIZES["loras"]),
-]
-
 
 def get_model_checks() -> list[tuple]:
-    """Model checks for this worker's provisioned profile.
-
-    Mirrors MODEL_PROFILE in wanly-runpod's download_models.sh — a worker validates
-    exactly what it was provisioned to download. Keeping the two in sync matters: a
-    lynx-profile pod has no 2.2 i2v weights, and validating them would fail startup
-    on a perfectly healthy worker.
-    """
-    if settings.model_profile.strip().lower() == "lynx":
-        return _COMMON_CHECKS + _LYNX_CHECKS
-    return _COMMON_CHECKS + _WAN22_CHECKS
-
-
-# Back-compat for callers/tests that import the flat list (full profile).
-MODEL_CHECKS = _COMMON_CHECKS + _WAN22_CHECKS
+    """Model checks every worker must pass. Kept as a function for call-site stability."""
+    return MODEL_CHECKS
 
 PARTIAL_EXTENSIONS = {".aria2", ".tmp", ".part"}
 
@@ -126,8 +99,7 @@ async def validate_models(comfyui_client) -> bool:
         return True
 
     checks = get_model_checks()
-    logger.info("Validating models for profile=%s (%d checks)",
-                settings.model_profile, len(checks))
+    logger.info("Validating models (%d checks)", len(checks))
 
     # Try to get available models from ComfyUI's /object_info
     available_models: dict[str, set[str]] = {}
@@ -136,8 +108,6 @@ async def validate_models(comfyui_client) -> bool:
         if resp.status_code == 200:
             object_info = resp.json()
             for _setting, loader_node, _subfolders, _min_size in checks:
-                if loader_node is None:
-                    continue  # disk-only check (WanVideoWrapper loaders)
                 node_info = object_info.get(loader_node, {})
                 inputs = node_info.get("input", {}).get("required", {})
                 # Model filename is typically the first input parameter
@@ -156,8 +126,8 @@ async def validate_models(comfyui_client) -> bool:
         if not filename:
             continue
 
-        # Check if ComfyUI knows about it (skipped for disk-only checks)
-        known_models = available_models.get(loader_node) if loader_node else None
+        # Check if ComfyUI knows about it
+        known_models = available_models.get(loader_node)
         if known_models and filename not in known_models:
             logger.error("  MISSING %s=%s — not found in ComfyUI %s model list", setting_name, filename, loader_node)
             all_ok = False

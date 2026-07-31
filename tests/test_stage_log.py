@@ -80,10 +80,10 @@ class TestStageContext:
             lambda: {"gpu_name": "x", "vram_used_mb": 18000, "vram_total_mb": 24576},
         )
         with caplog.at_level(logging.INFO):
-            with stage(logging.getLogger("t"), "lynx.generate", CID, num_frames=81):
+            with stage(logging.getLogger("t"), "segment.generate", CID, num_frames=81):
                 pass
         events = _json_records(caplog)
-        assert [e["event"] for e in events] == ["lynx.generate.start", "lynx.generate.end"]
+        assert [e["event"] for e in events] == ["segment.generate.start", "segment.generate.end"]
         end = events[1]
         assert end["correlation_id"] == CID
         assert end["num_frames"] == 81
@@ -94,7 +94,7 @@ class TestStageContext:
     def test_extra_dict_is_merged_into_end_record(self, monkeypatch, caplog):
         monkeypatch.setattr(stage_log, "get_gpu_stats", lambda: None)
         with caplog.at_level(logging.INFO):
-            with stage(logging.getLogger("t"), "lynx.build", CID) as extra:
+            with stage(logging.getLogger("t"), "segment.build", CID) as extra:
                 extra["nodes"] = 17
         assert _json_records(caplog)[1]["nodes"] == 17
 
@@ -102,10 +102,10 @@ class TestStageContext:
         monkeypatch.setattr(stage_log, "get_gpu_stats", lambda: None)
         with caplog.at_level(logging.INFO):
             with pytest.raises(ValueError, match="boom"):
-                with stage(logging.getLogger("t"), "lynx.generate", CID):
+                with stage(logging.getLogger("t"), "segment.generate", CID):
                     raise ValueError("boom")
         events = _json_records(caplog)
-        assert [e["event"] for e in events] == ["lynx.generate.start", "lynx.generate.failed"]
+        assert [e["event"] for e in events] == ["segment.generate.start", "segment.generate.failed"]
         assert events[1]["error"] == "boom"
         assert events[1]["error_type"] == "ValueError"
         assert caplog.records[-1].levelno == logging.ERROR
