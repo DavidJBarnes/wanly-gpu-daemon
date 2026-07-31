@@ -519,6 +519,38 @@ async def _execute_ar_hologram(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+SMASHCUT_MAX_FPS = 60
+
+
+def smashcut_output_fps(base_fps: int, speeds: list[float]) -> int:
+    """The single fps every retimed clip is encoded at before concatenation.
+
+    The concat demuxer needs uniform streams, so one rate has to cover clips running at
+    different speeds. Speeding up raises the rate rather than dropping frames: sources come
+    out of RIFE interpolation, so up to ~2x every original frame still fits. Slowing down
+    holds frames longer instead of lowering the rate, which would make slow-motion choppier
+    than the clip it came from. Capped so 4x on a 30fps source cannot emit a 120fps file.
+    """
+    fastest = max([*speeds, 1.0])
+    return min(round(base_fps * fastest), SMASHCUT_MAX_FPS)
+
+
+async def _retime_clip(src: str, dst: str, speed: float, fps: int) -> None:
+    """Re-encode one clip at a new playback speed, normalised to the montage's fps.
+
+    setpts rescales presentation timestamps — <1 stretches (slow-motion), >1 compresses.
+    -an because generated clips carry no audio; without it a stray stream would survive
+    retiming untouched and drift against the video.
+    """
+    await _run_ffmpeg([
+        "-i", src,
+        "-filter:v", f"setpts=PTS/{speed}",
+        "-r", str(fps),
+        "-an",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", dst,
+    ])
+
+
 async def _generate_black(path: str, duration: float, width: int, height: int, fps: int) -> None:
     """Generate a black mp4 clip for dip-to-black smashcut transitions."""
     await _run_ffmpeg([
@@ -534,8 +566,20 @@ async def _execute_smashcut_concat(segment: SegmentClaim, queue: QueueClient) ->
     """
     paths = segment.smashcut_clip_paths or []
     black = segment.smashcut_transition == "black"
-    logger.info("=== Smashcut concat %s: %d clips, transition=%s ===",
-                str(segment.id)[:8], len(paths), segment.smashcut_transition)
+    # Speeds ride in a list parallel to the paths. A shorter list would silently misalign
+    # every clip after the gap, so treat any mismatch as "no retiming" rather than guessing.
+    speeds = segment.smashcut_clip_speeds or []
+    if speeds and len(speeds) != len(paths):
+        logger.warning(
+            "Smashcut %s: %d clip speeds for %d clips — ignoring the speeds and building at 1x",
+            str(segment.id)[:8], len(speeds), len(paths),
+        )
+        speeds = []
+    retime = any(s != 1.0 for s in speeds)
+    out_fps = smashcut_output_fps(segment.fps, speeds) if retime else segment.fps
+    logger.info("=== Smashcut concat %s: %d clips, transition=%s, speeds=%s, fps=%d ===",
+                str(segment.id)[:8], len(paths), segment.smashcut_transition,
+                speeds if retime else "1x", out_fps)
     progress = ProgressLog(segment.id, queue)
     start = time.monotonic()
     try:
@@ -543,7 +587,8 @@ async def _execute_smashcut_concat(segment: SegmentClaim, queue: QueueClient) ->
             raise RuntimeError("smashcut needs at least 2 clips")
 
         with tempfile.TemporaryDirectory() as tmp:
-            await progress.log(f"[1/3] Downloading {len(paths)} clips...")
+            steps = 4 if retime else 3  # download, [retime], concat, upload
+            await progress.log(f"[1/{steps}] Downloading {len(paths)} clips...")
             local = []
             for i, p in enumerate(paths):
                 data = await _download_with_retry(lambda p=p: queue.download_file(p), "smashcut_clip")
@@ -552,13 +597,26 @@ async def _execute_smashcut_concat(segment: SegmentClaim, queue: QueueClient) ->
                     f.write(data)
                 local.append(fn)
 
-            await progress.log("[2/3] Concatenating...")
+            if retime:
+                await progress.log(f"[2/{steps}] Retiming {len(local)} clips to {out_fps}fps...")
+                retimed = []
+                for i, (fn, speed) in enumerate(zip(local, speeds)):
+                    rp = os.path.join(tmp, f"retimed_{i:03d}.mp4")
+                    # Every clip goes through this, including the 1.0x ones: the concat
+                    # demuxer needs them all at out_fps, which differs from the source rate.
+                    await _retime_clip(fn, rp, speed, out_fps)
+                    retimed.append(rp)
+                local = retimed
+
+            await progress.log(f"[{steps - 1}/{steps}] Concatenating...")
             items = []
             for i, fn in enumerate(local):
                 items.append(fn)
                 if black and i < len(local) - 1:
                     bp = os.path.join(tmp, f"black_{i:03d}.mp4")
-                    await _generate_black(bp, 0.4, segment.width, segment.height, segment.fps)
+                    # Generated after retiming and never passed through it, so the dip stays
+                    # a real 0.4s beat no matter how fast the clips around it run.
+                    await _generate_black(bp, 0.4, segment.width, segment.height, out_fps)
                     items.append(bp)
 
             # concat demuxer resolves relative paths against the list file's dir → basenames in tmp.
@@ -577,7 +635,7 @@ async def _execute_smashcut_concat(segment: SegmentClaim, queue: QueueClient) ->
             with open(out, "rb") as f:
                 result = f.read()
 
-            await progress.log("[3/3] Uploading...")
+            await progress.log(f"[{steps}/{steps}] Uploading...")
             await queue.upload_smashcut_output(segment.id, result)
         logger.info("Smashcut %s complete in %.1fs", str(segment.id)[:8], time.monotonic() - start)
     except Exception as e:

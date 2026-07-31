@@ -68,6 +68,8 @@ class SegmentClaim(BaseModel):
     # Foundry smashcut (reprocess_type="smashcut_concat"): ordered clip paths + transition.
     smashcut_clip_paths: Optional[list[str]] = None
     smashcut_transition: Optional[str] = None
+    # Per-clip playback speed, aligned 1:1 with smashcut_clip_paths. None = no retiming.
+    smashcut_clip_speeds: Optional[list[float]] = None
     width: int
     height: int
     fps: int
