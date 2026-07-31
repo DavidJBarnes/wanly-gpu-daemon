@@ -13,7 +13,7 @@ JOB_ID = UUID("66666666-7777-8888-9999-000000000000")
 
 
 def make_segment(**overrides: Any) -> SegmentClaim:
-    """Build a SegmentClaim with sane Lynx-compatible defaults.
+    """Build a SegmentClaim with sane defaults.
 
     Defaults describe an 832x480 clip whose duration lands exactly on 81 WAN frames
     (81 frames / 15 generation fps = 5.4s), which is the smoke-test shape.
@@ -29,8 +29,6 @@ def make_segment(**overrides: Any) -> SegmentClaim:
         "height": 480,
         "fps": 15,
         "seed": 42,
-        "generation_engine": "lynx",
-        "lynx_subject_image": "subject.png",
     }
     base.update(overrides)
     return SegmentClaim(**base)

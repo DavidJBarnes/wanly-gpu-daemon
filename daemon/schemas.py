@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -46,16 +46,15 @@ class SegmentClaim(BaseModel):
     high_noise_steps: Optional[int] = None   # high/low split boundary (None -> daemon default)
     flow_shift: Optional[float] = None       # ModelSamplingSD3 shift (None -> daemon default)
     sampler_name: Optional[str] = None       # KSampler sampler (None/"" -> daemon default euler)
-    scheduler: Optional[str] = None          # KSampler/VACE scheduler (None/"" -> euler:simple, vace:unipc)
+    scheduler: Optional[str] = None          # KSampler scheduler (None/"" -> simple)
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
-    # VACE continuation (resolved API-side). "vace" => generate this segment as a
-    # video-conditioned continuation of previous_output_path's tail (vace_overlap_frames
-    # kept frames). Daemon falls back to the traditional i2v path if not VACE-capable.
+    # Retired engine selectors, still sent by wanly-api on older jobs. Kept on the schema so
+    # a claim carrying them still parses; execute_segment rejects "lynx" and ignores "vace".
     continuation_mode: str = "traditional"
+    generation_engine: Optional[str] = None
     previous_output_path: Optional[str] = None
-    vace_overlap_frames: int = 12
     # Seed re-anchor: when True (resolved API-side — setting on AND this segment has a
     # successor), faceswap the extracted last frame to the canonical identity face before
     # it seeds the next i2v segment. Falls back to the raw seed if no face is detected.
@@ -69,26 +68,6 @@ class SegmentClaim(BaseModel):
     # Foundry smashcut (reprocess_type="smashcut_concat"): ordered clip paths + transition.
     smashcut_clip_paths: Optional[list[str]] = None
     smashcut_transition: Optional[str] = None
-    # === Lynx identity-preserving generation ===
-    # Set generation_engine="lynx" to route this segment to build_lynx_workflow. The subject
-    # image conditions identity via ArcFace + VAE reference features; it is NOT a start frame.
-    # Every lynx_* tunable below is a per-job override: None => the daemon settings default.
-    generation_engine: Optional[str] = None
-    lynx_subject_image: Optional[str] = None
-    lynx_ip_scale: Optional[float] = None
-    lynx_ref_scale: Optional[float] = None
-    lynx_cfg_scale: Optional[float] = None
-    lynx_start_percent: Optional[float] = None
-    lynx_end_percent: Optional[float] = None
-    lynx_ref_blocks_to_use: Optional[str] = None
-    # A/B arm: overrides the matched ip-layers + resampler pair (both or neither).
-    lynx_ip_layers: Optional[str] = None
-    lynx_resampler: Optional[str] = None
-    lynx_steps: Optional[int] = None
-    lynx_cfg: Optional[float] = None
-    lynx_shift: Optional[float] = None
-    lynx_scheduler: Optional[str] = None
-    lynx_distill_strength: Optional[float] = None
     width: int
     height: int
     fps: int
@@ -105,11 +84,3 @@ class SegmentResult(BaseModel):
     progress_log: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
-    # Set by the VACE continuation path: length (seconds) of the reconstructed lead-in this
-    # segment carries. Stitch trims this much off the *previous* segment's tail so the
-    # reconstruction replaces it seamlessly.
-    vace_overlap_seconds: Optional[float] = None
-    # Lynx identity QA: per-frame cosine similarities of sampled output frames against the
-    # subject crop, plus summary stats. Measurement only — no gating. Shape:
-    # {"scores": [...], "mean": f, "min": f, "max": f, "frames_sampled": n, "frames_with_face": n}
-    lynx_identity_scores: Optional[dict[str, Any]] = None

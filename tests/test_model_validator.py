@@ -1,20 +1,15 @@
-"""Tests for profile-aware startup model validation.
+"""Tests for startup model validation.
 
-The regression these guard: a lynx-profile pod has no Wan 2.2 i2v weights by design.
-Validating them anyway fails startup on a perfectly healthy worker — which is exactly
-what happened on the first Lynx pod boot.
+validate_models is a startup gate: returning False exits the daemon before it registers.
+So the regressions worth guarding are the two directions of that gate — it must fail when
+a required weight is genuinely missing or truncated, and it must NOT fail for reasons that
+say nothing about the weights (no comfyui_path configured, a flaky /object_info).
 """
 
 import pytest
 
 from daemon import model_validator
-from daemon.model_validator import (
-    _LYNX_CHECKS,
-    _WAN22_CHECKS,
-    MODEL_CHECKS,
-    get_model_checks,
-    validate_models,
-)
+from daemon.model_validator import MODEL_CHECKS, get_model_checks, validate_models
 
 
 class FakeResponse:
@@ -39,47 +34,28 @@ class FakeComfyUI:
         self.http = FakeHTTP(object_info)
 
 
-class TestProfileSelection:
-    def test_full_profile_checks_wan22(self, monkeypatch):
-        monkeypatch.setattr(model_validator.settings, "model_profile", "full")
+class TestModelChecks:
+    def test_checks_cover_the_native_i2v_path(self):
         names = [c[0] for c in get_model_checks()]
-        assert "unet_high_model" in names
-        assert "lightx2v_lora_high" in names
-        assert "lynx_t2v_model" not in names
+        assert names == [
+            "vae_model", "clip_model", "unet_high_model", "unet_low_model",
+            "lightx2v_lora_high", "lightx2v_lora_low",
+        ]
 
-    def test_lynx_profile_checks_lynx_only(self, monkeypatch):
-        monkeypatch.setattr(model_validator.settings, "model_profile", "lynx")
+    def test_no_retired_engine_models_are_validated(self):
+        """VACE and Lynx weights are no longer staged, so requiring them would fail
+        startup on a correctly-provisioned worker."""
         names = [c[0] for c in get_model_checks()]
-        assert "lynx_t2v_model" in names
-        assert "lynx_ip_layers" in names
-        assert "lynx_ref_layers" in names
-        assert "lynx_resampler" in names
-        # The 2.2 i2v weights are absent from a lynx pod by design.
-        assert "unet_high_model" not in names
-        assert "lightx2v_lora_high" not in names
+        assert not [n for n in names if n.startswith(("vace_", "lynx_"))]
 
-    @pytest.mark.parametrize("value", ["lynx", "LYNX", " Lynx ", "lYnX"])
-    def test_profile_match_is_case_and_space_insensitive(self, monkeypatch, value):
-        monkeypatch.setattr(model_validator.settings, "model_profile", value)
-        assert [c[0] for c in get_model_checks()] == [c[0] for c in
-                                                      (model_validator._COMMON_CHECKS + _LYNX_CHECKS)]
+    def test_every_check_resolves_to_a_real_setting(self):
+        """A typo'd setting name silently skips the check (getattr -> None -> continue)."""
+        from daemon.config import settings
+        for name, _loader, _subs, _min in MODEL_CHECKS:
+            assert getattr(settings, name, None), f"{name} is not a Settings field"
 
-    @pytest.mark.parametrize("value", ["full", "", "anything-else"])
-    def test_unknown_profile_falls_back_to_full(self, monkeypatch, value):
-        monkeypatch.setattr(model_validator.settings, "model_profile", value)
-        assert "unet_high_model" in [c[0] for c in get_model_checks()]
-
-    def test_vae_is_checked_in_both_profiles(self, monkeypatch):
-        for profile in ("full", "lynx"):
-            monkeypatch.setattr(model_validator.settings, "model_profile", profile)
-            assert "vae_model" in [c[0] for c in get_model_checks()]
-
-    def test_backcompat_flat_list_is_the_full_profile(self):
-        assert MODEL_CHECKS == model_validator._COMMON_CHECKS + _WAN22_CHECKS
-
-    def test_lynx_checks_are_disk_only(self):
-        """Lynx models load via WanVideoWrapper's loaders, not a ComfyUI dropdown."""
-        assert all(loader is None for _n, loader, _s, _m in _LYNX_CHECKS)
+    def test_every_check_has_a_comfyui_loader(self):
+        assert all(loader for _n, loader, _s, _m in MODEL_CHECKS)
 
 
 class TestValidateModels:
@@ -98,49 +74,51 @@ class TestValidateModels:
         d.mkdir(parents=True, exist_ok=True)
         (d / name).write_bytes(b"\0" * size)
 
+    def _write_all(self, tmp_path, checks):
+        for name, _loader, subfolders, _min in checks:
+            self._write(tmp_path, subfolders[0],
+                        getattr(model_validator.settings, name), 64)
+
     async def test_skips_entirely_without_comfyui_path(self, monkeypatch):
         monkeypatch.setattr(model_validator.settings, "comfyui_path", "")
         assert await validate_models(FakeComfyUI()) is True
 
-    async def test_lynx_profile_passes_without_wan22_models(self, monkeypatch, _comfy_path):
-        """The exact scenario that failed the first pod boot."""
-        monkeypatch.setattr(model_validator.settings, "model_profile", "lynx")
+    async def test_passes_when_every_model_is_present(self, monkeypatch, _comfy_path):
         monkeypatch.setattr(model_validator, "get_model_checks",
-                            lambda: self._small(model_validator._COMMON_CHECKS + _LYNX_CHECKS))
-        # Only Lynx + VAE present — no 2.2 i2v weights anywhere.
-        self._write(_comfy_path, "vae", model_validator.settings.vae_model, 64)
-        for setting in ("lynx_t2v_model", "lynx_ip_layers", "lynx_ref_layers", "lynx_resampler"):
-            self._write(_comfy_path, "diffusion_models",
-                        getattr(model_validator.settings, setting), 64)
+                            lambda: self._small(MODEL_CHECKS))
+        self._write_all(_comfy_path, MODEL_CHECKS)
         assert await validate_models(FakeComfyUI()) is True
 
-    async def test_lynx_profile_fails_when_an_adapter_is_missing(self, monkeypatch, _comfy_path):
-        monkeypatch.setattr(model_validator.settings, "model_profile", "lynx")
+    async def test_fails_when_a_model_is_missing(self, monkeypatch, _comfy_path):
         monkeypatch.setattr(model_validator, "get_model_checks",
-                            lambda: self._small(model_validator._COMMON_CHECKS + _LYNX_CHECKS))
-        self._write(_comfy_path, "vae", model_validator.settings.vae_model, 64)
-        self._write(_comfy_path, "diffusion_models",
-                    model_validator.settings.lynx_t2v_model, 64)
-        # ref layers + resampler absent
+                            lambda: self._small(MODEL_CHECKS))
+        self._write_all(_comfy_path, MODEL_CHECKS)
+        # Remove one unet — the gate must catch it.
+        (_comfy_path / "models" / "diffusion_models"
+         / model_validator.settings.unet_low_model).unlink()
         assert await validate_models(FakeComfyUI()) is False
 
-    async def test_undersized_file_is_rejected(self, monkeypatch, _comfy_path):
-        monkeypatch.setattr(model_validator.settings, "model_profile", "lynx")
+    async def test_undersized_file_is_rejected(self, _comfy_path):
         self._write(_comfy_path, "vae", model_validator.settings.vae_model, 8)
         assert await validate_models(FakeComfyUI()) is False
 
     async def test_object_info_failure_is_non_fatal(self, monkeypatch, _comfy_path):
         """A /object_info hiccup must not block startup on its own."""
-        monkeypatch.setattr(model_validator.settings, "model_profile", "lynx")
         monkeypatch.setattr(model_validator, "get_model_checks",
-                            lambda: self._small(model_validator._COMMON_CHECKS + _LYNX_CHECKS))
-        self._write(_comfy_path, "vae", model_validator.settings.vae_model, 64)
-        for setting in ("lynx_t2v_model", "lynx_ip_layers", "lynx_ref_layers", "lynx_resampler"):
-            self._write(_comfy_path, "diffusion_models",
-                        getattr(model_validator.settings, setting), 64)
+                            lambda: self._small(MODEL_CHECKS))
+        self._write_all(_comfy_path, MODEL_CHECKS)
 
         class Boom:
             http = type("H", (), {"get": staticmethod(
                 lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no object_info")))})()
 
         assert await validate_models(Boom()) is True
+
+    async def test_model_unknown_to_comfyui_is_rejected(self, monkeypatch, _comfy_path):
+        """Present on disk but absent from the loader's dropdown => ComfyUI can't load it."""
+        monkeypatch.setattr(model_validator, "get_model_checks",
+                            lambda: self._small(MODEL_CHECKS))
+        self._write_all(_comfy_path, MODEL_CHECKS)
+        object_info = {"UNETLoader": {"input": {"required": {
+            "unet_name": [["some_other_model.safetensors"]]}}}}
+        assert await validate_models(FakeComfyUI(object_info)) is False
