@@ -36,7 +36,10 @@ WANVIDEO_SCHEDULERS = frozenset({
 
 # Wan native resolution buckets Lynx is validated at. Anything else is rejected rather
 # than snapped, because an off-bucket latent grid degrades identity silently.
-LYNX_RESOLUTIONS = frozenset({(832, 480), (1280, 720)})
+# Wan native buckets, both orientations. Portrait matters for the i2v path: a start frame
+# is usually shot portrait, and forcing it into a landscape bucket centre-crops the subject.
+# Nothing in Lynx is orientation-specific — the constraint is Wan's bucket grid.
+LYNX_RESOLUTIONS = frozenset({(832, 480), (480, 832), (1280, 720), (720, 1280)})
 
 # Lynx adapter arms. The ip layers and the resampler are a matched pair — the
 # resampler's proj_out dimension must match the ip layers it feeds. A mismatched pair
@@ -621,6 +624,52 @@ def lynx_num_frames(segment: SegmentClaim) -> int:
     return ((n - 1) // 4) * 4 + 1
 
 
+LYNX_MAX_PIXELS = 1280 * 720   # 720p budget; beyond this block swap thrashes on 24GB
+
+
+def _validate_lynx_resolution(width: int, height: int) -> None:
+    """Any /16 resolution within the pixel budget is allowed — NOT a fixed bucket list.
+
+    A fixed list was actively harmful: ``WanVideoImageToVideoEncode`` resizes the start
+    image with ``common_upscale(..., W, H, "lanczos", "disabled")`` — crop mode *disabled*,
+    i.e. a plain resize with no aspect preservation. Forcing a 768x1024 (0.750) start frame
+    into 480x832 (0.577) therefore stretched the face ~1.30x vertically, which both looks
+    wrong and depresses ArcFace similarity (the embedding is geometry-sensitive). Callers
+    should derive the generation resolution from the start frame's aspect via
+    ``aspect_matched_resolution`` instead of snapping to a bucket.
+    """
+    for name, value in (("width", width), ("height", height)):
+        if value % 16 != 0:
+            raise LynxValidationError(
+                f"Lynx {name} must be divisible by 16 (VAE 8x downsample x 2x patch); "
+                f"got {value}."
+            )
+    if width * height > LYNX_MAX_PIXELS:
+        raise LynxValidationError(
+            f"Lynx resolution {width}x{height} exceeds the {LYNX_MAX_PIXELS}px budget."
+        )
+
+
+def aspect_matched_resolution(
+    src_width: int, src_height: int, pixel_budget: int = 480 * 832
+) -> tuple[int, int]:
+    """Largest /16 resolution matching the source aspect within ``pixel_budget``.
+
+    Prevents the stretch described in ``_validate_lynx_resolution``: a 768x1024 source
+    resolves to 624x832 (aspect 0.750, exact) rather than 480x832 (0.577).
+    """
+    if src_width <= 0 or src_height <= 0:
+        raise LynxValidationError(f"invalid source dimensions {src_width}x{src_height}")
+    aspect = src_width / src_height
+    # height from the budget at this aspect: budget = (h*aspect) * h
+    height = int(((pixel_budget / aspect) ** 0.5) // 16 * 16)
+    width = int((height * aspect) // 16 * 16)
+    while width * height > pixel_budget and height > 16:
+        height -= 16
+        width = int((height * aspect) // 16 * 16)
+    return max(width, 16), max(height, 16)
+
+
 def _validate_lynx(
     segment: SegmentClaim,
     subject_filename: str | None,
@@ -634,12 +683,7 @@ def _validate_lynx(
             "Lynx requires a subject_image: identity is conditioned on an ArcFace "
             "embedding of that image, so there is nothing to condition on without it."
         )
-    if (segment.width, segment.height) not in LYNX_RESOLUTIONS:
-        allowed = ", ".join(f"{w}x{h}" for w, h in sorted(LYNX_RESOLUTIONS))
-        raise LynxValidationError(
-            f"Lynx supports only the Wan native buckets ({allowed}); "
-            f"got {segment.width}x{segment.height}."
-        )
+    _validate_lynx_resolution(segment.width, segment.height)
     if num_frames < 5 or (num_frames - 1) % 4 != 0:
         raise LynxValidationError(
             f"Lynx frame count must be on the 4n+1 grid and >= 5 (e.g. 81); got {num_frames}."
@@ -787,6 +831,15 @@ def build_lynx_workflow(
         "model": ["610", 0], "image_embeds": ["641", 0], "text_embeds": ["621", 0],
         "steps": steps, "cfg": cfg, "shift": shift, "seed": segment.seed,
         "force_offload": True, "scheduler": scheduler, "riflex_freq_index": 0,
+        # MUST be set explicitly. WanVideoSampler declares the widget default as "comfy"
+        # (nodes_sampler.py: rope_function widget) but its Python signature defaults to
+        # "default" — and only the "comfy"/"comfy_chunked" branches ever populate the RoPE
+        # freqs table (wanvideo/modules/model.py). Omitting the input therefore takes the
+        # "default" path, leaves freqs None, and the sampler dies inside rope_apply_3d with
+        # "'NoneType' object has no attribute 'split'". The ComfyUI GUI always sends the
+        # widget default, so Kijai's reference workflow never trips this; an API-built graph
+        # must send it itself.
+        "rope_function": "comfy",
         "start_step": 0, "end_step": -1}}
     wf["660"] = {"class_type": "WanVideoDecode", "inputs": {
         "vae": ["620", 0], "samples": ["650", 0], "enable_vae_tiling": False,
@@ -813,6 +866,220 @@ def build_lynx_workflow(
         steps=steps, cfg=cfg, shift=shift, scheduler=scheduler,
         distill_strength=distill_strength, character_loras=len(segment.loras or []),
         rife_multiplier=rife_mult,
+    )
+    return wf
+
+
+def build_lynx_i2v_workflow(
+    segment: SegmentClaim,
+    subject_filename: str,
+    start_image_filename: str,
+    num_frames: int,
+    ref_from_start_frame: bool = False,
+) -> dict[str, Any]:
+    """Lynx identity adapters on the Wan2.2 i2v dual-expert base.
+
+    This is the i2v identity-lock configuration. Unlike ``build_lynx_workflow`` (Wan2.1
+    T2V, where the subject image is the ONLY conditioning and the scene is invented from
+    the prompt), here a real ``start_image`` drives the video exactly as the production
+    i2v path does, and the Lynx adapters ride on top — re-asserting identity at every
+    denoising step of every segment rather than baking it into weights the way a
+    character LoRA does.
+
+    Two things differ structurally from the T2V graph:
+
+    * ``WanVideoImageToVideoEncode`` replaces ``WanVideoEmptyEmbeds`` as the source of
+      image_embeds. ``clip_embeds`` is deliberately left unset — Wan2.2 dropped the CLIP
+      image encoder, and the deprecated ``WanVideoImageClipEncode`` node must not be used.
+    * Wan2.2 is dual-expert, so there are TWO model loaders and TWO sampler passes split
+      at ``boundary`` (mirroring ``build_vace_workflow``). The adapter chain is attached to
+      BOTH loaders: each expert is a separate WanModel, and the sampler raises "Lynx IP
+      embeds provided, but the no lynx ip adapter layers found in the model" for whichever
+      expert is missing them.
+
+    ``ref_from_start_frame`` splits the two adapters' sources, which is usually what you want
+    for identity *stabilisation* (as opposed to replacement). The adapters encode different
+    things:
+
+    * **ip** is an ArcFace embedding — it encodes *who*, and is largely pose- and
+      lighting-invariant. It wants the best face pixels available, so it is fed from the
+      canonical subject photo. Anchoring it on the start frame instead perpetuates whatever
+      per-frame variation the upstream swap introduced (measured at 0.54-0.86 between start
+      frames of the same person), giving within-clip stability but no cross-clip consistency.
+    * **ref** is dense VAE features — it encodes *appearance* (skin, hair, lighting). Feeding
+      it the start frame's own face crop matches the shot, so it does not fight the start
+      frame the way a differently-lit canonical photo does.
+
+    Both crops still come from ``LynxInsightFaceCrop``, which does the detection and alignment
+    internally; splitting the sources just means two instances of that node.
+
+    UNPROVEN. No public example of this combination exists; see the config notes and
+    BUILD_wanly-lynx-engine.md for the cross-generation transfer risk.
+    """
+    ip_layers = _pick(segment.lynx_ip_layers, settings.lynx_ip_layers)
+    resampler = _pick(segment.lynx_resampler, settings.lynx_resampler)
+    _validate_lynx(segment, start_image_filename, num_frames, ip_layers, resampler)
+    if not subject_filename:
+        raise LynxValidationError("Lynx i2v needs a subject image for the identity adapters")
+
+    gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
+    steps = int(_pick(segment.lynx_steps, settings.lynx_i2v_steps))
+    cfg = float(_pick(segment.lynx_cfg, settings.lynx_i2v_cfg))
+    shift = float(_pick(segment.lynx_shift, settings.lynx_i2v_shift))
+    boundary = min(int(settings.lynx_i2v_boundary), steps)
+    scheduler = _pick(segment.lynx_scheduler, settings.lynx_scheduler)
+    if scheduler not in WANVIDEO_SCHEDULERS:
+        raise LynxValidationError(
+            f"scheduler {scheduler!r} is not a WanVideoSampler scheduler "
+            f"(valid: {sorted(WANVIDEO_SCHEDULERS)})"
+        )
+
+    wf: dict[str, Any] = {}
+
+    # --- Adapters + block swap -------------------------------------------------
+    wf["600"] = {"class_type": "WanVideoBlockSwap", "inputs": {
+        "blocks_to_swap": settings.lynx_i2v_blocks_to_swap, "offload_img_emb": False,
+        "offload_txt_emb": False, "vace_blocks_to_swap": 0}}
+    wf["601"] = {"class_type": "WanVideoExtraModelSelect", "inputs": {"extra_model": ip_layers}}
+    wf["602"] = {"class_type": "WanVideoExtraModelSelect", "inputs": {
+        "extra_model": settings.lynx_ref_layers, "prev_model": ["601", 0]}}
+
+    # --- Per-expert LoRA chains (2.2 is dual-expert, so high and low differ) ----
+    def _lora_chain(expert: str, start_id: int) -> tuple[list[Any] | None, int]:
+        ref: list[Any] | None = None
+        node_id = start_id
+        distill_strength = (
+            settings.lynx_i2v_distill_high_strength if expert == "high"
+            else settings.lynx_i2v_distill_low_strength
+        )
+        distill_file = (
+            settings.lightx2v_lora_high if expert == "high" else settings.lightx2v_lora_low
+        )
+        if distill_strength:
+            wf[str(node_id)] = {"class_type": "WanVideoLoraSelect", "inputs": {
+                "lora": distill_file, "strength": float(distill_strength),
+                "merge_loras": True}}
+            ref = [str(node_id), 0]
+            node_id += 1
+        for lora in (segment.loras or []):
+            lora_file = lora.high_file if expert == "high" else lora.low_file
+            if not lora_file:
+                continue
+            weight = lora.high_weight if expert == "high" else lora.low_weight
+            inputs: dict[str, Any] = {
+                "lora": lora_file, "strength": float(weight), "merge_loras": True}
+            if ref is not None:
+                inputs["prev_lora"] = ref
+            wf[str(node_id)] = {"class_type": "WanVideoLoraSelect", "inputs": inputs}
+            ref = [str(node_id), 0]
+            node_id += 1
+        return ref, node_id
+
+    high_lora, next_id = _lora_chain("high", 700)
+    low_lora, _ = _lora_chain("low", next_id)
+
+    def _loader(model_name: str, lora_ref: list[Any] | None) -> dict[str, Any]:
+        inputs: dict[str, Any] = {
+            "model": model_name,
+            "base_precision": settings.lynx_i2v_base_precision,
+            "quantization": settings.lynx_i2v_quantization,
+            "load_device": "offload_device", "attention_mode": "sdpa",
+            # Both experts get the adapter chain — see the class docstring.
+            "extra_model": ["602", 0], "block_swap_args": ["600", 0]}
+        if lora_ref is not None:
+            inputs["lora"] = lora_ref
+        return {"class_type": "WanVideoModelLoader", "inputs": inputs}
+
+    wf["610"] = _loader(settings.lynx_i2v_high_model, high_lora)
+    wf["611"] = _loader(settings.lynx_i2v_low_model, low_lora)
+
+    # --- VAE + text encoders ---------------------------------------------------
+    wf["620"] = {"class_type": "WanVideoVAELoader", "inputs": {
+        "model_name": settings.vae_model, "precision": "bf16"}}
+    wf["621"] = {"class_type": "WanVideoTextEncodeCached", "inputs": {
+        "model_name": settings.lynx_t5_model, "precision": "bf16",
+        "positive_prompt": segment.prompt, "negative_prompt": segment.negative_prompt or "",
+        "quantization": "disabled", "use_disk_cache": False, "device": "gpu"}}
+    # The ref-extraction pass needs its own text embed; hardcoded in ByteDance's
+    # implementation and required by the node whenever ref_image is supplied.
+    wf["622"] = {"class_type": "WanVideoTextEncodeCached", "inputs": {
+        "model_name": settings.lynx_t5_model, "precision": "bf16",
+        "positive_prompt": settings.lynx_ref_prompt, "negative_prompt": "",
+        "quantization": "disabled", "use_disk_cache": False, "device": "gpu"}}
+
+    # --- Identity chain (unchanged from the proven T2V graph) ------------------
+    wf["630"] = {"class_type": "LoadImage", "inputs": {"image": subject_filename}}
+    wf["631"] = {"class_type": "LynxInsightFaceCrop", "inputs": {"image": ["630", 0]}}
+    wf["632"] = {"class_type": "LoadLynxResampler", "inputs": {
+        "model_name": resampler, "precision": settings.lynx_resampler_precision}}
+    wf["633"] = {"class_type": "LynxEncodeFaceIP", "inputs": {
+        "resampler": ["632", 0], "ip_image": ["631", 0]}}
+
+    # --- i2v conditioning: the START FRAME drives the video --------------------
+    wf["635"] = {"class_type": "LoadImage", "inputs": {"image": start_image_filename}}
+    wf["640"] = {"class_type": "WanVideoImageToVideoEncode", "inputs": {
+        "width": segment.width, "height": segment.height, "num_frames": num_frames,
+        "noise_aug_strength": settings.lynx_i2v_noise_aug_strength,
+        "start_latent_strength": settings.lynx_i2v_start_latent_strength,
+        "end_latent_strength": settings.lynx_i2v_end_latent_strength,
+        "force_offload": True, "vae": ["620", 0], "start_image": ["635", 0]}}
+
+    wf["641"] = {"class_type": "WanVideoAddLynxEmbeds", "inputs": {
+        "embeds": ["640", 0],
+        "ip_scale": float(_pick(segment.lynx_ip_scale, settings.lynx_ip_scale)),
+        "ref_scale": float(_pick(segment.lynx_ref_scale, settings.lynx_ref_scale)),
+        "lynx_cfg_scale": float(_pick(segment.lynx_cfg_scale, settings.lynx_lynx_cfg_scale)),
+        "start_percent": float(_pick(segment.lynx_start_percent, settings.lynx_start_percent)),
+        "end_percent": float(_pick(segment.lynx_end_percent, settings.lynx_end_percent)),
+        "vae": ["620", 0], "lynx_ip_embeds": ["633", 0], "ref_image": ["631", 1],
+        "ref_text_embed": ["622", 0]}}
+    if ref_from_start_frame:
+        # Second crop instance on the start frame; ref (appearance) tracks the shot while ip
+        # (identity) stays anchored on the canonical subject photo.
+        wf["636"] = {"class_type": "LynxInsightFaceCrop", "inputs": {"image": ["635", 0]}}
+        wf["641"]["inputs"]["ref_image"] = ["636", 1]
+    ref_blocks = _pick(segment.lynx_ref_blocks_to_use, settings.lynx_ref_blocks_to_use)
+    if ref_blocks:
+        wf["641"]["inputs"]["ref_blocks_to_use"] = ref_blocks
+
+    # --- Dual-expert sampling, split at boundary -------------------------------
+    # rope_function must be explicit: the widget default is "comfy" but the Python
+    # signature default is "default", and only the comfy branches build the RoPE freqs
+    # table — omitting it dies in rope_apply_3d. See TestSamplerWidgetDefaults.
+    common = {
+        "image_embeds": ["641", 0], "text_embeds": ["621", 0], "steps": steps, "cfg": cfg,
+        "shift": shift, "seed": segment.seed, "force_offload": True, "scheduler": scheduler,
+        "riflex_freq_index": 0, "rope_function": "comfy"}
+    wf["650"] = {"class_type": "WanVideoSampler", "inputs": {
+        "model": ["610", 0], **common, "start_step": 0, "end_step": boundary}}
+    wf["651"] = {"class_type": "WanVideoSampler", "inputs": {
+        "model": ["611", 0], **common, "samples": ["650", 0],
+        "start_step": boundary, "end_step": -1}}
+
+    wf["660"] = {"class_type": "WanVideoDecode", "inputs": {
+        "vae": ["620", 0], "samples": ["651", 0], "enable_vae_tiling": False,
+        "tile_x": 272, "tile_y": 272, "tile_stride_x": 144, "tile_stride_y": 128}}
+
+    rife_mult = gen["rife_multiplier"]
+    final_images: list[Any] = ["660", 0]
+    if rife_mult > 1:
+        wf["670"] = {"class_type": "RIFE VFI", "inputs": {
+            "ckpt_name": "rife49.pth", "clear_cache_after_n_frames": 10,
+            "multiplier": rife_mult, "fast_mode": True, "ensemble": True,
+            "scale_factor": 1.0, "dtype": "float16", "torch_compile": False,
+            "batch_size": 1, "frames": ["660", 0]}}
+        final_images = ["670", 0]
+    wf["680"] = {"class_type": "VHS_VideoCombine", "inputs": {
+        "frame_rate": gen["output_fps"], "loop_count": 0, "filename_prefix": "output",
+        "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 15, "save_metadata": True,
+        "trim_to_audio": False, "pingpong": False, "save_output": True,
+        "images": final_images}}
+
+    log_event(
+        logger, "lynx_i2v.graph_built", str(segment.id),
+        nodes=len(wf), num_frames=num_frames,
+        resolution=f"{segment.width}x{segment.height}",
+        arm=_lynx_arm(ip_layers), boundary=boundary, steps=steps,
     )
     return wf
 

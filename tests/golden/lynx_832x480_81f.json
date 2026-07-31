@@ -165,6 +165,7 @@
         0
       ],
       "riflex_freq_index": 0,
+      "rope_function": "comfy",
       "scheduler": "lcm",
       "seed": 42,
       "shift": 8.0,

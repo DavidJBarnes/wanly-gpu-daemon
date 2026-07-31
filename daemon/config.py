@@ -118,6 +118,48 @@ class Settings(BaseSettings):
     # embeddings against the subject crop. Measurement only — nothing gates on the score.
     lynx_identity_sample_frames: int = 5
 
+    # === Lynx on Wan2.2 i2v (dual expert) — UNPROVEN, see BUILD_wanly-lynx-engine.md ===
+    # This is the configuration that actually targets i2v character identity: a real start
+    # frame drives the video while the Lynx adapters re-assert identity at every denoising
+    # step of every segment (a character LoRA bakes identity in once; Lynx re-injects).
+    #
+    # Why 2.2 rather than the 2.1 i2v base the adapters were trained nearest to:
+    #   Lynx's ip adapter patches CROSS-attention. Wan2.1 i2v carries CLIP image projections
+    #   there (blocks.N.cross_attn.k_img/v_img) — that is literally how the wrapper detects
+    #   an i2v model. Wan2.2 i2v has no k_img at all, so the wrapper leaves model_type at
+    #   "t2v" and the ip adapter lands in the same cross-attn shape it was TRAINED in.
+    #   Verified against the checkpoints: 2.2 i2v is dim 5120 / 40 blocks / in_channels 36,
+    #   and blocks.0.cross_attn holds only q,k,v,o,norm_q,norm_k.
+    #
+    # Known risk: the adapters were trained on Wan2.1 T2V *weights*. Cross-generation
+    # transfer to 2.2 may load cleanly and still yield weak identity. Only a run settles it.
+    #
+    # BOTH experts must receive the adapter chain. Each expert is a separate WanModel with
+    # its own blocks, and WanVideoSampler raises "Lynx IP embeds provided, but the no lynx
+    # ip adapter layers found in the model" for whichever expert lacks them. Upstream issues
+    # #1413/#1418 report exactly that failure on the 2.2 HIGH expert — consistent with the
+    # chain having been attached to only one loader.
+    lynx_i2v_high_model: str = "wan2.2_i2v_high_noise_14B_fp16.safetensors"
+    lynx_i2v_low_model: str = "wan2.2_i2v_low_noise_14B_fp16.safetensors"
+    # fp16 + quantization disabled is mandatory: the Lynx adapters are plain nn.Linear and
+    # are not wrapped by the wrapper's fp8-aware linear, so an fp8 base casts their weights
+    # to fp8 while activations stay fp16 and the sampler dies on a dtype mismatch.
+    lynx_i2v_base_precision: str = "fp16"
+    lynx_i2v_quantization: str = "disabled"
+    lynx_i2v_steps: int = 6
+    lynx_i2v_cfg: float = 1.0
+    lynx_i2v_shift: float = 8.0
+    lynx_i2v_boundary: int = 3  # high expert runs [0, boundary], low runs [boundary, end]
+    lynx_i2v_blocks_to_swap: int = 35
+    # WanVideoImageToVideoEncode knobs. Lower start_latent_strength allows more motion;
+    # noise_aug_strength adds motion/sharpness at some cost to start-frame fidelity.
+    lynx_i2v_noise_aug_strength: float = 0.0
+    lynx_i2v_start_latent_strength: float = 1.0
+    lynx_i2v_end_latent_strength: float = 1.0
+    # Wan2.2 i2v distill LoRAs. Strength 0 on both drops them -> de-distilled path.
+    lynx_i2v_distill_high_strength: float = 0.0
+    lynx_i2v_distill_low_strength: float = 0.0
+
     # AR hologram: Robust Video Matting ONNX model (auto-used when a clip is NOT green-screen).
     # ~15MB; auto-downloaded on first use if missing. Path is relative to the daemon workdir.
     rvm_model_path: str = "models/rvm_mobilenetv3_fp32.onnx"

@@ -13,8 +13,10 @@ from daemon.workflow_builder import (
     WANVIDEO_SCHEDULERS,
     LynxValidationError,
     _lynx_arm,
+    aspect_matched_resolution,
     _pick,
     _validate_lynx,
+    build_lynx_i2v_workflow,
     build_lynx_workflow,
     lynx_num_frames,
 )
@@ -73,16 +75,24 @@ class TestValidation:
         with pytest.raises(LynxValidationError, match="subject_image"):
             _validate_lynx(make_segment(), "", 81, "lite_ip.safetensors", "lite_res.safetensors")
 
-    @pytest.mark.parametrize("w,h", [(512, 512), (1920, 1080), (480, 832), (1024, 576)])
-    def test_off_bucket_resolution_rejected(self, w, h):
+    @pytest.mark.parametrize("w,h", [(1280, 1024), (832, 1216), (1280, 1280)])
+    def test_over_budget_resolution_rejected(self, w, h):
         seg = make_segment(width=w, height=h)
-        with pytest.raises(LynxValidationError, match=f"{w}x{h}"):
+        with pytest.raises(LynxValidationError, match="budget"):
             _validate_lynx(seg, "s.png", 81, "lite_ip.safetensors", "lite_res.safetensors")
 
-    @pytest.mark.parametrize("w,h", sorted(LYNX_RESOLUTIONS))
-    def test_native_buckets_accepted(self, w, h):
+    @pytest.mark.parametrize("w,h", [(500, 832), (480, 830), (100, 100)])
+    def test_non_multiple_of_16_rejected(self, w, h):
+        seg = make_segment(width=w, height=h)
+        with pytest.raises(LynxValidationError, match="divisible by 16"):
+            _validate_lynx(seg, "s.png", 81, "lite_ip.safetensors", "lite_res.safetensors")
+
+    @pytest.mark.parametrize("w,h", sorted(LYNX_RESOLUTIONS) + [(624, 832), (528, 720), (512, 512)])
+    def test_aspect_matched_resolutions_accepted(self, w, h):
+        """Any /16 resolution within budget — a fixed bucket list forced aspect stretch."""
         seg = make_segment(width=w, height=h)
         _validate_lynx(seg, "s.png", 81, "lite_ip.safetensors", "lite_res.safetensors")
+
 
     @pytest.mark.parametrize("frames", [0, 3, 4, 80, 82, 100])
     def test_off_grid_frame_count_rejected(self, frames):
@@ -105,8 +115,25 @@ class TestValidation:
     def test_build_surfaces_validation(self):
         # The public builder must validate, not just the private helper.
         with pytest.raises(LynxValidationError):
-            build_lynx_workflow(make_segment(width=512, height=512), "s.png", 81)
+            build_lynx_workflow(make_segment(width=500, height=832), "s.png", 81)
 
+
+class TestAspectMatching:
+    """WanVideoImageToVideoEncode resizes with crop 'disabled' — no aspect preservation."""
+
+    @pytest.mark.parametrize("sw,sh", [(768, 1024), (832, 1216), (1008, 1008), (1920, 1088)])
+    def test_matches_source_aspect_closely(self, sw, sh):
+        w, h = aspect_matched_resolution(sw, sh)
+        assert w % 16 == 0 and h % 16 == 0
+        assert w * h <= 480 * 832
+        assert abs(1 - (sw / sh) / (w / h)) < 0.05      # within 5% of source aspect
+
+    def test_exact_when_budget_allows(self):
+        assert aspect_matched_resolution(768, 1024, pixel_budget=530_000) == (624, 832)
+
+    def test_rejects_invalid_source(self):
+        with pytest.raises(LynxValidationError):
+            aspect_matched_resolution(0, 100)
 
 class TestGraphTopology:
     """The wiring that makes Lynx identity-preserving, asserted structurally."""
@@ -340,6 +367,99 @@ class TestStructuredLogging:
         assert built[0]["num_frames"] == 81
         assert built[0]["arm"] == "lite"
         assert built[0]["resolution"] == "832x480"
+
+
+class TestLynxI2VWorkflow:
+    """Wan2.2 i2v + Lynx — the i2v identity-lock graph."""
+
+    def _wf(self, segment):
+        return build_lynx_i2v_workflow(segment, "subject.png", "start.png", 45)
+
+    def test_both_experts_receive_the_adapter_chain(self, segment):
+        """Each 2.2 expert is a separate WanModel with its own blocks.
+
+        WanVideoSampler raises "Lynx IP embeds provided, but the no lynx ip adapter
+        layers found in the model" for whichever expert lacks them. Upstream issues
+        #1413/#1418 report exactly that on the 2.2 HIGH expert.
+        """
+        wf = self._wf(segment)
+        assert wf["610"]["inputs"]["extra_model"] == ["602", 0]
+        assert wf["611"]["inputs"]["extra_model"] == ["602", 0]
+
+    def test_start_frame_drives_generation(self, segment):
+        wf = self._wf(segment)
+        assert wf["640"]["class_type"] == "WanVideoImageToVideoEncode"
+        assert wf["640"]["inputs"]["start_image"] == ["635", 0]
+        assert wf["635"]["inputs"]["image"] == "start.png"
+        assert wf["641"]["inputs"]["embeds"] == ["640", 0]
+
+    def test_no_clip_embeds(self, segment):
+        """Wan2.2 dropped the CLIP image encoder; clip_embeds must stay unset."""
+        assert "clip_embeds" not in self._wf(segment)["640"]["inputs"]
+
+    def test_no_vace_nodes(self, segment):
+        """Pure i2v — VACE is not part of this path."""
+        assert not [n for n in self._wf(segment).values() if "VACE" in n["class_type"]]
+
+    def test_rope_function_explicit_on_both_samplers(self, segment):
+        wf = self._wf(segment)
+        assert wf["650"]["inputs"]["rope_function"] == "comfy"
+        assert wf["651"]["inputs"]["rope_function"] == "comfy"
+
+    def test_dual_expert_split_and_chaining(self, segment):
+        wf = self._wf(segment)
+        boundary = wf["650"]["inputs"]["end_step"]
+        assert wf["650"]["inputs"]["model"] == ["610", 0]
+        assert wf["651"]["inputs"]["model"] == ["611", 0]
+        assert wf["651"]["inputs"]["start_step"] == boundary
+        assert wf["651"]["inputs"]["samples"] == ["650", 0]
+
+    def test_resampler_uses_model_name_input(self, segment):
+        """LoadLynxResampler's input is model_name, not model."""
+        inputs = self._wf(segment)["632"]["inputs"]
+        assert "model_name" in inputs and "model" not in inputs
+
+    def test_fp16_no_quantization(self, segment):
+        """fp8 casts the plain-nn.Linear adapters and kills the sampler on dtype."""
+        wf = self._wf(segment)
+        for nid in ("610", "611"):
+            assert wf[nid]["inputs"]["base_precision"] == "fp16"
+            assert wf[nid]["inputs"]["quantization"] == "disabled"
+
+    def test_requires_subject_image(self, segment):
+        with pytest.raises(LynxValidationError, match="subject image"):
+            build_lynx_i2v_workflow(segment, "", "start.png", 45)
+
+    def test_default_takes_both_crops_from_subject(self, segment):
+        wf = self._wf(segment)
+        assert wf["641"]["inputs"]["ref_image"] == ["631", 1]      # subject crop
+        assert "636" not in wf
+
+    def test_split_sources_wires_ref_from_start_frame(self, segment):
+        """ip stays on the canonical subject; ref follows the start frame's appearance."""
+        wf = build_lynx_i2v_workflow(segment, "subject.png", "start.png", 45,
+                                     ref_from_start_frame=True)
+        assert wf["636"]["class_type"] == "LynxInsightFaceCrop"
+        assert wf["636"]["inputs"]["image"] == ["635", 0]           # the start frame
+        assert wf["641"]["inputs"]["ref_image"] == ["636", 1]       # ref <- start frame crop
+        assert wf["633"]["inputs"]["ip_image"] == ["631", 0]        # ip  <- subject crop
+        assert wf["641"]["inputs"]["lynx_ip_embeds"] == ["633", 0]
+
+
+class TestSamplerWidgetDefaults:
+    """Inputs whose ComfyUI widget default disagrees with the node's Python signature
+    default must be sent explicitly.
+
+    WanVideoSampler declares rope_function's widget default as "comfy" but its process()
+    signature defaults to "default". Only the comfy/comfy_chunked branches build the RoPE
+    freqs table, so omitting the input leaves freqs None and the sampler raises
+    "'NoneType' object has no attribute 'split'" inside rope_apply_3d. The ComfyUI GUI
+    always transmits widget defaults; an API-built graph must do so itself.
+    """
+
+    def test_rope_function_is_explicit(self, segment):
+        wf = build_lynx_workflow(segment, "subject.png", 81)
+        assert wf["650"]["inputs"]["rope_function"] == "comfy"
 
 
 class TestGoldenFile:

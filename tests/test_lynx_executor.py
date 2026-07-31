@@ -222,12 +222,12 @@ class TestExecuteLynx:
 
     async def test_validation_failure_reports_failed_without_submitting(self, caplog):
         comfy, queue = FakeComfyUI(), FakeQueue()
-        seg = make_segment(width=512, height=512, lynx_subject_image="s3://b/f.png")
+        seg = make_segment(width=500, height=832, lynx_subject_image="s3://b/f.png")
         with caplog.at_level(logging.INFO):
             await _execute_lynx(seg, comfy, queue)
         assert comfy.submitted is None
         assert _failure(queue).status == "failed"
-        assert "512x512" in _failure(queue).error_message
+        assert "500" in _failure(queue).error_message
         assert "lynx.validation_failed" in [e["event"] for e in _events(caplog)]
 
     async def test_faceless_subject_gets_an_explanatory_error(self):
