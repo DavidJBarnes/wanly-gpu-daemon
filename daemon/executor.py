@@ -54,13 +54,6 @@ from daemon.hologram import (
 )
 from daemon.depth import ensure_depth_model, estimate_depth, normalize_depth_clip
 
-# HACK (temp): known-good canonical face per character LoRA, keyed by char lora_id. Feeds the
-# seed re-anchor faceswap, which re-asserts identity on the frame that seeds the next segment.
-_HARDCODE_IDENTITY_FACE = {
-    "b86c19a9-20aa-44de-85e9-aab2a4ca4809": "s3://wanly-loras/hardcode/k3lly2026_face.png",
-    "5427b202-76da-4a15-aa8a-75e375c4d7d0": "s3://wanly-loras/hardcode/k3llydw_face.png",
-}
-
 logger = logging.getLogger(__name__)
 
 
@@ -186,24 +179,31 @@ async def _reanchor_seed_frame(
     queue: QueueClient,
     progress: "ProgressLog",
 ) -> bytes:
-    """Re-anchor the continuation seed (last frame) to the canonical identity face before
-    it seeds the next i2v segment. FaceFusion passes the frame through unchanged when no
-    face is detected, so we diff the result and fall back to the raw seed on no-op/error.
-    NEVER raises — always returns a usable seed frame (swapped or raw), and logs which."""
+    """Re-anchor the continuation seed (last frame) to the segment's own faceswap face
+    before it seeds the next i2v segment. FaceFusion passes the frame through unchanged when
+    no face is detected, so we diff the result and fall back to the raw seed on no-op/error.
+    NEVER raises — always returns a usable seed frame (swapped or raw), and logs which.
+
+    The face comes from segment.faceswap_image, which execute_segment has already resolved
+    to a ComfyUI filename by this point (see _resolve_faceswap_image). It used to come from
+    a hardcoded lora_id -> S3 face map, which limited the feature to two characters."""
     try:
-        source_s3 = next(
-            (_HARDCODE_IDENTITY_FACE[item.lora_id] for item in (segment.loras or [])
-             if item.lora_id in _HARDCODE_IDENTITY_FACE),
-            None,
-        )
-        if not source_s3:
-            logger.info("Seed re-anchor: no canonical face for segment %d LoRAs — kept raw seed", segment.index)
-            await progress.log("[seed] No canonical face for these LoRAs — kept raw frame")
+        face_fn = segment.faceswap_image
+        if not face_fn:
+            logger.info("Seed re-anchor: segment %d has no faceswap face — kept raw seed", segment.index)
+            await progress.log("[seed] No faceswap face configured — kept raw frame")
             return last_frame_data
 
-        face_data = await _download_with_retry(lambda: queue.download_file(source_s3), "seed_face")
-        _validate_image_data(face_data, "seed_face")
-        face_fn = await comfyui.upload_image(face_data, f"seedface_{segment.id}.png")
+        # Normally already a ComfyUI filename. If the segment carries an unresolved S3 URI
+        # (faceswap disabled for the video but a face still selected), resolve it here.
+        if face_fn.startswith("s3://"):
+            face_data = await _download_with_retry(
+                lambda: queue.download_file(face_fn), "seed_face"
+            )
+            _validate_image_data(face_data, "seed_face")
+            ext = os.path.splitext(face_fn)[1] or ".png"
+            face_fn = await comfyui.upload_image(face_data, f"seedface_{segment.id}{ext}")
+
         seed_fn = await comfyui.upload_image(last_frame_data, f"seed_{segment.id}.png")
 
         seg = segment.model_copy(update={
