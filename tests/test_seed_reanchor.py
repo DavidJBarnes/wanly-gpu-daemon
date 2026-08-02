@@ -191,6 +191,46 @@ class TestWorkflowShape:
         assert not any(n.get("class_type", "").startswith("VHS_") for n in wf.values())
 
 
+class TestFaceSelection:
+    """With two people in frame the seed swap must be told WHICH face to replace.
+
+    _add_faceswap defaults to faces_order="left-right", faces_index="0" — the leftmost
+    face. In a two-person scene that can be the wrong person entirely, so these values
+    have to survive from the console onto the seed workflow.
+    """
+
+    def test_faces_order_and_index_reach_the_seed_workflow(self):
+        seg = make_segment(
+            faceswap_enabled=False, seed_faceswap=True, faceswap_image="face.png",
+            faceswap_method="reactor",
+            faceswap_faces_order="right-left", faceswap_faces_index="1",
+        )
+        wf = build_seed_faceswap_workflow(seg, "seed.png")
+        opts = next(n for n in wf.values() if n["class_type"] == "ReActorOptions")
+        assert opts["inputs"]["input_faces_order"] == "right-left"
+        assert opts["inputs"]["input_faces_index"] == "1"
+
+    def test_defaults_pick_the_leftmost_face_when_unset(self):
+        """Documents the fallback: fine for one face, WRONG for two."""
+        seg = make_segment(
+            faceswap_enabled=False, seed_faceswap=True, faceswap_image="face.png",
+            faceswap_method="reactor",
+            faceswap_faces_order=None, faceswap_faces_index=None,
+        )
+        wf = build_seed_faceswap_workflow(seg, "seed.png")
+        opts = next(n for n in wf.values() if n["class_type"] == "ReActorOptions")
+        assert opts["inputs"]["input_faces_order"] == "left-right"
+        assert opts["inputs"]["input_faces_index"] == "0"
+
+    def test_method_reaches_the_seed_workflow(self):
+        seg = make_segment(
+            faceswap_enabled=False, seed_faceswap=True, faceswap_image="face.png",
+            faceswap_method="reactor",
+        )
+        wf = build_seed_faceswap_workflow(seg, "seed.png")
+        assert any(n["class_type"] == "ReActorOptions" for n in wf.values())
+
+
 class TestFlagPlumbing:
     def test_seed_faceswap_defaults_off(self):
         assert make_segment().seed_faceswap is False
