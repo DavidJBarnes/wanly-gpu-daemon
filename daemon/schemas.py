@@ -98,4 +98,8 @@ class SegmentResult(BaseModel):
     identity_no_face: Optional[int] = None
     identity_face_px_p50: Optional[float] = None
     identity_yaw_max: Optional[float] = None
+    # Trajectory endpoints vs the job's ground truth. Loss across a segment is
+    # start - end; a continuation begins where the previous ended, so these chain.
+    identity_start_cos_ref: Optional[float] = None
+    identity_end_cos_ref: Optional[float] = None
     identity_metrics: Optional[dict] = None
