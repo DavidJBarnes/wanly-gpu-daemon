@@ -685,9 +685,10 @@ async def _score_segment_identity(
             except Exception as e:
                 logger.info("identity: could not fetch reference (%s)", e)
 
-        score = identity_score.score_video(video_data, start_bytes, ref_bytes)
+        score, reason = identity_score.score_video(video_data, start_bytes, ref_bytes)
         if score is None:
-            await progress.log("[7/7] Identity: not scored (no usable reference)")
+            await progress.log(f"[7/7] Identity: not scored ({reason})")
+            logger.info("Identity not scored for segment %d: %s", segment.index, reason)
             return {}
         await progress.log(f"[7/7] Identity: {score.summary()}")
         logger.info("Identity score for segment %d: %s", segment.index, score.summary())

@@ -90,14 +90,14 @@ class TestPicksTheSubjectNotTheLargestFace:
         patched(frame_faces=[[big_other, small_subject]] * 4,
                 ref_faces=[FakeFace(SUBJECT, x0=0, x1=200)])
 
-        s = score_video(b"video", reference_bytes=b"ref")
+        s, _ = score_video(b"video", reference_bytes=b"ref")
         assert s is not None
         assert s.mean_cos_ref == pytest.approx(1.0, abs=1e-4)
         assert s.metrics["multi_face_frames"] == 4
 
     def test_single_face_frames_still_work(self, patched):
         patched(frame_faces=[[FakeFace(SUBJECT)]] * 3, ref_faces=[FakeFace(SUBJECT)])
-        s = score_video(b"video", reference_bytes=b"ref")
+        s, _ = score_video(b"video", reference_bytes=b"ref")
         assert s.mean_cos_ref == pytest.approx(1.0, abs=1e-4)
         assert s.metrics["multi_face_frames"] == 0
 
@@ -106,7 +106,7 @@ class TestUndetectedFramesAreCounted:
     def test_no_face_frames_are_reported_not_dropped(self, patched):
         patched(frame_faces=[[FakeFace(SUBJECT)], [], [FakeFace(SUBJECT)], []],
                 ref_faces=[FakeFace(SUBJECT)])
-        s = score_video(b"video", reference_bytes=b"ref")
+        s, _ = score_video(b"video", reference_bytes=b"ref")
         assert s.frames == 4
         assert s.faces_detected == 2
         assert s.no_face == 2
@@ -115,7 +115,7 @@ class TestUndetectedFramesAreCounted:
         """'No face anywhere' is a real result about the clip, distinct from 'scoring
         could not run'. Returning None for both would conflate them."""
         patched(frame_faces=[[], [], []], ref_faces=[FakeFace(SUBJECT)])
-        s = score_video(b"video", reference_bytes=b"ref")
+        s, _ = score_video(b"video", reference_bytes=b"ref")
         assert s is not None
         assert s.faces_detected == 0 and s.no_face == 3
         assert s.mean_cos_ref is None
@@ -128,17 +128,19 @@ class TestTwoReferences:
         patched(frame_faces=[[FakeFace(DRIFTED)]] * 4,
                 ref_faces=[FakeFace(DRIFTED)])   # reference-face lookup returns this for both
 
-        s = score_video(b"video", start_frame_bytes=b"start", reference_bytes=b"ref")
+        s, _ = score_video(b"video", start_frame_bytes=b"start", reference_bytes=b"ref")
         assert s.mean_cos_start is not None
         assert s.mean_cos_ref is not None
 
     def test_reference_only_still_scores(self, patched):
         patched(frame_faces=[[FakeFace(SUBJECT)]] * 3, ref_faces=[FakeFace(SUBJECT)])
-        s = score_video(b"video", reference_bytes=b"ref")
+        s, _ = score_video(b"video", reference_bytes=b"ref")
         assert s.mean_cos_ref is not None and s.mean_cos_start is None
 
     def test_no_reference_at_all_returns_none(self):
-        assert score_video(b"video") is None
+        score, reason = score_video(b"video")
+        assert score is None
+        assert "no reference" in reason
 
 
 class TestSlope:
@@ -147,29 +149,35 @@ class TestSlope:
         drift, which needs a different fix than a uniformly low mean."""
         decaying = [[FakeFace(unit(1, t * 0.25, 0))] for t in range(8)]
         patched(frame_faces=decaying, ref_faces=[FakeFace(SUBJECT)])
-        s = score_video(b"video", reference_bytes=b"ref")
+        s, _ = score_video(b"video", reference_bytes=b"ref")
         assert s.slope is not None and s.slope < 0
 
     def test_stable_identity_gives_a_flat_slope(self, patched):
         patched(frame_faces=[[FakeFace(SUBJECT)]] * 8, ref_faces=[FakeFace(SUBJECT)])
-        s = score_video(b"video", reference_bytes=b"ref")
+        s, _ = score_video(b"video", reference_bytes=b"ref")
         assert s.slope == pytest.approx(0.0, abs=1e-6)
 
 
 class TestNeverRaises:
     def test_empty_video_returns_none(self):
-        assert score_video(b"", reference_bytes=b"ref") is None
+        score, reason = score_video(b"", reference_bytes=b"ref")
+        assert score is None
+        assert reason == "no video data"
 
     def test_model_load_failure_returns_none(self, monkeypatch):
         def boom(): raise RuntimeError("onnxruntime exploded")
         monkeypatch.setattr(identity_score, "_get_app", boom)
-        assert score_video(b"video", reference_bytes=b"ref") is None
+        score, reason = score_video(b"video", reference_bytes=b"ref")
+        assert score is None
+        assert "error:" in reason or "dependency missing" in reason
 
     def test_unreadable_reference_returns_none(self, monkeypatch):
         monkeypatch.setattr(identity_score, "_get_app", lambda: FakeApp([[]]))
         import cv2
         monkeypatch.setattr(cv2, "imdecode", lambda *a, **k: None)
-        assert score_video(b"video", reference_bytes=b"notanimage") is None
+        score, reason = score_video(b"video", reference_bytes=b"notanimage")
+        assert score is None
+        assert "reference" in reason
 
     def test_prewarm_failure_is_survivable(self, monkeypatch):
         def boom(): raise RuntimeError("no model")
@@ -199,6 +207,34 @@ class TestStride:
         """Bounds the cost so a long stitched segment cannot add minutes to every job."""
         n = identity_score.MAX_FRAMES_DENSE * 3
         patched(frame_faces=[[FakeFace(SUBJECT)]] * 30, ref_faces=[FakeFace(SUBJECT)], n_frames=n)
-        s = score_video(b"video", reference_bytes=b"ref")
+        s, _ = score_video(b"video", reference_bytes=b"ref")
         assert s.metrics["stride"] > 1
         assert s.metrics["total_frames"] == n
+
+
+class TestFailureReasonIsSpecific:
+    """The bug this class exists for: a missing insightface reported as
+    "not scored (no usable reference)", which sent us looking for a missing reference image
+    when the real cause was a dependency that was never installed. Six different failures
+    were collapsing into one message."""
+
+    def test_missing_dependency_says_so_by_name(self, monkeypatch):
+        def boom():
+            raise ModuleNotFoundError("No module named 'insightface'", name="insightface")
+        monkeypatch.setattr(identity_score, "_get_app", boom)
+        score, reason = score_video(b"video", reference_bytes=b"ref")
+        assert score is None
+        assert "dependency missing" in reason and "insightface" in reason
+
+    def test_no_reference_is_distinguishable_from_a_bad_one(self, monkeypatch):
+        _, none_at_all = score_video(b"video")
+        monkeypatch.setattr(identity_score, "_get_app", lambda: FakeApp([[]]))
+        import cv2
+        monkeypatch.setattr(cv2, "imdecode", lambda *a, **k: None)
+        _, unreadable = score_video(b"video", reference_bytes=b"junk")
+        assert none_at_all != unreadable, "distinct failures must not share a message"
+
+    def test_success_has_an_empty_reason(self, patched):
+        patched(frame_faces=[[FakeFace(SUBJECT)]] * 3, ref_faces=[FakeFace(SUBJECT)])
+        score, reason = score_video(b"video", reference_bytes=b"ref")
+        assert score is not None and reason == ""
