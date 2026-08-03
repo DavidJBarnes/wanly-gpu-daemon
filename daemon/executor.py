@@ -31,6 +31,7 @@ from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
 from daemon.lora_sync import ensure_loras_available
 from daemon.motion_extractor import _augment_prompt_with_motion, extract_motion_keywords
 from daemon.motion_analyzer import measure_motion_magnitude
+from daemon import identity_score
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
@@ -646,6 +647,56 @@ async def _execute_smashcut_concat(segment: SegmentClaim, queue: QueueClient) ->
         )
 
 
+
+async def _score_segment_identity(
+    segment: SegmentClaim,
+    video_data: bytes,
+    ref_bytes: "bytes | None",
+    queue: QueueClient,
+    progress: "ProgressLog",
+) -> dict:
+    """Measure identity on the finished segment. NEVER raises - a scoring failure must not
+    fail a generation that already succeeded, so every path returns a dict (empty on failure).
+
+    Two references, because they answer different questions:
+      start frame       - how far did THIS generation drift from where it began
+      identity reference- is it the character at all
+    The start frame is the one that isolates the model's own drift; the identity reference is
+    bounded by how close the start frame already was (0.708 on the CTRL clip).
+    """
+    try:
+        start_bytes = None
+        if segment.start_image and segment.start_image.startswith("s3://"):
+            try:
+                start_bytes = await _download_with_retry(
+                    lambda: queue.download_file(segment.start_image), "identity_start_frame"
+                )
+            except Exception as e:
+                logger.info("identity: could not fetch start frame (%s)", e)
+
+        # index 0 skips the reference download above, so fetch it here when scoring needs it
+        if ref_bytes is None and segment.initial_reference_image \
+                and segment.initial_reference_image.startswith("s3://"):
+            try:
+                ref_bytes = await _download_with_retry(
+                    lambda: queue.download_file(segment.initial_reference_image),
+                    "identity_reference",
+                )
+            except Exception as e:
+                logger.info("identity: could not fetch reference (%s)", e)
+
+        score = identity_score.score_video(video_data, start_bytes, ref_bytes)
+        if score is None:
+            await progress.log("[7/7] Identity: not scored (no usable reference)")
+            return {}
+        await progress.log(f"[7/7] Identity: {score.summary()}")
+        logger.info("Identity score for segment %d: %s", segment.index, score.summary())
+        return identity_score.as_result_fields(score)
+    except Exception as e:
+        logger.warning("identity: scoring wrapper failed (%s) - segment unaffected", e)
+        return {}
+
+
 async def execute_segment(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -715,6 +766,7 @@ async def execute_segment(
 
         # Step 1b: Resolve initial reference image (identity anchor for PainterLongVideo)
         initial_ref_filename = None
+        identity_ref_bytes: bytes | None = None
         if segment.initial_reference_image and segment.index > 0:
             ref_image = segment.initial_reference_image
             if ref_image.startswith("s3://"):
@@ -723,6 +775,7 @@ async def execute_segment(
                     lambda: queue.download_file(ref_image), "initial_reference_image"
                 )
                 _validate_image_data(ref_data, "initial_reference_image")
+                identity_ref_bytes = ref_data
                 ext = os.path.splitext(ref_image)[1] or ".png"
                 ref_filename = f"initial_ref_{segment.id}{ext}"
                 initial_ref_filename = await comfyui.upload_image(ref_data, ref_filename)
@@ -840,10 +893,18 @@ async def execute_segment(
         motion_keywords = await extract_motion_keywords(segment.prompt, video_data)
         if motion_keywords:
             await progress.log(f"[7/7] Motion detected: {', '.join(motion_keywords)}")
+
+        # Identity scoring: same shape as motion magnitude - analyse the bytes we already
+        # have, attach numbers to the segment. CPU only, and never raises.
+        identity_fields = await _score_segment_identity(
+            segment, video_data, identity_ref_bytes, queue, progress,
+        )
+
         segment_result = SegmentResult(
             status="completed",
             motion_keywords=motion_keywords if motion_keywords else None,
             motion_magnitude=motion_magnitude,
+            **identity_fields,
         )
         await queue.upload_segment_output(segment.id, video_data, last_frame_data, segment_result)
         step_times.append(("upload", time.monotonic() - t0))

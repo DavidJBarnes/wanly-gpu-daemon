@@ -7,3 +7,4 @@ pydantic-settings
 python-dotenv
 pyyaml
 websockets
+insightface==0.7.3
