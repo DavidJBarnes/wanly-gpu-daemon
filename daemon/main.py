@@ -11,6 +11,7 @@ from daemon.executor import execute_segment
 from daemon.model_validator import cleanup_partial_downloads, validate_models
 from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
+from daemon import identity_score
 from daemon.gpu_stats import get_gpu_stats
 from daemon.resource_sync import sync_resources
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
@@ -347,6 +348,9 @@ def kill_stale_daemons():
 
 async def run():
     kill_stale_daemons()
+    # Load the face model up front. First ever run downloads ~300MB, and doing that lazily
+    # inside the first scored segment looks like a hang in the middle of a generation.
+    await asyncio.get_running_loop().run_in_executor(None, identity_score.prewarm)
     comfyui = ComfyUIClient()
     queue = QueueClient()
     shutdown_event = asyncio.Event()
