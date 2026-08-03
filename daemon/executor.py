@@ -651,7 +651,6 @@ async def _execute_smashcut_concat(segment: SegmentClaim, queue: QueueClient) ->
 async def _score_segment_identity(
     segment: SegmentClaim,
     video_data: bytes,
-    ref_bytes: "bytes | None",
     queue: QueueClient,
     progress: "ProgressLog",
 ) -> dict:
@@ -674,16 +673,19 @@ async def _score_segment_identity(
             except Exception as e:
                 logger.info("identity: could not fetch start frame (%s)", e)
 
-        # index 0 skips the reference download above, so fetch it here when scoring needs it
-        if ref_bytes is None and segment.initial_reference_image \
-                and segment.initial_reference_image.startswith("s3://"):
+        # Ground truth is segment 0's start frame - the job's starting image - and nothing
+        # else. Explicitly NOT initial_reference_image: that field is the PainterLongVideo
+        # anchor and can be overridden, which would silently change what "her" means
+        # partway through a measurement. "Her" is where the job began.
+        ref_bytes = None
+        truth = segment.identity_ground_truth
+        if truth and truth.startswith("s3://"):
             try:
                 ref_bytes = await _download_with_retry(
-                    lambda: queue.download_file(segment.initial_reference_image),
-                    "identity_reference",
+                    lambda: queue.download_file(truth), "identity_ground_truth",
                 )
             except Exception as e:
-                logger.info("identity: could not fetch reference (%s)", e)
+                logger.info("identity: could not fetch ground truth (%s)", e)
 
         score, reason = identity_score.score_video(video_data, start_bytes, ref_bytes)
         if score is None:
@@ -767,7 +769,6 @@ async def execute_segment(
 
         # Step 1b: Resolve initial reference image (identity anchor for PainterLongVideo)
         initial_ref_filename = None
-        identity_ref_bytes: bytes | None = None
         if segment.initial_reference_image and segment.index > 0:
             ref_image = segment.initial_reference_image
             if ref_image.startswith("s3://"):
@@ -776,7 +777,6 @@ async def execute_segment(
                     lambda: queue.download_file(ref_image), "initial_reference_image"
                 )
                 _validate_image_data(ref_data, "initial_reference_image")
-                identity_ref_bytes = ref_data
                 ext = os.path.splitext(ref_image)[1] or ".png"
                 ref_filename = f"initial_ref_{segment.id}{ext}"
                 initial_ref_filename = await comfyui.upload_image(ref_data, ref_filename)
@@ -898,7 +898,7 @@ async def execute_segment(
         # Identity scoring: same shape as motion magnitude - analyse the bytes we already
         # have, attach numbers to the segment. CPU only, and never raises.
         identity_fields = await _score_segment_identity(
-            segment, video_data, identity_ref_bytes, queue, progress,
+            segment, video_data, queue, progress,
         )
 
         segment_result = SegmentResult(

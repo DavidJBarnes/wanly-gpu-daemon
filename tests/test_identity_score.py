@@ -285,3 +285,52 @@ class TestTrajectory:
         patched(frame_faces=[[FakeFace(SUBJECT)]] * 3, ref_faces=[FakeFace(SUBJECT)])
         s, _ = score_video(b"video", start_frame_bytes=b"start")
         assert s.loss is None
+
+
+class TestGroundTruthIsSegmentZeroStartFrame:
+    """"Her" is defined by where the job began — segment 0's start frame — and by nothing
+    else. No external reference, no override, nothing hardcoded.
+
+    Scoring previously piggybacked on `initial_reference_image`, which resolves to
+    `job.identity_reference_image or job.starting_image`. That field exists for the
+    PainterLongVideo anchor and is overridable, so setting it would have silently changed
+    what the numbers were measured against, partway through a job.
+    """
+
+    def test_claim_carries_an_explicit_ground_truth_field(self):
+        from daemon.schemas import SegmentClaim
+        assert "identity_ground_truth" in SegmentClaim.model_fields
+
+    def test_ground_truth_is_independent_of_the_painter_anchor(self):
+        """The two fields must be separately settable, or one can shadow the other."""
+        from tests.conftest import make_segment
+        seg = make_segment(
+            identity_ground_truth="s3://bucket/seg0_start.png",
+            initial_reference_image="s3://bucket/some_other_anchor.png",
+        )
+        assert seg.identity_ground_truth != seg.initial_reference_image
+
+    def test_scoring_never_reads_the_painter_anchor(self):
+        """Source-level guard: the scoring helper must not reference the overridable field.
+        A future edit that reintroduces the coupling fails here rather than silently
+        changing what every number means."""
+        import ast as _ast, inspect
+        from daemon import executor
+        raw = inspect.getsource(executor._score_segment_identity)
+        # Strip comments and docstrings: the helper deliberately NAMES the anchor field in a
+        # comment explaining why it is not used, and that must not trip the guard.
+        tree = _ast.parse(raw.lstrip())
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) \
+                    and _ast.get_docstring(node):
+                node.body = node.body[1:]
+        src = _ast.unparse(tree)
+        assert "initial_reference_image" not in src, (
+            "identity scoring must use identity_ground_truth, not the overridable "
+            "PainterLongVideo anchor"
+        )
+        assert "identity_ground_truth" in src
+
+    def test_no_hardcoded_identity_face_map_remains(self):
+        from daemon import executor
+        assert not hasattr(executor, "_HARDCODE_IDENTITY_FACE")
