@@ -56,6 +56,12 @@ def prewarm() -> bool:
     try:
         _get_app()
         return True
+    except ModuleNotFoundError as e:
+        logger.warning(
+            "identity: %s is not installed in the daemon venv - scoring will be SKIPPED for "
+            "every segment. Fix: venv/bin/pip install insightface==0.7.3", e.name,
+        )
+        return False
     except Exception as e:
         logger.warning("identity: prewarm failed (%s) - scoring will be skipped", e)
         return False
@@ -118,16 +124,21 @@ def score_video(
     video_bytes: bytes,
     start_frame_bytes: Optional[bytes] = None,
     reference_bytes: Optional[bytes] = None,
-) -> Optional[IdentityScore]:
-    """Score a segment. Returns None if scoring could not run at all.
+) -> tuple[Optional[IdentityScore], str]:
+    """Score a segment.
+
+    Returns (score, reason). `reason` is "" on success and otherwise says WHY scoring did
+    not run - a missing dependency, an unreadable reference and an empty video are very
+    different problems, and collapsing them into a single "not scored" message sent us
+    looking for a missing reference when insightface simply was not installed.
 
     Never raises.
     """
     if not video_bytes:
-        return None
+        return None, "no video data"
     if not start_frame_bytes and not reference_bytes:
         logger.info("identity: no reference available - skipping")
-        return None
+        return None, "no reference image on the segment"
 
     tmp = None
     try:
@@ -138,7 +149,7 @@ def score_video(
         emb_ref = _pick_reference_face(app, reference_bytes, "identity reference") if reference_bytes else None
         if emb_start is None and emb_ref is None:
             logger.info("identity: no usable reference face - skipping")
-            return None
+            return None, "no face detected in the reference image"
         # the embedding used to disambiguate WHICH face is the subject on multi-face frames
         anchor = emb_ref if emb_ref is not None else emb_start
 
@@ -198,7 +209,7 @@ def score_video(
                 mean_cos_start=None, mean_cos_ref=None, min_cos_start=None,
                 slope=None, face_px_p50=None, yaw_max=None,
                 metrics={"stride": stride, "total_frames": total},
-            )
+            ), ""
 
         slope = None
         if len(slope_x) >= 3:
@@ -234,10 +245,15 @@ def score_video(
                 "yaw_bands": bands,
                 "series": [round(v, 4) for v in slope_y[:600]],
             },
-        )
+        ), ""
+    except ModuleNotFoundError as e:
+        # The one that actually bit: insightface missing from the daemon venv. Say so
+        # plainly instead of blaming the reference image.
+        logger.warning("identity: dependency missing (%s) - scoring skipped", e)
+        return None, f"dependency missing: {e.name}"
     except Exception as e:
         logger.warning("identity: scoring failed (%s) - segment unaffected", e, exc_info=True)
-        return None
+        return None, f"error: {type(e).__name__}: {e}"
     finally:
         if tmp and os.path.exists(tmp):
             try:
