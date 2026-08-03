@@ -74,14 +74,30 @@ class IdentityScore:
     no_face: int                     # counted, never silently dropped
     mean_cos_start: Optional[float]
     mean_cos_ref: Optional[float]
+    # Endpoints vs the ground truth (the job's start image, identical for every segment).
+    # The MEAN blurs the trajectory: a clip going 0.95 -> 0.65 averages about the same as one
+    # sitting flat at 0.80. Loss across a segment is start_cos_ref - end_cos_ref, and because
+    # a continuation begins where the previous segment ended, these chain across the job.
+    start_cos_ref: Optional[float]
+    end_cos_ref: Optional[float]
     min_cos_start: Optional[float]
     slope: Optional[float]           # cosine per frame, vs whichever ref was available
     face_px_p50: Optional[float]
     yaw_max: Optional[float]
     metrics: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def loss(self) -> Optional[float]:
+        """Identity lost across this segment, measured against the job's ground truth."""
+        if self.start_cos_ref is None or self.end_cos_ref is None:
+            return None
+        return self.start_cos_ref - self.end_cos_ref
+
     def summary(self) -> str:
         bits = []
+        if self.start_cos_ref is not None and self.end_cos_ref is not None:
+            bits.append(f"{self.start_cos_ref:.3f}->{self.end_cos_ref:.3f} vs truth "
+                        f"(loss {self.loss:+.3f})")
         if self.mean_cos_start is not None:
             bits.append(f"{self.mean_cos_start:.3f} vs start")
         if self.mean_cos_ref is not None:
@@ -207,6 +223,7 @@ def score_video(
             return IdentityScore(
                 frames=examined, faces_detected=0, no_face=no_face,
                 mean_cos_start=None, mean_cos_ref=None, min_cos_start=None,
+                start_cos_ref=None, end_cos_ref=None,
                 slope=None, face_px_p50=None, yaw_max=None,
                 metrics={"stride": stride, "total_frames": total},
             ), ""
@@ -232,6 +249,8 @@ def score_video(
             no_face=no_face,
             mean_cos_start=float(np.mean(cs_start)) if cs_start else None,
             mean_cos_ref=float(np.mean(cs_ref)) if cs_ref else None,
+            start_cos_ref=float(cs_ref[0]) if cs_ref else None,
+            end_cos_ref=float(cs_ref[-1]) if cs_ref else None,
             min_cos_start=float(np.min(cs_start)) if cs_start else None,
             slope=slope,
             face_px_p50=float(np.percentile(face_px, 50)),
@@ -276,5 +295,7 @@ def as_result_fields(score: Optional[IdentityScore]) -> dict[str, Any]:
         "identity_no_face": d["no_face"],
         "identity_face_px_p50": d["face_px_p50"],
         "identity_yaw_max": d["yaw_max"],
+        "identity_start_cos_ref": d["start_cos_ref"],
+        "identity_end_cos_ref": d["end_cos_ref"],
         "identity_metrics": d["metrics"],
     }

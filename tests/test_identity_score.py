@@ -194,7 +194,8 @@ class TestResultFields:
         score = IdentityScore(
             frames=10, faces_detected=9, no_face=1, mean_cos_start=0.81,
             mean_cos_ref=0.49, min_cos_start=0.7, slope=-0.001,
-            face_px_p50=110.0, yaw_max=28.0, metrics={"stride": 1},
+            face_px_p50=110.0, yaw_max=28.0, start_cos_ref=0.98, end_cos_ref=0.60,
+            metrics={"stride": 1},
         )
         fields = as_result_fields(score)
         unknown = set(fields) - set(SegmentResult.model_fields)
@@ -238,3 +239,49 @@ class TestFailureReasonIsSpecific:
         patched(frame_faces=[[FakeFace(SUBJECT)]] * 3, ref_faces=[FakeFace(SUBJECT)])
         score, reason = score_video(b"video", reference_bytes=b"ref")
         assert score is not None and reason == ""
+
+
+class TestTrajectory:
+    """The mean blurs the shape. A segment going 0.95 -> 0.65 averages about the same as one
+    sitting flat at 0.80, and only the first has lost the character. Loss across a segment is
+    start - end against the job's ground truth; because a continuation begins where the
+    previous ended, these chain across the whole job."""
+
+    def test_endpoints_are_recorded_against_the_reference(self, patched):
+        decaying = [[FakeFace(unit(1, t * 0.3, 0))] for t in range(6)]
+        patched(frame_faces=decaying, ref_faces=[FakeFace(SUBJECT)])
+        s, _ = score_video(b"video", reference_bytes=b"ref")
+        assert s.start_cos_ref is not None and s.end_cos_ref is not None
+        assert s.start_cos_ref > s.end_cos_ref, "a decaying clip must end lower than it started"
+
+    def test_loss_is_start_minus_end(self, patched):
+        decaying = [[FakeFace(unit(1, t * 0.3, 0))] for t in range(6)]
+        patched(frame_faces=decaying, ref_faces=[FakeFace(SUBJECT)])
+        s, _ = score_video(b"video", reference_bytes=b"ref")
+        assert s.loss == pytest.approx(s.start_cos_ref - s.end_cos_ref)
+        assert s.loss > 0, "positive loss means identity was lost"
+
+    def test_a_stable_clip_has_near_zero_loss(self, patched):
+        patched(frame_faces=[[FakeFace(SUBJECT)]] * 6, ref_faces=[FakeFace(SUBJECT)])
+        s, _ = score_video(b"video", reference_bytes=b"ref")
+        assert s.loss == pytest.approx(0.0, abs=1e-6)
+
+    def test_mean_alone_cannot_distinguish_the_two(self, patched):
+        """Why endpoints exist: build a decaying clip and a flat clip with a similar mean and
+        confirm only the trajectory separates them."""
+        decaying = [[FakeFace(unit(1, t * 0.22, 0))] for t in range(8)]
+        patched(frame_faces=decaying, ref_faces=[FakeFace(SUBJECT)])
+        drift, _ = score_video(b"video", reference_bytes=b"ref")
+
+        flat_val = drift.mean_cos_ref
+        flat_emb = unit(1, (1 / flat_val ** 2 - 1) ** 0.5, 0)
+        patched(frame_faces=[[FakeFace(flat_emb)]] * 8, ref_faces=[FakeFace(SUBJECT)])
+        flat, _ = score_video(b"video", reference_bytes=b"ref")
+
+        assert flat.mean_cos_ref == pytest.approx(drift.mean_cos_ref, abs=0.02)
+        assert abs(flat.loss) < 1e-6 < drift.loss, "means match; only loss tells them apart"
+
+    def test_loss_is_none_without_a_reference(self, patched):
+        patched(frame_faces=[[FakeFace(SUBJECT)]] * 3, ref_faces=[FakeFace(SUBJECT)])
+        s, _ = score_video(b"video", start_frame_bytes=b"start")
+        assert s.loss is None
