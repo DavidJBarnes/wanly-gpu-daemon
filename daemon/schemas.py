@@ -34,6 +34,9 @@ class SegmentClaim(BaseModel):
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
     initial_reference_image: Optional[str] = None
+    # Identity scoring ground truth: segment 0's start frame. NOT initial_reference_image -
+    # that is the PainterLongVideo anchor and is overridable.
+    identity_ground_truth: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
     previous_motion_keywords: Optional[list[str]] = None
     previous_motion_magnitude: Optional[float] = None
