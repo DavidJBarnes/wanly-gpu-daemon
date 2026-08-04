@@ -183,6 +183,26 @@ class TestAnchorsToTheScoredReference:
         assert node["class_type"] == "AdvancedSwapFaceImage", node["class_type"]
         assert node["inputs"]["face_selector_mode"] == "reference"
 
+    @pytest.mark.asyncio
+    async def test_seed_uses_a_looser_reference_threshold_than_video(self):
+        """The seed frame is the DRIFTED one — that is why it is being re-anchored. A face
+        at 0.663 cosine can fall outside the video path's 0.8 threshold, in which case
+        FaceFusion swaps nothing and the fix no-ops precisely when it matters."""
+        seg = make_segment(seed_faceswap=True, faceswap_enabled=True, faceswap_image="f.png")
+        comfy = FakeComfy()
+        await _reanchor_seed_frame(seg, RAW_SEED, comfy, FakeQueue(), FakeProgress())
+        assert comfy.submitted["183"]["inputs"]["reference_face_distance"] == 1.0
+
+    def test_video_faceswap_keeps_the_validated_08_threshold(self):
+        """Scoped change: the seed path loosens, the video path David has already validated
+        must not move."""
+        from daemon.workflow_builder import _add_faceswap
+        wf: dict = {}
+        seg = make_segment(faceswap_enabled=True, faceswap_image="f.png",
+                           faceswap_method="facefusion")
+        _add_faceswap(wf, seg)
+        assert wf["183"]["inputs"]["reference_face_distance"] == 0.8
+
 
 class TestDegradesToRawSeed:
     """A failed re-anchor must cost nothing: the raw frame still seeds the next segment."""

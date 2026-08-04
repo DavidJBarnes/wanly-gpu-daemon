@@ -269,11 +269,22 @@ def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
     workflow["102"]["inputs"]["model"] = [last_low_node, 0]
 
 
-def _add_faceswap(workflow: dict, segment: SegmentClaim, input_node: str = "87") -> None:
+def _add_faceswap(
+    workflow: dict,
+    segment: SegmentClaim,
+    input_node: str = "87",
+    reference_face_distance: float = 0.8,
+) -> None:
     """Add face swap nodes (188 LoadImage + 183 FaceSwap).
 
     input_node controls where frames come from: "87" (VAEDecode) for generation
     workflows, or "400" (VHS_LoadVideo) for faceswap-only reprocessing.
+
+    reference_face_distance is the threshold FaceFusion uses in face_selector_mode
+    "reference": a target face is swapped only when its embedding is within this
+    distance of the source. That is how the RIGHT person gets picked in a two-person
+    frame — by identity, not by position. The seed re-anchor overrides it upward; see
+    build_seed_faceswap_workflow for why.
     """
     workflow["188"] = {
         "class_type": "LoadImage",
@@ -339,7 +350,7 @@ def _add_faceswap(workflow: dict, segment: SegmentClaim, input_node: str = "87")
             "face_mask_regions": "skin,nose,mouth,upper-lip,lower-lip",
             "face_mask_padding": "0,0,0,0",
             "reference_image": ["188", 0],
-            "reference_face_distance": 0.8,
+            "reference_face_distance": reference_face_distance,
         }
         workflow["183"] = {
             "class_type": "AdvancedSwapFaceImage",
@@ -430,7 +441,14 @@ def build_seed_faceswap_workflow(segment: SegmentClaim, seed_filename: str) -> d
         "inputs": {"image": seed_filename},
         "_meta": {"title": "Seed frame (last frame)"},
     }
-    _add_faceswap(workflow, segment, input_node="400")
+    # Looser reference threshold than the video path (0.8), and deliberately so.
+    # In a two-person frame the right face is chosen by matching the SOURCE identity, but
+    # the seed frame is by definition the drifted one — that is the reason to re-anchor it.
+    # A face measured at 0.663 cosine against the reference can fall outside a 0.8 threshold,
+    # in which case FaceFusion swaps nothing and the fix silently no-ops exactly when it is
+    # needed most. 1.0 is the value validated on the NSFW face-swap work. It still excludes
+    # the male partner, whose embedding distance from her is far larger than either bound.
+    _add_faceswap(workflow, segment, input_node="400", reference_face_distance=1.0)
     workflow["186"] = {
         "class_type": "SaveImage",
         "inputs": {"filename_prefix": "seed_swap", "images": ["183", 0]},
