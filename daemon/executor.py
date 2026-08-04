@@ -189,7 +189,11 @@ async def _reanchor_seed_frame(
     to a ComfyUI filename by this point (see _resolve_faceswap_image). It used to come from
     a hardcoded lora_id -> S3 face map, which limited the feature to two characters."""
     try:
-        face_fn = segment.faceswap_image
+        # Anchor to the SAME image identity is measured against — the job's starting image,
+        # which is segment 0's start frame. A separate faceswap portrait pulls the seed toward
+        # a different face than the one we score against, so even a perfect swap reads as a
+        # failure. Falls back to the configured faceswap face when no ground truth is set.
+        face_fn = segment.identity_ground_truth or segment.faceswap_image
         if not face_fn:
             logger.info("Seed re-anchor: segment %d has no faceswap face — kept raw seed", segment.index)
             await progress.log("[seed] No faceswap face configured — kept raw frame")
@@ -207,9 +211,16 @@ async def _reanchor_seed_frame(
 
         seed_fn = await comfyui.upload_image(last_frame_data, f"seed_{segment.id}.png")
 
+        # ALWAYS facefusion for a seed re-anchor, whatever the video's method is.
+        # ReActor selects the target face by POSITION (faces_index 0, left-right), so on a
+        # two-person frame it swaps the leftmost face — often the wrong person entirely. It
+        # still changes pixels, so the caller's diff reports success while her face is
+        # untouched. Measured cost of that on a real job: +0.014 cosine from a full swap.
+        # FaceFusion uses face_selector_mode="reference" and targets the face MATCHING the
+        # source, which is the only correct semantics for re-anchoring one specific identity.
         seg = segment.model_copy(update={
             "faceswap_image": face_fn,
-            "faceswap_method": segment.faceswap_method or "facefusion",
+            "faceswap_method": "facefusion",
         })
         workflow = build_seed_faceswap_workflow(seg, seed_fn)
         prompt_id, client_id = await comfyui.submit_workflow(workflow)
