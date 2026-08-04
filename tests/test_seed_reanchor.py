@@ -134,6 +134,56 @@ class TestFaceSource:
         assert any(f.startswith("seedface_") for f in comfy.uploads)
 
 
+class TestAnchorsToTheScoredReference:
+    """Two bugs found on 2026-08-04 after a real re-anchor moved identity by +0.014.
+
+    The seed came out at 0.677 against ground truth where the raw frame was 0.663 — a full
+    face swap that accomplished nothing. Cause was a mismatch on BOTH ends: it swapped the
+    wrong face IN, onto the wrong face in the frame."""
+
+    @pytest.mark.asyncio
+    async def test_prefers_the_job_ground_truth_over_a_separate_portrait(self):
+        """Identity is scored against the job's starting image. Anchoring to a different
+        portrait pulls the seed toward a face nobody is measuring."""
+        seg = make_segment(
+            seed_faceswap=True, faceswap_enabled=True,
+            faceswap_image="Kelly_young_driveway.jpg",
+            identity_ground_truth="seg0_start.png",
+        )
+        comfy = FakeComfy()
+        out = await _reanchor_seed_frame(seg, RAW_SEED, comfy, FakeQueue(), FakeProgress())
+        assert out == SWAPPED
+        assert comfy.submitted["188"]["inputs"]["image"] == "seg0_start.png"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_faceswap_face_without_ground_truth(self):
+        seg = make_segment(
+            seed_faceswap=True, faceswap_enabled=True,
+            faceswap_image="portrait.png", identity_ground_truth=None,
+        )
+        comfy = FakeComfy()
+        await _reanchor_seed_frame(seg, RAW_SEED, comfy, FakeQueue(), FakeProgress())
+        assert comfy.submitted["188"]["inputs"]["image"] == "portrait.png"
+
+    @pytest.mark.asyncio
+    async def test_forces_facefusion_even_when_the_video_uses_reactor(self):
+        """ReActor picks the target face by POSITION (faces_index 0, left-right). On a
+        two-person frame that is the leftmost face — frequently the wrong person. It still
+        rewrites pixels, so the caller's diff reads success while her face is untouched.
+        FaceFusion selects by reference, matching the source face, which is the only correct
+        semantics here."""
+        seg = make_segment(
+            seed_faceswap=True, faceswap_enabled=True, faceswap_image="f.png",
+            faceswap_method="reactor", faceswap_faces_index="0",
+            faceswap_faces_order="left-right",
+        )
+        comfy = FakeComfy()
+        await _reanchor_seed_frame(seg, RAW_SEED, comfy, FakeQueue(), FakeProgress())
+        node = comfy.submitted["183"]
+        assert node["class_type"] == "AdvancedSwapFaceImage", node["class_type"]
+        assert node["inputs"]["face_selector_mode"] == "reference"
+
+
 class TestDegradesToRawSeed:
     """A failed re-anchor must cost nothing: the raw frame still seeds the next segment."""
 
