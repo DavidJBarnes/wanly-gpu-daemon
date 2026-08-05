@@ -312,3 +312,29 @@ class TestFlagPlumbing:
         """The seed re-anchor is a separate decision from swapping the whole clip."""
         seg = make_segment(seed_faceswap=True, faceswap_enabled=False)
         assert seg.seed_faceswap is True and seg.faceswap_enabled is False
+
+
+class TestSwapperTunables:
+    """face_swapper_model and pixel_boost were hardcoded, which made the swap stage
+    untunable - and a controlled sweep put the remaining headroom there, not in generation
+    (no LoRA at all scores mean 0.695, same as a purpose-trained one)."""
+
+    def test_defaults_preserve_the_validated_recipe(self):
+        from daemon.workflow_builder import _add_faceswap
+        wf: dict = {}
+        seg = make_segment(faceswap_enabled=True, faceswap_image="f.png",
+                           faceswap_method="facefusion")
+        _add_faceswap(wf, seg)
+        assert wf["183"]["inputs"]["face_swapper_model"] == "inswapper_128"
+        assert wf["183"]["inputs"]["pixel_boost"] == "512x512"
+
+    def test_segment_can_override_both(self):
+        from daemon.workflow_builder import _add_faceswap
+        wf: dict = {}
+        seg = make_segment(faceswap_enabled=True, faceswap_image="f.png",
+                           faceswap_method="facefusion",
+                           faceswap_model="hyperswap_1c_256",
+                           faceswap_pixel_boost="256x256")
+        _add_faceswap(wf, seg)
+        assert wf["183"]["inputs"]["face_swapper_model"] == "hyperswap_1c_256"
+        assert wf["183"]["inputs"]["pixel_boost"] == "256x256"
