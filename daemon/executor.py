@@ -173,6 +173,28 @@ def _images_differ(a: bytes, b: bytes, threshold: float = 1.0) -> bool:
     return float(np.abs(ia.astype(np.int16) - ib.astype(np.int16)).mean()) > threshold
 
 
+async def _clean_seed_frame(history: dict, comfyui: ComfyUIClient) -> bytes | None:
+    """Fetch the pre-swap last frame the workflow saved at node 206, if it is there.
+
+    Returns None when faceswap was off (no such node) or the download fails, in which case the
+    caller falls back to extracting from the finished video. Never raises: a missing seed must
+    degrade to the old behaviour, not fail a completed generation."""
+    try:
+        node = (history.get("outputs") or {}).get("206") or {}
+        images = node.get("images") or []
+        if not images:
+            return None
+        im = images[0]
+        data = await comfyui.download_output(
+            im["filename"], im.get("subfolder", ""), im.get("type", "output"),
+        )
+        _validate_image_data(data, "clean_seed")
+        return data
+    except Exception as e:
+        logger.warning("clean seed unavailable (%s) - falling back to the swapped frame", e)
+        return None
+
+
 async def _reanchor_seed_frame(
     segment: SegmentClaim,
     last_frame_data: bytes,
@@ -888,7 +910,16 @@ async def execute_segment(
         # Step 7: Extract last frame + measure motion + upload
         t0 = time.monotonic()
         await progress.log("[7/7] Extracting last frame and uploading...")
-        last_frame_data = await _extract_last_frame(video_data)
+        # Prefer the PRE-SWAP last frame as the continuation seed. A swap costs ~18% of face
+        # detail (inswapper rebuilds the face from a 512-d embedding), and seeding the next
+        # segment from a swapped frame makes that compound: measured 233 -> 130 across seg0,
+        # 101 after it became conditioning, 79 by the end of seg1. The seed does not need to
+        # carry identity -- the next segment's own faceswap restores it on every output frame.
+        last_frame_data = await _clean_seed_frame(history, comfyui)
+        if last_frame_data is not None:
+            await progress.log("[7/7] Using pre-swap frame as continuation seed")
+        else:
+            last_frame_data = await _extract_last_frame(video_data)
 
         # Seed re-anchor: faceswap the last frame to the canonical identity before it seeds
         # the next segment (only fires when API resolved seed_faceswap=True). Never raises.

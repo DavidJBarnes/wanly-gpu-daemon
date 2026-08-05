@@ -338,3 +338,66 @@ class TestSwapperTunables:
         _add_faceswap(wf, seg)
         assert wf["183"]["inputs"]["face_swapper_model"] == "hyperswap_1c_256"
         assert wf["183"]["inputs"]["pixel_boost"] == "256x256"
+
+
+class TestCleanContinuationSeed:
+    """The deliverable keeps the swap; the frame that seeds the NEXT segment should not.
+
+    Measured on a real 2x5s chain: face detail ran 233 -> 130 across seg0, fell to 101 once
+    that swapped frame became conditioning, then 101 -> 79 through seg1 — 66% of facial detail
+    gone. A swap costs ~18% because inswapper rebuilds the face from a 512-d embedding, and
+    seeding from a swapped frame compounds that every segment. Identity does not need to ride
+    on the seed: the next segment's own faceswap restores it on every output frame."""
+
+    def test_workflow_saves_the_pre_swap_frame_when_swapping(self):
+        from daemon.workflow_builder import build_workflow
+        seg = make_segment(faceswap_enabled=True, faceswap_image="f.png",
+                           faceswap_method="facefusion", duration_seconds=3.0)
+        wf = build_workflow(seg, start_image_filename="start.png")
+        assert "205" in wf and wf["205"]["class_type"] == "ImageFromBatch"
+        # node 87 is the raw VAEDecode batch - 183 would be the swapped one
+        assert wf["205"]["inputs"]["image"] == ["87", 0]
+        assert wf["206"]["inputs"]["images"] == ["205", 0]
+
+    def test_seed_index_is_pre_rife(self):
+        """Node 87 holds wan_frames, not the interpolated total; an out-of-range index would
+        silently clamp to the wrong frame."""
+        from daemon.workflow_builder import build_workflow, _calculate_generation_params
+        seg = make_segment(faceswap_enabled=True, faceswap_image="f.png",
+                           faceswap_method="facefusion", duration_seconds=3.0)
+        wf = build_workflow(seg, start_image_filename="start.png")
+        gen = _calculate_generation_params(seg.fps, seg.duration_seconds, seg.speed)
+        assert wf["205"]["inputs"]["batch_index"] == gen["wan_frames"] - 1
+
+    def test_no_clean_seed_nodes_without_faceswap(self):
+        """Without a swap the video frames ARE the clean frames - the extra save would just
+        cost time."""
+        from daemon.workflow_builder import build_workflow
+        seg = make_segment(faceswap_enabled=False, duration_seconds=3.0)
+        wf = build_workflow(seg, start_image_filename="start.png")
+        assert "205" not in wf and "206" not in wf
+
+    @pytest.mark.asyncio
+    async def test_clean_seed_returns_none_when_absent(self):
+        """Falls back to extracting from the finished video rather than failing a completed
+        30-minute generation."""
+        from daemon.executor import _clean_seed_frame
+        assert await _clean_seed_frame({"outputs": {}}, FakeComfy()) is None
+
+    @pytest.mark.asyncio
+    async def test_clean_seed_downloads_node_206(self):
+        from daemon.executor import _clean_seed_frame
+        comfy = FakeComfy(output=SWAPPED)
+        hist = {"outputs": {"206": {"images": [{"filename": "clean_seed_0001.png"}]}}}
+        assert await _clean_seed_frame(hist, comfy) == SWAPPED
+
+    @pytest.mark.asyncio
+    async def test_clean_seed_never_raises_on_download_failure(self):
+        from daemon.executor import _clean_seed_frame
+
+        class Boom(FakeComfy):
+            async def download_output(self, *a, **k):
+                raise RuntimeError("s3 exploded")
+
+        hist = {"outputs": {"206": {"images": [{"filename": "x.png"}]}}}
+        assert await _clean_seed_frame(hist, Boom()) is None

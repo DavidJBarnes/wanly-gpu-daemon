@@ -651,6 +651,29 @@ def build_workflow(
         "_meta": {"title": f"RIFE {rife_multiplier}x Interpolation"},
     }
 
+    # Clean continuation seed: the last PRE-SWAP frame, saved alongside the swapped video.
+    #
+    # The deliverable keeps the swap, but the frame that seeds the NEXT segment should not.
+    # Measured on a real 2x5s chain: face detail runs 233 -> 130 across seg0, drops to 101 as
+    # that swapped frame becomes conditioning, then 101 -> 79 in seg1 — 66% of facial detail
+    # gone by the end. A swap costs ~18% detail because inswapper rebuilds the face from a
+    # 512-d embedding, and seeding from it makes that cost compound segment over segment.
+    #
+    # The seed does not need to carry identity: the next segment's own faceswap restores it on
+    # every output frame. So seed from the sharp original instead and let the swap do its job
+    # downstream. Pre-RIFE index, because node 87 is the raw VAEDecode batch.
+    if faceswap:
+        workflow["205"] = {
+            "class_type": "ImageFromBatch",
+            "inputs": {"image": ["87", 0], "batch_index": gen["wan_frames"] - 1, "length": 1},
+            "_meta": {"title": "Last frame, pre-swap"},
+        }
+        workflow["206"] = {
+            "class_type": "SaveImage",
+            "inputs": {"filename_prefix": "clean_seed", "images": ["205", 0]},
+            "_meta": {"title": "Clean continuation seed"},
+        }
+
     # VHS_VideoCombine output — always reads from RIFE (last processing step)
     video_input = ["200", 0]
     workflow["186"] = {
