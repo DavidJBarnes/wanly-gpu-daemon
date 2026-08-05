@@ -334,3 +334,39 @@ class TestGroundTruthIsSegmentZeroStartFrame:
     def test_no_hardcoded_identity_face_map_remains(self):
         from daemon import executor
         assert not hasattr(executor, "_HARDCODE_IDENTITY_FACE")
+
+
+class TestFaceDetail:
+    """Cosine is largely blur-invariant, so it cannot see a face going soft.
+
+    On a real 2x5s chain, face detail fell 233 -> 79 (66%) while identity moved only
+    0.901 -> 0.870. David could see it; the metric could not. Detail is measured as Laplacian
+    variance of the face crop resized to a fixed 128x128, so it tracks sharpness rather than
+    how big the face happens to be in frame."""
+
+    def test_score_exposes_detail_fields(self):
+        from daemon.identity_score import IdentityScore
+        f = IdentityScore.__dataclass_fields__
+        for name in ("face_sharp_mean", "face_sharp_start", "face_sharp_end"):
+            assert name in f, name
+            assert f[name].default is None, f"{name} must default None - older clips have none"
+
+    def test_summary_reports_detail_when_present(self):
+        from daemon.identity_score import IdentityScore
+        s = IdentityScore(
+            frames=10, faces_detected=10, no_face=0, mean_cos_start=0.9, mean_cos_ref=0.9,
+            min_cos_start=0.8, slope=0.0, face_px_p50=100.0, yaw_max=3.0,
+            start_cos_ref=0.95, end_cos_ref=0.90,
+            face_sharp_mean=150.0, face_sharp_start=233.0, face_sharp_end=79.0,
+        )
+        assert "detail 233->79" in s.summary()
+
+    def test_summary_omits_detail_when_unmeasured(self):
+        """Faces under 40px are skipped, so a clip can legitimately have no detail reading."""
+        from daemon.identity_score import IdentityScore
+        s = IdentityScore(
+            frames=10, faces_detected=10, no_face=0, mean_cos_start=0.9, mean_cos_ref=0.9,
+            min_cos_start=0.8, slope=0.0, face_px_p50=100.0, yaw_max=3.0,
+            start_cos_ref=0.95, end_cos_ref=0.90,
+        )
+        assert "detail" not in s.summary()

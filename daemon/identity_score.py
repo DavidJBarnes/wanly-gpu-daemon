@@ -84,6 +84,14 @@ class IdentityScore:
     slope: Optional[float]           # cosine per frame, vs whichever ref was available
     face_px_p50: Optional[float]
     yaw_max: Optional[float]
+    # Face DETAIL, which cosine cannot see: ArcFace is largely blur-invariant, so a face can
+    # stay unmistakably her while going soft. Measured on a real 2x5s chain, detail fell 233 ->
+    # 79 (66%) while identity moved only 0.901 -> 0.870 -- David could see it, the metric could
+    # not. Laplacian variance of the face crop, resized to a fixed 128x128 so this tracks
+    # sharpness rather than how big the face happens to be.
+    face_sharp_mean: Optional[float] = None
+    face_sharp_start: Optional[float] = None
+    face_sharp_end: Optional[float] = None
     metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -102,6 +110,10 @@ class IdentityScore:
             bits.append(f"{self.mean_cos_start:.3f} vs start")
         if self.mean_cos_ref is not None:
             bits.append(f"{self.mean_cos_ref:.3f} vs ref")
+        if self.face_sharp_start is not None and self.face_sharp_end is not None:
+            # Surfaced in the one-line log because cosine cannot see it: a face can hold
+            # identity while going visibly soft, and that only shows up here.
+            bits.append(f"detail {self.face_sharp_start:.0f}->{self.face_sharp_end:.0f}")
         if self.slope is not None:
             bits.append(f"drift {self.slope * max(self.frames - 1, 1):+.3f} over {self.frames}f")
         if self.no_face:
@@ -181,6 +193,7 @@ def score_video(
         examined = no_face = 0
         cs_start: list[float] = []
         cs_ref: list[float] = []
+        sharps: list[float] = []
         slope_x: list[int] = []
         slope_y: list[float] = []
         face_px: list[float] = []
@@ -213,6 +226,11 @@ def score_video(
             slope_x.append(idx)
             slope_y.append(primary)
             face_px.append(float(f.bbox[2] - f.bbox[0]))
+            x1, y1, x2, y2 = (max(0, int(v)) for v in f.bbox)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size and (x2 - x1) >= 40:
+                g = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (128, 128))
+                sharps.append(float(cv2.Laplacian(g, cv2.CV_64F).var()))
             yaws.append(abs(float(f.pose[1])))
             idx += 1
         cap.release()
@@ -255,12 +273,20 @@ def score_video(
             slope=slope,
             face_px_p50=float(np.percentile(face_px, 50)),
             yaw_max=float(np.max(ys)),
+            face_sharp_mean=float(np.mean(sharps)) if sharps else None,
+            face_sharp_start=float(np.mean(sharps[:3])) if len(sharps) >= 3 else None,
+            face_sharp_end=float(np.mean(sharps[-3:])) if len(sharps) >= 3 else None,
             metrics={
                 "stride": stride,
                 "total_frames": total,
                 "multi_face_frames": multi_face,
                 "face_px_min": float(np.min(face_px)),
                 "face_px_max": float(np.max(face_px)),
+                # Rides in metrics rather than its own columns: identity_metrics is already
+                # persisted as JSON, so this needs no migration and no API change.
+                "face_sharp_mean": round(float(np.mean(sharps)), 1) if sharps else None,
+                "face_sharp_start": round(float(np.mean(sharps[:3])), 1) if len(sharps) >= 3 else None,
+                "face_sharp_end": round(float(np.mean(sharps[-3:])), 1) if len(sharps) >= 3 else None,
                 "yaw_bands": bands,
                 "series": [round(v, 4) for v in slope_y[:600]],
             },
