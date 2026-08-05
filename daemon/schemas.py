@@ -31,6 +31,8 @@ class SegmentClaim(BaseModel):
     faceswap_method: Optional[str] = None
     faceswap_source_type: Optional[str] = None
     faceswap_image: Optional[str] = None
+    faceswap_model: Optional[str] = None
+    faceswap_pixel_boost: Optional[str] = None
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
     initial_reference_image: Optional[str] = None

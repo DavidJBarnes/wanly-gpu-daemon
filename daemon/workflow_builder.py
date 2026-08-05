@@ -332,9 +332,14 @@ def _add_faceswap(
             "source_images": ["188", 0],
             "target_image": [input_node, 0],
             "api_token": "-1",
-            "face_swapper_model": "inswapper_128",
+            # inswapper_128 is 128px native, so a 256/512 model stretches the crop
+            # half as far or not at all. The node's own default is hyperswap_1c_256.
+            "face_swapper_model": segment.faceswap_model or "inswapper_128",
             "face_detector_model": "retinaface",
-            "pixel_boost": "512x512",
+            # 512x512 on a ~100px face interpolates 5x then pixel-unshuffles into 16
+            # strided sub-images carrying no extra real signal - ~16x compute for nothing.
+            # Only worth raising when the face genuinely has >128px of detail.
+            "pixel_boost": segment.faceswap_pixel_boost or "512x512",
             "face_occluder_model": "xseg_1",
             "face_parser_model": "bisenet_resnet_34",
             "face_mask_blur": 0.3,
