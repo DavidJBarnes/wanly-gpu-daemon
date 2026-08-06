@@ -917,7 +917,7 @@ async def execute_segment(
         # carry identity -- the next segment's own faceswap restores it on every output frame.
         last_frame_data = await _clean_seed_frame(history, comfyui)
         if last_frame_data is not None:
-            await progress.log("[7/7] Using pre-swap frame as continuation seed")
+            await progress.log("[7/7] Continuation seed taken BEFORE the faceswap (keeps face detail)")
         else:
             last_frame_data = await _extract_last_frame(video_data)
 
