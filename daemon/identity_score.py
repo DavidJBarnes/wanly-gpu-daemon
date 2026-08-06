@@ -222,7 +222,13 @@ def score_video(
                 cs_start.append(_cos(emb, emb_start))
             if emb_ref is not None:
                 cs_ref.append(_cos(emb, emb_ref))
-            primary = cs_start[-1] if emb_start is not None else cs_ref[-1]
+            # Prefer the GROUND TRUTH (the job's start image) over this segment's own start
+            # frame. They are the same image on segment 0, but on a continuation the own-start
+            # reference is the already-drifted last frame -- so a segment could read as stable
+            # while identity had collapsed since the job began. The headline trajectory is vs
+            # ground truth, so the series, the slope and the yaw bands must be too or the panel
+            # contradicts the numbers printed above it.
+            primary = cs_ref[-1] if emb_ref is not None else cs_start[-1]
             slope_x.append(idx)
             slope_y.append(primary)
             face_px.append(float(f.bbox[2] - f.bbox[0]))
@@ -288,7 +294,13 @@ def score_video(
                 "face_sharp_start": round(float(np.mean(sharps[:3])), 1) if len(sharps) >= 3 else None,
                 "face_sharp_end": round(float(np.mean(sharps[-3:])), 1) if len(sharps) >= 3 else None,
                 "yaw_bands": bands,
+                # Which reference `series`, `slope` and `yaw_bands` are measured against.
+                # Older clips predate this field and are all vs the segment's own start frame.
+                "series_ref": "ground_truth" if emb_ref is not None else "own_start",
                 "series": [round(v, 4) for v in slope_y[:600]],
+                # Within-segment drift, for contrast: how far the face moved from where THIS
+                # segment began, independent of what it inherited.
+                "series_own_start": [round(v, 4) for v in cs_start[:600]] if cs_start else None,
             },
         ), ""
     except ModuleNotFoundError as e:
