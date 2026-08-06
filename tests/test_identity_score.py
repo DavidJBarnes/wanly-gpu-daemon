@@ -370,3 +370,45 @@ class TestFaceDetail:
             start_cos_ref=0.95, end_cos_ref=0.90,
         )
         assert "detail" not in s.summary()
+
+
+class TestSeriesReference:
+    """The per-frame series, the slope and the yaw bands must read the SAME reference as the
+    headline trajectory, which is the job's ground truth.
+
+    They did not. `primary` preferred the segment's OWN start frame, and on a continuation that
+    is the already-drifted last frame -- so the graph started at ~0.95 while the numbers printed
+    directly above it read 0.851. Confirmed on real data: every seg1 series began near 0.95
+    regardless of a cumulative start of 0.851-0.914. Harmless on segment 0, where both
+    references are the same image; misleading on everything after it."""
+
+    def test_ground_truth_is_preferred_over_own_start(self):
+        import inspect
+        from daemon import identity_score
+        src = inspect.getsource(identity_score.score_video)
+        assert "primary = cs_ref[-1] if emb_ref is not None else cs_start[-1]" in src, \
+            "series/slope/bands must prefer the ground-truth reference"
+
+    def test_metrics_declare_which_reference_was_used(self):
+        """Clips scored before this change are all vs own_start and have no such field, so a
+        reader must be able to tell them apart rather than assuming."""
+        import inspect
+        from daemon import identity_score
+        src = inspect.getsource(identity_score.score_video)
+        assert '"series_ref": "ground_truth" if emb_ref is not None else "own_start"' in src
+
+    def test_own_start_series_is_still_recorded(self):
+        """Within-segment drift stays available -- it answers a different question (how far did
+        the face move from where THIS segment began) and is what the dip detector wants."""
+        import inspect
+        from daemon import identity_score
+        assert '"series_own_start"' in inspect.getsource(identity_score.score_video)
+
+    def test_mean_and_min_cos_start_still_read_cs_start(self):
+        """Only slope, bands and series move. mean_cos_start/min_cos_start are explicitly the
+        vs-own-start figures and must not silently become vs-truth."""
+        import inspect
+        from daemon import identity_score
+        src = inspect.getsource(identity_score.score_video)
+        assert "mean_cos_start=float(np.mean(cs_start))" in src
+        assert "min_cos_start=float(np.min(cs_start))" in src
