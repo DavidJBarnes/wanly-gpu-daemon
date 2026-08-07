@@ -25,7 +25,7 @@ MIN_SIZES = {
 # Multiple subfolders because ComfyUI searches several dirs per model type
 # (e.g. CLIPLoader searches both clip/ and text_encoders/)
 #
-# One engine, one list: the native Wan 2.2 i2v path. Mirrors what wanly-runpod's
+# One engine, one list: the native Wan 2.2 i2v path. Mirrors what wanly-gpu-docker's
 # download_models.sh stages — a worker validates exactly what it was provisioned with.
 MODEL_CHECKS = [
     ("vae_model",           "VAELoader",            ["vae"],                    MIN_SIZES["vae"]),
