@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     # embedding agreement.
     identity_scoring_gpu: bool = False
 
+    # How long a drain waits for the in-flight segment before giving up.
+    #
+    # Was 600s, which is shorter than the work: measured segments run 329s at 480p/3s, ~570s at
+    # 480p/5s and ~1780s at 720x1056/5s. A drain during a 720p segment hit the old timeout at
+    # the 10 minute mark and abandoned ~20 minutes of finished-but-unreported work. Now generous
+    # by default, because the cost of waiting too long is a slightly later shutdown, while the
+    # cost of not waiting long enough is a discarded segment.
+    drain_wait_seconds: int = 3600
+
     # Motion matching (optical flow based)
     motion_matching_enabled: bool = True  # Enable automatic motion amplitude matching
     motion_amplitude_default: float = 1.3  # Default motion_amplitude for segment 0
