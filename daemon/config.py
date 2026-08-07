@@ -49,11 +49,19 @@ class Settings(BaseSettings):
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
     painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
 
-    # Identity scoring. Scoring runs AFTER generation and BEFORE the next claim, so on a box
-    # where the daemon owns the card it can use the GPU freely — VRAM is back down to ~2GB by
-    # then. Set false on the 3090, which shares its card with A1111 and sd-scripts and may not
-    # have the headroom. Falls back to CPU on its own if the CUDA provider won't load.
-    identity_scoring_gpu: bool = True
+    # Identity scoring device. Defaults to CPU, which is what every recorded identity score to
+    # date was produced on.
+    #
+    # Moving it to GPU is issue #106 and is NOT yet justified: the measurement that motivated it
+    # (scoring = 23-29% of job time) did not reproduce — a later run scored 289 frames in 9s, and
+    # motion analysis, not scoring, dominated that phase. Worse, nobody has yet checked whether
+    # CUDA and CPU produce the SAME embeddings. If they differ, every score after the switch sits
+    # on a different scale from every score before it, and the recorded history stops being
+    # comparable — the same hazard the DET_SIZE comment warns about.
+    #
+    # So: opt in per worker, never on by default, until #106 measures both the speedup and the
+    # embedding agreement.
+    identity_scoring_gpu: bool = False
 
     # Motion matching (optical flow based)
     motion_matching_enabled: bool = True  # Enable automatic motion amplitude matching
