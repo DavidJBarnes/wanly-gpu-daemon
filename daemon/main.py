@@ -288,8 +288,11 @@ async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutd
                 logger.error("Failed to report hologram failure: %s", report_err)
 
 
-async def _stop_runpod_pod() -> bool:
-    """Call RunPod API to stop this pod. Returns True if the pod was told to stop.
+async def _terminate_runpod_pod() -> bool:
+    """Terminate this pod. Returns True if RunPod accepted the termination.
+
+    Terminate, not stop. podStop leaves the pod EXITED and still billing for its disk; the
+    operator then has to notice and clean it up by hand. A drained worker should cost nothing.
 
     Missing credentials are logged loudly rather than ignored: this runs at the end of a
     drain, and if the pod does not actually stop the container respawns, the daemon
@@ -302,7 +305,7 @@ async def _stop_runpod_pod() -> bool:
     api_key = settings.runpod_api_key
     if not pod_id or not api_key:
         logger.warning(
-            "Drained, but cannot stop the pod: RUNPOD_POD_ID=%s, RUNPOD_API_KEY=%s. "
+            "Drained, but cannot terminate the pod: RUNPOD_POD_ID=%s, RUNPOD_API_KEY=%s. "
             "The container will respawn and this worker will start claiming work again. "
             "Set both as pod environment variables to make drain actually stop the pod.",
             "set" if pod_id else "MISSING",
@@ -310,22 +313,25 @@ async def _stop_runpod_pod() -> bool:
         )
         return False
 
-    logger.info("Stopping RunPod pod %s ...", pod_id)
-    query = f'mutation {{ podStop(input: {{podId: "{pod_id}"}}) {{ id desiredStatus }} }}'
+    logger.info("Terminating RunPod pod %s ...", pod_id)
     try:
         async with _httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://api.runpod.io/graphql?api_key={api_key}",
-                json={"query": query},
+            resp = await client.delete(
+                f"https://rest.runpod.io/v1/pods/{pod_id}",
+                headers={"Authorization": f"Bearer {api_key}"},
             )
+            # 404 means it is already gone, which is the state we wanted.
+            if resp.status_code == 404:
+                logger.info("RunPod pod %s already gone", pod_id)
+                return True
             resp.raise_for_status()
-            logger.info("RunPod stop response: %s", resp.text)
+            logger.info("RunPod pod %s terminated", pod_id)
             return True
     except Exception as e:
         # A revoked API key lands here as a 401. That is not hypothetical: the key baked into
         # the pod template was revoked, every drain 401'd, and because the failure was silent
         # the worker simply carried on taking jobs. See wanly-console#286.
-        logger.error("Failed to stop RunPod pod: %s", e)
+        logger.error("Failed to terminate RunPod pod: %s", e)
     return False
 
 
@@ -470,15 +476,28 @@ async def run():
         await asyncio.gather(heartbeat_task, job_task, holo_task)
     finally:
         # Graceful shutdown: wait for current segment if executing
+        segment_abandoned = False
         if executing_event.is_set():
-            logger.info("Waiting for current segment to finish (up to 10 minutes)...")
+            # executing_event wraps the WHOLE of execute_segment, including the [7/7] upload —
+            # so clearing it means the segment is finished and reported, not merely that the GPU
+            # went quiet. That distinction matters: decode, RIFE, stitching, faceswap and
+            # identity scoring all run after the GPU idles, for 47s to over 2 minutes.
+            logger.info(
+                "Waiting for current segment to finish (up to %ds)...",
+                settings.drain_wait_seconds,
+            )
             try:
                 await asyncio.wait_for(
                     asyncio.create_task(_wait_for_clear(executing_event)),
-                    timeout=600,
+                    timeout=settings.drain_wait_seconds,
                 )
             except asyncio.TimeoutError:
-                logger.warning("Timed out waiting for segment, forcing shutdown")
+                segment_abandoned = True
+                logger.error(
+                    "Timed out after %ds waiting for the segment to finish. It is still "
+                    "running. NOT terminating the pod — that would destroy work in progress.",
+                    settings.drain_wait_seconds,
+                )
 
         # Stop the pod BEFORE deregistering, not after.
         #
@@ -488,11 +507,24 @@ async def run():
         # depends on. So if the pod does not actually stop, the container respawns, the daemon
         # registers fresh as online-idle, and goes straight back to claiming work. The drain is
         # silently undone, which is indistinguishable from the drain never having been requested.
-        stopped = False
+        terminated = False
         on_runpod = bool(settings.runpod_pod_id)
+        if drain_event.is_set() and on_runpod and segment_abandoned:
+            # Park rather than terminate. The segment is still running inside this container;
+            # destroying the pod now loses it outright.
+            logger.error(
+                "DRAIN INCOMPLETE: segment still running past the drain timeout. Staying "
+                "registered as 'draining' and NOT terminating. Raise DRAIN_WAIT_SECONDS if "
+                "segments legitimately take this long."
+            )
+            await queue.close()
+            await comfyui.close()
+            while True:
+                await asyncio.sleep(3600)
+
         if drain_event.is_set() and on_runpod:
-            stopped = await _stop_runpod_pod()
-            if not stopped:
+            terminated = await _terminate_runpod_pod()
+            if not terminated:
                 # Park. Do not deregister, do not exit.
                 #
                 # Exiting would respawn the container into the same failed drain, in a loop.
@@ -500,10 +532,10 @@ async def run():
                 # worker that is visibly not finishing — which is the honest picture — and the
                 # job poll loop has already stopped, so it claims nothing while parked.
                 logger.error(
-                    "DRAIN INCOMPLETE: the pod is still running and could not be stopped. "
+                    "DRAIN INCOMPLETE: the pod is still running and could not be terminated. "
                     "Staying registered as 'draining' so this worker does NOT resume claiming "
-                    "work. Stop the pod from the RunPod console, and check that RUNPOD_API_KEY "
-                    "is valid — a revoked key returns 401 here."
+                    "work. Terminate the pod from the RunPod console, and check RUNPOD_API_KEY "
+                    "— a revoked key returns 401 here."
                 )
                 await queue.close()
                 await comfyui.close()

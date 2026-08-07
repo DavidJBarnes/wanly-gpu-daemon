@@ -1,6 +1,6 @@
-"""Tests for _stop_runpod_pod's handling of missing RunPod credentials.
+"""Tests for _terminate_runpod_pod's handling of missing RunPod credentials.
 
-The regression this guards: _stop_runpod_pod returned silently when RUNPOD_POD_ID or
+The regression this guards: the terminate call returned silently when RUNPOD_POD_ID or
 RUNPOD_API_KEY was unset. That runs at the end of a drain — so the pod kept running, the
 container respawned, the daemon re-registered and resumed claiming work, and the log said
 nothing at all about why the drain appeared to do nothing.
@@ -26,7 +26,7 @@ class TestMissingCredentials:
         monkeypatch.setattr(main.settings, "runpod_pod_id", pod_id)
         monkeypatch.setattr(main.settings, "runpod_api_key", api_key)
         with caplog.at_level(logging.WARNING, logger=main.logger.name):
-            await main._stop_runpod_pod()
+            await main._terminate_runpod_pod()
         assert caplog.records, "missing credentials must not fail silently"
         msg = caplog.records[-1].getMessage()
         assert expect_missing in msg
@@ -36,14 +36,14 @@ class TestMissingCredentials:
         """It runs inside the shutdown finally-block; raising would mask the real path."""
         monkeypatch.setattr(main.settings, "runpod_pod_id", "")
         monkeypatch.setattr(main.settings, "runpod_api_key", "")
-        await main._stop_runpod_pod()  # must simply return
+        await main._terminate_runpod_pod()  # must simply return
 
     async def test_set_credentials_are_reported_as_set(self, monkeypatch, caplog):
         """Only the absent one is named — so the log points at the actual gap."""
         monkeypatch.setattr(main.settings, "runpod_pod_id", "pod123")
         monkeypatch.setattr(main.settings, "runpod_api_key", "")
         with caplog.at_level(logging.WARNING, logger=main.logger.name):
-            await main._stop_runpod_pod()
+            await main._terminate_runpod_pod()
         msg = caplog.records[-1].getMessage()
         assert "RUNPOD_POD_ID=set" in msg
         assert "RUNPOD_API_KEY=MISSING" in msg
@@ -59,7 +59,7 @@ class TestReturnValue:
     async def test_returns_false_when_credentials_missing(self, monkeypatch):
         monkeypatch.setattr(main.settings, "runpod_pod_id", "")
         monkeypatch.setattr(main.settings, "runpod_api_key", "")
-        assert await main._stop_runpod_pod() is False
+        assert await main._terminate_runpod_pod() is False
 
     async def test_returns_false_when_the_api_rejects_the_key(self, monkeypatch):
         """A revoked key 401s. That is what actually happened, and it must not read as success."""
@@ -70,6 +70,7 @@ class TestReturnValue:
 
         class _Resp:
             text = "unauthorized"
+            status_code = 401
 
             def raise_for_status(self):
                 raise httpx.HTTPStatusError(
@@ -84,11 +85,11 @@ class TestReturnValue:
             async def __aexit__(self, *a):
                 return False
 
-            async def post(self, *a, **k):
+            async def delete(self, *a, **k):
                 return _Resp()
 
         monkeypatch.setattr(httpx, "AsyncClient", lambda **k: _Client())
-        assert await main._stop_runpod_pod() is False
+        assert await main._terminate_runpod_pod() is False
 
     async def test_returns_true_on_success(self, monkeypatch):
         import httpx
@@ -97,7 +98,8 @@ class TestReturnValue:
         monkeypatch.setattr(main.settings, "runpod_api_key", "goodkey")
 
         class _Resp:
-            text = '{"data":{"podStop":{"id":"pod123"}}}'
+            text = ""
+            status_code = 204
 
             def raise_for_status(self):
                 return None
@@ -109,8 +111,38 @@ class TestReturnValue:
             async def __aexit__(self, *a):
                 return False
 
-            async def post(self, *a, **k):
+            async def delete(self, *a, **k):
                 return _Resp()
 
         monkeypatch.setattr(httpx, "AsyncClient", lambda **k: _Client())
-        assert await main._stop_runpod_pod() is True
+        assert await main._terminate_runpod_pod() is True
+
+
+class TestDrainWaitWindow:
+    """The drain must outlast a real segment.
+
+    The old timeout was 600s. Measured segment durations on the same worker:
+
+        480p / 3s  ->  329s
+        480p / 5s  ->  566s, 575s
+        720x1056/5s -> 1774s, 1787s
+
+    So a drain issued during a 720p segment gave up at the 10 minute mark and abandoned roughly
+    twenty more minutes of work that was about to finish. With terminate rather than stop, that
+    stops being wasted time and becomes a destroyed pod with the segment still inside it.
+    """
+
+    def test_default_outlasts_the_longest_measured_segment(self):
+        from daemon.config import Settings
+
+        longest_measured = 1787.4
+        assert Settings().drain_wait_seconds > longest_measured, (
+            "the drain wait must exceed a real 720p segment, or draining discards finished work"
+        )
+
+    def test_is_configurable_per_worker(self, monkeypatch):
+        """Bigger shapes will take longer than anything measured so far."""
+        monkeypatch.setenv("DRAIN_WAIT_SECONDS", "7200")
+        from daemon.config import Settings
+
+        assert Settings().drain_wait_seconds == 7200
