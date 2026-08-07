@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
     painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
 
+    # Identity scoring. Scoring runs AFTER generation and BEFORE the next claim, so on a box
+    # where the daemon owns the card it can use the GPU freely — VRAM is back down to ~2GB by
+    # then. Set false on the 3090, which shares its card with A1111 and sd-scripts and may not
+    # have the headroom. Falls back to CPU on its own if the CUDA provider won't load.
+    identity_scoring_gpu: bool = True
+
     # Motion matching (optical flow based)
     motion_matching_enabled: bool = True  # Enable automatic motion amplitude matching
     motion_amplitude_default: float = 1.3  # Default motion_amplitude for segment 0

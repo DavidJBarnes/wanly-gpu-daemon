@@ -47,3 +47,70 @@ class TestMissingCredentials:
         msg = caplog.records[-1].getMessage()
         assert "RUNPOD_POD_ID=set" in msg
         assert "RUNPOD_API_KEY=MISSING" in msg
+
+
+class TestReturnValue:
+    """The caller now decides whether to deregister based on this, so it has to be honest.
+
+    Before wanly-console#286 the function returned None either way and the shutdown path
+    deregistered regardless — so a failed stop silently discarded the pending drain.
+    """
+
+    async def test_returns_false_when_credentials_missing(self, monkeypatch):
+        monkeypatch.setattr(main.settings, "runpod_pod_id", "")
+        monkeypatch.setattr(main.settings, "runpod_api_key", "")
+        assert await main._stop_runpod_pod() is False
+
+    async def test_returns_false_when_the_api_rejects_the_key(self, monkeypatch):
+        """A revoked key 401s. That is what actually happened, and it must not read as success."""
+        import httpx
+
+        monkeypatch.setattr(main.settings, "runpod_pod_id", "pod123")
+        monkeypatch.setattr(main.settings, "runpod_api_key", "revoked")
+
+        class _Resp:
+            text = "unauthorized"
+
+            def raise_for_status(self):
+                raise httpx.HTTPStatusError(
+                    "401 Unauthorized", request=httpx.Request("POST", "http://x"),
+                    response=httpx.Response(401),
+                )
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                return _Resp()
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **k: _Client())
+        assert await main._stop_runpod_pod() is False
+
+    async def test_returns_true_on_success(self, monkeypatch):
+        import httpx
+
+        monkeypatch.setattr(main.settings, "runpod_pod_id", "pod123")
+        monkeypatch.setattr(main.settings, "runpod_api_key", "goodkey")
+
+        class _Resp:
+            text = '{"data":{"podStop":{"id":"pod123"}}}'
+
+            def raise_for_status(self):
+                return None
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                return _Resp()
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **k: _Client())
+        assert await main._stop_runpod_pod() is True

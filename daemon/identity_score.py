@@ -44,9 +44,59 @@ def _get_app():
     global _app
     if _app is None:
         from insightface.app import FaceAnalysis
-        logger.info("identity: loading buffalo_l (first run downloads ~300MB)")
-        app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-        app.prepare(ctx_id=-1, det_size=DET_SIZE)
+        from .config import settings
+
+        # Scoring 289 frames of detection + recognition was 255-309s on CPU: 23-29% of every
+        # job, and larger than the video encode, the upload and the motion analysis combined.
+        #
+        # It was pinned to CPU for a good reason — the container's CUDA execution provider could
+        # not load at all (wanly-gpu-docker #32, #33), and onnxruntime does not raise when that
+        # happens, it just silently uses CPU. Both defects are fixed and verified, so the pin is
+        # no longer buying anything on a box where the daemon owns the card.
+        #
+        # ctx_id matters as much as the providers list: insightface treats -1 as CPU regardless
+        # of what onnxruntime was offered, so setting only one of the two changes nothing.
+        gpu = settings.identity_scoring_gpu
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"] if gpu else ["CPUExecutionProvider"]
+        )
+        logger.info(
+            "identity: loading buffalo_l on %s (first run downloads ~300MB)",
+            "GPU (CPU fallback)" if gpu else "CPU",
+        )
+        app = FaceAnalysis(name="buffalo_l", providers=providers)
+        app.prepare(ctx_id=0 if gpu else -1, det_size=DET_SIZE)
+
+        # Say which provider it ACTUALLY got. onnxruntime falls back to CPU without raising, so
+        # "we asked for CUDA" and "we are running on CUDA" are different claims — and the gap
+        # between them is exactly what cost a day on the container.
+        try:
+            actual = app.models["recognition"].session.get_providers()[0]
+            logger.info("identity: recognition running on %s", actual)
+            if gpu and actual != "CUDAExecutionProvider":
+                import onnxruntime as ort
+
+                have_cuda = "CUDAExecutionProvider" in ort.get_available_providers()
+                logger.warning(
+                    "identity: asked for CUDA but got %s — scoring stays on CPU. %s",
+                    actual,
+                    (
+                        # Two different causes, and they need different fixes. The 3090's daemon
+                        # venv has the CPU-only `onnxruntime` package, which does not contain a
+                        # CUDA provider at all; the container has onnxruntime-gpu, where the
+                        # failure mode instead is the provider being present but unable to load
+                        # its libraries.
+                        "The CUDA provider failed to load — check LD_LIBRARY_PATH and that the "
+                        "onnxruntime-gpu wheel matches this image's CUDA major."
+                        if have_cuda
+                        else "This venv has the CPU-only `onnxruntime` package. Install "
+                        "`onnxruntime-gpu` (and remove `onnxruntime`, they provide the same "
+                        "module) or set IDENTITY_SCORING_GPU=false to silence this."
+                    ),
+                )
+        except Exception:  # pragma: no cover - diagnostic only, never fail scoring over it
+            pass
+
         _app = app
     return _app
 

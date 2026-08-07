@@ -288,8 +288,8 @@ async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutd
                 logger.error("Failed to report hologram failure: %s", report_err)
 
 
-async def _stop_runpod_pod():
-    """Call RunPod API to stop this pod (if running on RunPod).
+async def _stop_runpod_pod() -> bool:
+    """Call RunPod API to stop this pod. Returns True if the pod was told to stop.
 
     Missing credentials are logged loudly rather than ignored: this runs at the end of a
     drain, and if the pod does not actually stop the container respawns, the daemon
@@ -308,7 +308,7 @@ async def _stop_runpod_pod():
             "set" if pod_id else "MISSING",
             "set" if api_key else "MISSING",
         )
-        return
+        return False
 
     logger.info("Stopping RunPod pod %s ...", pod_id)
     query = f'mutation {{ podStop(input: {{podId: "{pod_id}"}}) {{ id desiredStatus }} }}'
@@ -320,8 +320,13 @@ async def _stop_runpod_pod():
             )
             resp.raise_for_status()
             logger.info("RunPod stop response: %s", resp.text)
+            return True
     except Exception as e:
+        # A revoked API key lands here as a 401. That is not hypothetical: the key baked into
+        # the pod template was revoked, every drain 401'd, and because the failure was silent
+        # the worker simply carried on taking jobs. See wanly-console#286.
         logger.error("Failed to stop RunPod pod: %s", e)
+    return False
 
 
 def kill_stale_daemons():
@@ -475,16 +480,44 @@ async def run():
             except asyncio.TimeoutError:
                 logger.warning("Timed out waiting for segment, forcing shutdown")
 
+        # Stop the pod BEFORE deregistering, not after.
+        #
+        # Deregistering deletes the worker row, and that row is where a pending drain lives.
+        # wanly-api#133 added reregistered_drain_state() precisely so a re-register cannot
+        # cancel a drain — but deleting the row first throws away the state that protection
+        # depends on. So if the pod does not actually stop, the container respawns, the daemon
+        # registers fresh as online-idle, and goes straight back to claiming work. The drain is
+        # silently undone, which is indistinguishable from the drain never having been requested.
+        stopped = False
+        on_runpod = bool(settings.runpod_pod_id)
+        if drain_event.is_set() and on_runpod:
+            stopped = await _stop_runpod_pod()
+            if not stopped:
+                # Park. Do not deregister, do not exit.
+                #
+                # Exiting would respawn the container into the same failed drain, in a loop.
+                # Staying registered as `draining` means the console keeps showing a Draining
+                # worker that is visibly not finishing — which is the honest picture — and the
+                # job poll loop has already stopped, so it claims nothing while parked.
+                logger.error(
+                    "DRAIN INCOMPLETE: the pod is still running and could not be stopped. "
+                    "Staying registered as 'draining' so this worker does NOT resume claiming "
+                    "work. Stop the pod from the RunPod console, and check that RUNPOD_API_KEY "
+                    "is valid — a revoked key returns 401 here."
+                )
+                await queue.close()
+                await comfyui.close()
+                # Sleep rather than return: returning ends the container's main process and
+                # RunPod restarts it.
+                while True:
+                    await asyncio.sleep(3600)
+
         logger.info("Shutting down, deregistering...")
         try:
             await queue.deregister(worker_id)
             logger.info("Deregistered successfully")
         except Exception as e:
             logger.error("Failed to deregister: %s", e)
-
-        # If draining on RunPod, stop the pod
-        if drain_event.is_set():
-            await _stop_runpod_pod()
 
         await queue.close()
         await comfyui.close()
