@@ -45,9 +45,6 @@ class Settings(BaseSettings):
     # (hologram_depth_scale_m, set in the console dialog) wins when present.
     depth_scale_m: float = 0.30
 
-    # PainterLongVideo motion parameters (identity anchoring)
-    painter_motion_amplitude: float = 1.3  # Range: 1.0-2.0, higher = more motion
-    painter_motion_frames: int = 5  # Range: 1-20, controls motion cycle length
 
     # Identity scoring device. Defaults to CPU, which is what every recorded identity score to
     # date was produced on.
@@ -72,11 +69,8 @@ class Settings(BaseSettings):
     # cost of not waiting long enough is a discarded segment.
     drain_wait_seconds: int = 3600
 
-    # Motion matching (optical flow based)
-    motion_matching_enabled: bool = True  # Enable automatic motion amplitude matching
-    motion_amplitude_default: float = 1.3  # Default motion_amplitude for segment 0
-    motion_amplitude_min: float = 1.0  # Minimum motion_amplitude (no motion boost)
-    motion_amplitude_max: float = 2.0  # Maximum motion_amplitude (extreme motion)
+    # The PainterLongVideo and motion-amplitude settings were removed with the swap that read
+    # them (see #124). extra="ignore" below means a .env still carrying them is harmless.
 
     # sd-scripts LoRA training monitor
     sd_scripts_path: str = "~/projects/sd-scripts"

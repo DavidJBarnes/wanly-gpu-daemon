@@ -11,7 +11,6 @@ from typing import Any
 
 from daemon.config import settings
 from daemon.schemas import SegmentClaim
-from daemon.motion_analyzer import estimate_motion_from_flow
 from daemon.stage_log import log_event
 
 logger = logging.getLogger(__name__)
@@ -182,42 +181,6 @@ def _calculate_generation_params(target_fps: int, duration_sec: float, speed: fl
         "rife_multiplier": rife_multiplier,
         "output_fps": output_fps,
     }
-
-
-def _calculate_motion_amplitude(
-    segment_index: int,
-    previous_motion_magnitude: float | None,
-    motion_amplitude_setting: float,
-) -> float:
-    """Calculate motion_amplitude for a segment based on previous motion data.
-    
-    Args:
-        segment_index: Index of the segment being built (0 = first segment)
-        previous_motion_magnitude: Measured motion from previous segment (px/frame)
-        motion_amplitude_setting: Default/configured motion_amplitude value
-        
-    Returns:
-        motion_amplitude to use for this segment
-    """
-    # Segment 0 uses the default/configured value
-    if segment_index == 0:
-        return motion_amplitude_setting
-    
-    # If no previous motion data, use default
-    if previous_motion_magnitude is None:
-        return motion_amplitude_setting
-    
-    # Motion matching enabled: estimate amplitude to match previous motion
-    # Use previous_motion_magnitude as target to achieve consistency
-    estimated = estimate_motion_from_flow(
-        previous_motion_magnitude=previous_motion_magnitude,
-        previous_motion_amplitude=motion_amplitude_setting,
-        target_motion_magnitude=previous_motion_magnitude,
-    )
-    
-    # Clamp to valid range
-    from daemon.config import settings
-    return max(settings.motion_amplitude_min, min(settings.motion_amplitude_max, estimated))
 
 
 def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
@@ -477,26 +440,27 @@ def build_workflow(
         start_image_filename: The ComfyUI-local filename of the start image
             (already uploaded). If None, the LoadImage node (97) is removed
             for text-to-video generation.
-        initial_reference_image_filename: The ComfyUI-local filename of the
-            job's original input image for PainterLongVideo identity anchoring.
-            When provided (segment > 0), node 98 is swapped from WanImageToVideo
-            to PainterLongVideo with dual-reference inputs.
-            identity for characters. PainterLongVideo only accepts a single
-            clip_vision_output, so multi-frame reference frames are not used.
-        previous_motion_magnitude: Measured motion magnitude from previous 
-            segment (px/frame). Used to auto-adjust motion_amplitude for 
-            consistent motion across segments.
+        initial_reference_image_filename: Accepted and ignored. It fed a
+            PainterLongVideo swap that was inert on Wan 2.2 i2v and has been
+            removed; the parameter stays so the executor's call site and any
+            queued segments carrying an identity_reference_image keep working.
+        previous_motion_magnitude: Accepted and ignored, for the same reason.
+            It fed motion_amplitude, which PainterLongVideo only applied on a
+            branch this graph never took.
+
+    Note on what was removed (see wanly-gpu-daemon#124): the swap replaced node
+    98 with PainterLongVideo whenever a segment had both an initial reference
+    and a start image. On Wan 2.2 i2v every one of its distinguishing inputs was
+    dead -- previous_video was wired to a single-frame LoadImage so the motion
+    reference resolved to None, reference_latents needs a ref_conv weight this
+    checkpoint does not have, clip_vision_output needs an img_emb it does not
+    have, and motion_amplitude is only read on the previous-video-only branch.
+    With start and end connected the node does exactly what stock
+    WanFirstLastFrameToVideo does. It was WanImageToVideo with a wasted VAE
+    encode and a wasted CLIP Vision load.
     """
     gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
     
-    # Calculate motion_amplitude based on previous segment's motion
-    motion_amplitude = _calculate_motion_amplitude(
-        segment_index=segment.index,
-        previous_motion_magnitude=previous_motion_magnitude,
-        motion_amplitude_setting=settings.painter_motion_amplitude,
-    )
-    logger.info("Segment %d motion_amplitude: %.2f (previous_magnitude=%s)",
-                segment.index, motion_amplitude, previous_motion_magnitude)
     workflow = copy.deepcopy(WAN_I2V_API_WORKFLOW)
 
     # Inject model filenames from config
@@ -568,57 +532,6 @@ def build_workflow(
         # Text-to-video: remove LoadImage and disconnect from WanImageToVideo
         del workflow["97"]
         del workflow["98"]["inputs"]["start_image"]
-
-    # PainterLongVideo swap for identity anchoring on segment > 0
-    if initial_reference_image_filename and start_image_filename:
-        # Node 300: load original input image (identity anchor)
-        workflow["300"] = {
-            "class_type": "LoadImage",
-            "inputs": {"image": initial_reference_image_filename},
-            "_meta": {"title": "Initial Reference Image"},
-        }
-        # Node 301: CLIP Vision model loader
-        workflow["301"] = {
-            "class_type": "CLIPVisionLoader",
-            "inputs": {"clip_name": settings.clip_vision_model},
-            "_meta": {"title": "CLIP Vision Loader"},
-        }
-        # Node 302: Encode reference image with CLIP Vision
-        workflow["302"] = {
-            "class_type": "CLIPVisionEncode",
-            "inputs": {
-                "clip_vision": ["301", 0],
-                "image": ["300", 0],
-                "crop": "center",
-            },
-            "_meta": {"title": "CLIP Vision Encode Reference"},
-        }
-        # Replace WanImageToVideo with PainterLongVideo
-        workflow["98"] = {
-            "class_type": "PainterLongVideo",
-            "inputs": {
-                "positive": ["93", 0],
-                "negative": ["89", 0],
-                "vae": ["90", 0],
-                "width": segment.width,
-                "height": segment.height,
-                "length": gen["wan_frames"],
-                "batch_size": 1,
-                "previous_video": ["97", 0],
-                "motion_frames": settings.painter_motion_frames,
-                "motion_amplitude": motion_amplitude,
-                "initial_reference_image": ["300", 0],
-                "clip_vision_output": ["302", 0],
-                "start_image": ["97", 0],
-            },
-            "_meta": {"title": "PainterLongVideo Identity Anchor"},
-        }
-        logger.info(
-            "Swapped to PainterLongVideo (segment %d, ref=%s, clip_vision=%s)",
-            segment.index,
-            initial_reference_image_filename,
-            settings.clip_vision_model,
-        )
 
     # User LoRAs
     if segment.loras:
