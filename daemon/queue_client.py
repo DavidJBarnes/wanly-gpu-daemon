@@ -202,14 +202,22 @@ class QueueClient:
         ip_address: str,
         comfyui_running: bool,
     ) -> tuple[uuid.UUID, str]:
+        # The pod id is how the console pairs this worker with the RunPod pod behind it.
+        # Pairing on name only worked for pods the console launcher created; a pod started from
+        # the template has an auto-generated name and showed as "Starting" forever beside the
+        # worker it had already become. Empty on anything self-hosted.
+        payload = {
+            "friendly_name": friendly_name,
+            "hostname": hostname,
+            "ip_address": ip_address,
+            "comfyui_running": comfyui_running,
+        }
+        if settings.runpod_pod_id:
+            payload["runpod_pod_id"] = settings.runpod_pod_id
+
         resp = await self.client.post(
             "/workers",
-            json={
-                "friendly_name": friendly_name,
-                "hostname": hostname,
-                "ip_address": ip_address,
-                "comfyui_running": comfyui_running,
-            },
+            json=payload,
         )
         if not resp.is_success:
             _raise_with_details(resp, "register")
