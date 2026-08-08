@@ -15,7 +15,36 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _downsample(values: list[float], cap: int = 600) -> list[float]:
+    """Evenly spaced sample, so a long clip keeps its SHAPE rather than its first 600 frames.
+
+    Truncating would silently plot only the opening of a long segment, which is worse than
+    plotting a coarser version of the whole thing.
+    """
+    if len(values) <= cap:
+        return [round(float(v), 4) for v in values]
+    step = len(values) / cap
+    return [round(float(values[int(i * step)]), 4) for i in range(cap)]
+
+
+def measure_motion_series(video_data: bytes, fps: int = 15) -> tuple[Optional[float], list[float]]:
+    """Mean optical flow magnitude AND the per-frame series behind it.
+
+    The series was always computed and then discarded. Keeping it lets motion be plotted beside
+    identity, expression and detail on one chart — which matters because the mean hides shape:
+    a clip that surges once and then freezes averages the same as one that moves steadily, and
+    those are not the same clip.
+    """
+    mean, series = _measure(video_data, fps)
+    return mean, series
+
+
 def measure_motion_magnitude(video_data: bytes, fps: int = 15) -> Optional[float]:
+    """Mean only. Kept so existing callers are unaffected."""
+    return _measure(video_data, fps)[0]
+
+
+def _measure(video_data: bytes, fps: int = 15) -> tuple[Optional[float], list[float]]:
     """Measure average optical flow magnitude in a video.
 
     Uses Farneback algorithm to compute dense optical flow between consecutive frames,
@@ -36,19 +65,19 @@ def measure_motion_magnitude(video_data: bytes, fps: int = 15) -> Optional[float
         cap = cv2.VideoCapture(tmp_video_path)
         if not cap.isOpened():
             logger.warning("Could not open video for motion analysis")
-            return None
+            return None, []
 
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if frame_count < 2:
             logger.warning("Video has fewer than 2 frames, cannot measure motion")
-            return None
+            return None, []
 
         magnitudes: list[float] = []
 
         ret, prev_frame = cap.read()
         if not ret:
             logger.warning("Could not read first frame")
-            return None
+            return None, []
 
         prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
 
@@ -87,14 +116,14 @@ def measure_motion_magnitude(video_data: bytes, fps: int = 15) -> Optional[float
                 avg_motion,
                 len(magnitudes),
             )
-            return avg_motion
+            return avg_motion, _downsample(magnitudes)
 
         logger.warning("No motion data extracted from video")
-        return None
+        return None, []
 
     except Exception as e:
         logger.warning("Motion analysis failed: %s", e)
-        return None
+        return None, []
     finally:
         try:
             os.unlink(tmp_video_path)

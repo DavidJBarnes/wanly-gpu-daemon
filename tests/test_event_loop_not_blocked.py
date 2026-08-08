@@ -23,7 +23,7 @@ from pathlib import Path
 
 from daemon import executor
 
-BLOCKING_CALLS = ["measure_motion_magnitude", "identity_score.score_video"]
+BLOCKING_CALLS = ["measure_motion_series", "identity_score.score_video"]
 
 
 def _executor_source() -> str:
