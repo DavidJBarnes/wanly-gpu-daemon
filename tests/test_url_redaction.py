@@ -12,13 +12,23 @@ import pytest
 
 from daemon.queue_client import _raise_with_details, _redact_url
 
-# Shape of the real thing, credentials shortened.
+# Structurally identical to a real presigned URL, with entirely invented values.
+#
+# The first version of this file pasted the shape from an actual failure and left a real
+# STS access key id in it, which GitHub secret scanning flagged — a test about not writing
+# credentials down, writing a credential down. The placeholders below are deliberately not
+# valid-looking: no ASIA/AKIA prefix, nothing that resembles a real signature.
 PRESIGNED = (
     "https://wanly-images.s3.amazonaws.com/2026-07-09/00054-1151936895-swapped.png"
-    "?AWSAccessKeyId=ASIA3QP5JFGTUPQDM4GR&Signature=O1tbz32YO7Qr9sDzbm16KhfAOaU%3D"
-    "&x-amz-security-token=IQoJb3JpZ2luX2VjEI7SECRETTOKENVALUE&Expires=1786145348"
+    "?AWSAccessKeyId=EXAMPLEKEYIDNOTREAL0&Signature=EXAMPLESIGNATUREVALUE%3D"
+    "&x-amz-security-token=EXAMPLESECURITYTOKENVALUE&Expires=1786145348"
 )
-SECRETS = ("AWSAccessKeyId", "Signature=", "x-amz-security-token", "SECRETTOKENVALUE")
+SECRETS = (
+    "AWSAccessKeyId",
+    "Signature=",
+    "x-amz-security-token",
+    "EXAMPLESECURITYTOKENVALUE",
+)
 
 
 def _response(status=404):
