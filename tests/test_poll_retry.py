@@ -82,3 +82,54 @@ class TestKeepaliveExpiry:
             "keepalive_expiry must sit below the far end's idle timeout, or reaped connections "
             "keep being handed out"
         )
+
+
+class TestRegistrationReportsPodId:
+    """The console pairs a pod with its worker by pod id (wanly-console#291 follow-up).
+
+    Pairing on name only worked for pods the console launcher created. A pod started from the
+    RunPod template has an auto-generated name while its worker registers as runpod-<pod id>,
+    so the two never matched and the pod showed as "Starting" forever.
+    """
+
+    async def test_pod_id_is_sent_when_running_on_runpod(self, monkeypatch):
+        from daemon.config import settings
+
+        monkeypatch.setattr(settings, "runpod_pod_id", "pod-xyz")
+        sent = {}
+
+        class _Client:
+            async def post(self, url, json=None, **kw):
+                sent.update(json or {})
+                return httpx.Response(
+                    201, json={"id": "00000000-0000-0000-0000-000000000001",
+                               "friendly_name": "w"},
+                    request=httpx.Request("POST", "http://x"),
+                )
+
+        client = QueueClient()
+        client.client = _Client()
+        await client.register("w", "h", "127.0.0.1", True)
+        assert sent.get("runpod_pod_id") == "pod-xyz"
+
+    async def test_omitted_when_self_hosted(self, monkeypatch):
+        """The 3090 is not a pod. Sending an empty string would create a worker that looks like
+        it belongs to a pod called "" and never pairs with anything."""
+        from daemon.config import settings
+
+        monkeypatch.setattr(settings, "runpod_pod_id", None)
+        sent = {}
+
+        class _Client:
+            async def post(self, url, json=None, **kw):
+                sent.update(json or {})
+                return httpx.Response(
+                    201, json={"id": "00000000-0000-0000-0000-000000000001",
+                               "friendly_name": "w"},
+                    request=httpx.Request("POST", "http://x"),
+                )
+
+        client = QueueClient()
+        client.client = _Client()
+        await client.register("w", "h", "127.0.0.1", True)
+        assert "runpod_pod_id" not in sent
