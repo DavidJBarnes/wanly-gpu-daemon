@@ -720,7 +720,18 @@ async def _score_segment_identity(
             except Exception as e:
                 logger.info("identity: could not fetch ground truth (%s)", e)
 
-        score, reason = identity_score.score_video(video_data, start_bytes, ref_bytes)
+        # insightface detection + recognition over every frame: 9s at 480p, but 126s on a 720p
+        # segment and 3m43s on one continuation. Run inline it blocked the daemon's event loop
+        # for that whole time, which stopped the heartbeat — and the API marks a worker offline
+        # after 120s of silence.
+        #
+        # That was not merely cosmetic. The offline sweep overwrites a `draining` status, so a
+        # pending drain was silently lost; and the stale-claim reaper's premise is explicitly
+        # "a healthy worker mid-render is still heartbeating", which stopped being true, putting
+        # a still-running segment at risk of being reclaimed by another worker.
+        score, reason = await asyncio.to_thread(
+            identity_score.score_video, video_data, start_bytes, ref_bytes
+        )
         if score is None:
             await progress.log(f"[7/7] Identity: not scored ({reason})")
             logger.info("Identity not scored for segment %d: %s", segment.index, reason)
@@ -928,8 +939,9 @@ async def execute_segment(
                 segment, last_frame_data, comfyui, queue, progress,
             )
 
-        # Measure motion magnitude using optical flow
-        motion_magnitude = measure_motion_magnitude(video_data)
+        # Optical flow over every frame — synchronous OpenCV, ~38s measured at 289 frames.
+        # Off the event loop, or the heartbeat stops for its duration (see below).
+        motion_magnitude = await asyncio.to_thread(measure_motion_magnitude, video_data)
         if motion_magnitude:
             await progress.log(f"[7/7] Motion magnitude: {motion_magnitude:.2f} px/frame")
 
