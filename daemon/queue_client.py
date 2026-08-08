@@ -29,7 +29,31 @@ class QueueClient:
         headers = {}
         if settings.queue_api_key:
             headers["X-API-Key"] = settings.queue_api_key
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10, headers=headers)
+        # keepalive_expiry below the far end's idle timeout: httpx otherwise hands out a
+        # connection the server has already closed, and only finds out after writing the
+        # request — surfacing as "Server disconnected without sending a response". Retiring
+        # them locally first removes most of that class. See #105.
+        limits = httpx.Limits(max_keepalive_connections=5, keepalive_expiry=30.0)
+        self.client = httpx.AsyncClient(
+            base_url=self.base_url, timeout=10, headers=headers, limits=limits
+        )
+
+    async def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Issue a request, retrying once on a transport-level failure.
+
+        A reaped keepalive connection fails instantly and succeeds instantly on a fresh socket,
+        so one retry is the whole fix — there is no backoff to tune. Deliberately narrow: only
+        transport errors retry. An HTTP error status is a real answer and must not be repeated,
+        since claiming is not idempotent.
+        """
+        try:
+            return await self.client.request(method, url, **kwargs)
+        except (httpx.TransportError, httpx.RemoteProtocolError) as e:
+            logger.info(
+                "%s %s failed at the transport layer (%s); retrying once on a fresh connection",
+                method, url, type(e).__name__,
+            )
+            return await self.client.request(method, url, **kwargs)
 
     async def claim_next(
         self, worker_id: uuid.UUID, worker_name: str | None = None, kind: str | None = None
@@ -42,7 +66,7 @@ class QueueClient:
         params = {"worker_id": str(worker_id), "worker_name": worker_name or settings.friendly_name}
         if kind:
             params["kind"] = kind
-        resp = await self.client.get("/segments/next", params=params)
+        resp = await self._request_with_retry("GET", "/segments/next", params=params)
         if not resp.is_success:
             _raise_with_details(resp, "claim_next")
         data = resp.json()
@@ -185,9 +209,8 @@ class QueueClient:
             payload["sd_scripts"] = sd_scripts_status
         if a1111_status is not None:
             payload["a1111"] = a1111_status
-        resp = await self.client.post(
-            f"/workers/{worker_id}/heartbeat",
-            json=payload,
+        resp = await self._request_with_retry(
+            "POST", f"/workers/{worker_id}/heartbeat", json=payload
         )
         if not resp.is_success:
             _raise_with_details(resp, "heartbeat")

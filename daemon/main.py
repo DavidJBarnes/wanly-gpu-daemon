@@ -153,7 +153,7 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
             elif beat_count % 5 == 0:
                 logger.debug("Heartbeat OK (beat #%d)", beat_count)
         except Exception as e:
-            logger.error("Heartbeat failed: %s", e)
+            logger.error("Heartbeat failed: %s: %s", type(e).__name__, e)
 
 
 async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event):
@@ -193,7 +193,7 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
         try:
             segment = await queue.claim_next(worker_id, friendly_name_ref[0], kind="gpu")
         except Exception as e:
-            logger.error("Poll failed: %s", e)
+            logger.error("Poll failed: %s: %s", type(e).__name__, e)
             continue
 
         poll_count += 1
@@ -250,7 +250,7 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
                     try:
                         await queue.update_status(worker_id, "online-idle")
                     except Exception as e:
-                        logger.error("Failed to update status to idle: %s", e)
+                        logger.error("Failed to update status to idle: %s: %s", type(e).__name__, e)
 
 
 async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event):
@@ -270,7 +270,7 @@ async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutd
         try:
             segment = await queue.claim_next(worker_id, friendly_name_ref[0], kind="hologram")
         except Exception as e:
-            logger.error("Hologram poll failed: %s", e)
+            logger.error("Hologram poll failed: %s: %s", type(e).__name__, e)
             continue
         if segment is None:
             continue
