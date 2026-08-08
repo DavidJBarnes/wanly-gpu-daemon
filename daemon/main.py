@@ -314,17 +314,35 @@ async def _terminate_runpod_pod() -> bool:
         return False
 
     logger.info("Terminating RunPod pod %s ...", pod_id)
+
+    # GraphQL podTerminate, not REST DELETE /v1/pods/{id}.
+    #
+    # A pod cannot delete ITSELF through the REST API — the identical key, on the identical
+    # endpoint, returns 403 from inside the container and 204 from outside it. This was found in
+    # production: a drain finished its segment, tried to terminate, got 403, and parked.
+    #
+    # The GraphQL mutation has no such restriction, which is why the earlier podStop worked from
+    # inside. podTerminate gives the terminate semantics we want; podStop only stopped the pod
+    # and left it billing for disk.
+    query = f'mutation {{ podTerminate(input: {{podId: "{pod_id}"}}) }}'
     try:
         async with _httpx.AsyncClient(timeout=15) as client:
-            resp = await client.delete(
-                f"https://rest.runpod.io/v1/pods/{pod_id}",
-                headers={"Authorization": f"Bearer {api_key}"},
+            resp = await client.post(
+                f"https://api.runpod.io/graphql?api_key={api_key}",
+                json={"query": query},
             )
-            # 404 means it is already gone, which is the state we wanted.
-            if resp.status_code == 404:
+            resp.raise_for_status()
+            body = resp.json()
+            errors = body.get("errors") or []
+            # POD_NOT_FOUND means it is already gone, which is the state we wanted.
+            if errors and all(
+                (e.get("extensions") or {}).get("code") == "POD_NOT_FOUND" for e in errors
+            ):
                 logger.info("RunPod pod %s already gone", pod_id)
                 return True
-            resp.raise_for_status()
+            if errors:
+                logger.error("RunPod refused to terminate %s: %s", pod_id, errors)
+                return False
             logger.info("RunPod pod %s terminated", pod_id)
             return True
     except Exception as e:
