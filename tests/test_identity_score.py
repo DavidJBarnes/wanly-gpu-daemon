@@ -412,3 +412,60 @@ class TestSeriesReference:
         src = inspect.getsource(identity_score.score_video)
         assert "mean_cos_start=float(np.mean(cs_start))" in src
         assert "min_cos_start=float(np.min(cs_start))" in src
+
+
+class TestExpressionMetric:
+    """Expression must measure the face DEFORMING, not the head moving.
+
+    The failure this exists to catch: P2 scored best on identity in its batch while having the
+    deadest face, and nothing in the numbers said so. Motion magnitude could not see it either —
+    a clip can move plenty and still be inert.
+    """
+
+    def test_a_rigid_face_scores_near_zero_however_much_it_moves(self):
+        import numpy as np
+
+        from daemon.identity_score import _expression_std
+
+        # Same face shape every frame. Landmarks arrive already normalised into the bbox, so a
+        # face that only translates or scales produces identical normalised points.
+        shape = np.random.RandomState(0).rand(73, 2)
+        assert _expression_std([shape.copy() for _ in range(30)]) == 0.0
+
+    def test_a_moving_face_scores_above_zero(self):
+        import numpy as np
+
+        from daemon.identity_score import _expression_std
+
+        rs = np.random.RandomState(1)
+        base = rs.rand(73, 2)
+        frames = [base + rs.normal(0, 0.02, base.shape) for _ in range(30)]
+        assert _expression_std(frames) > 0
+
+    def test_more_deformation_scores_higher(self):
+        """The number has to be ordinal or it cannot rank two takes."""
+        import numpy as np
+
+        from daemon.identity_score import _expression_std
+
+        rs = np.random.RandomState(2)
+        base = rs.rand(73, 2)
+        subtle = [base + rs.normal(0, 0.005, base.shape) for _ in range(30)]
+        animated = [base + rs.normal(0, 0.05, base.shape) for _ in range(30)]
+        assert _expression_std(animated) > _expression_std(subtle)
+
+    def test_too_few_frames_returns_none_rather_than_a_wrong_number(self):
+        import numpy as np
+
+        from daemon.identity_score import _expression_std
+
+        assert _expression_std([np.zeros((73, 2))]) is None
+        assert _expression_std([]) is None
+
+    def test_a_ragged_series_does_not_break_scoring(self):
+        """A frame with a different landmark count must not fail the whole segment."""
+        import numpy as np
+
+        from daemon.identity_score import _expression_std
+
+        assert _expression_std([np.zeros((73, 2)), np.zeros((70, 2)), np.zeros((73, 2))]) is None

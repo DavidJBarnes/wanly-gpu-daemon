@@ -142,6 +142,11 @@ class IdentityScore:
     face_sharp_mean: Optional[float] = None
     face_sharp_start: Optional[float] = None
     face_sharp_end: Optional[float] = None
+    # Facial EXPRESSION, which neither cosine nor motion can see. A face can hold identity
+    # perfectly and move through the frame while being completely inert -- P2 scored best on
+    # identity with the deadest face of the batch, and no number said so. Landmarks normalised
+    # into the face bbox, so head movement drops out and only deformation remains.
+    expression: Optional[float] = None
     metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -164,6 +169,10 @@ class IdentityScore:
             # Surfaced in the one-line log because cosine cannot see it: a face can hold
             # identity while going visibly soft, and that only shows up here.
             bits.append(f"detail {self.face_sharp_start:.0f}->{self.face_sharp_end:.0f}")
+        if self.expression is not None:
+            # In the one-line log for the same reason as detail: a clip can move plenty and
+            # still have an inert face, and no other number here would show it.
+            bits.append(f"expr {self.expression:.1f}")
         if self.slope is not None:
             bits.append(f"drift {self.slope * max(self.frames - 1, 1):+.3f} over {self.frames}f")
         if self.no_face:
@@ -244,6 +253,7 @@ def score_video(
         cs_start: list[float] = []
         cs_ref: list[float] = []
         sharps: list[float] = []
+        lmk_series: list[np.ndarray] = []
         slope_x: list[int] = []
         slope_y: list[float] = []
         face_px: list[float] = []
@@ -288,6 +298,23 @@ def score_video(
                 g = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (128, 128))
                 sharps.append(float(cv2.Laplacian(g, cv2.CV_64F).var()))
             yaws.append(abs(float(f.pose[1])))
+
+            # Expression: how much the face MOVES relative to itself, not how much the head
+            # moves. Landmarks are normalised into the face bbox, so translation and scale drop
+            # out — a rigid face on a turning head scores near zero, which is exactly the
+            # failure we could not see before. P2 scored best on identity while having the
+            # deadest face, and nothing in the numbers said so.
+            #
+            # Points 0-32 are the jaw contour, which tracks head pose more than expression, so
+            # only 33+ (brows, nose, eyes, mouth) are used. That split is stable across the
+            # landmark_2d_106 layouts; the finer per-region indices are not.
+            lmk = getattr(f, "landmark_2d_106", None)
+            if lmk is not None and len(lmk) >= 106:
+                w = max(1.0, float(x2 - x1))
+                h = max(1.0, float(y2 - y1))
+                inner = np.asarray(lmk[33:], dtype=np.float64)
+                lmk_series.append(np.stack([(inner[:, 0] - x1) / w, (inner[:, 1] - y1) / h], axis=1))
+
             idx += 1
         cap.release()
 
@@ -329,6 +356,7 @@ def score_video(
             slope=slope,
             face_px_p50=float(np.percentile(face_px, 50)),
             yaw_max=float(np.max(ys)),
+            expression=_expression_std(lmk_series),
             face_sharp_mean=float(np.mean(sharps)) if sharps else None,
             face_sharp_start=float(np.mean(sharps[:3])) if len(sharps) >= 3 else None,
             face_sharp_end=float(np.mean(sharps[-3:])) if len(sharps) >= 3 else None,
@@ -341,6 +369,7 @@ def score_video(
                 # Rides in metrics rather than its own columns: identity_metrics is already
                 # persisted as JSON, so this needs no migration and no API change.
                 "face_sharp_mean": round(float(np.mean(sharps)), 1) if sharps else None,
+                "expression": _expression_std(lmk_series),
                 "face_sharp_start": round(float(np.mean(sharps[:3])), 1) if len(sharps) >= 3 else None,
                 "face_sharp_end": round(float(np.mean(sharps[-3:])), 1) if len(sharps) >= 3 else None,
                 "yaw_bands": bands,
@@ -367,6 +396,31 @@ def score_video(
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def _expression_std(lmk_series: list) -> Optional[float]:
+    """How much the face changes shape over the clip, with head movement removed.
+
+    Landmarks arrive already normalised into the face bbox, so translation and scale are gone.
+    What is left is the face deforming: mouth opening, brows moving, eyes narrowing. Taking the
+    standard deviation per point over time and averaging gives one number where a plastic,
+    frozen face lands near zero and an animated one does not.
+
+    Scaled by 1000 purely so the useful range reads as tens rather than hundredths.
+
+    Deliberately NOT a measure of how much the head moves — that is motion_magnitude, and the
+    two must stay separate. A clip can have plenty of motion and a dead face; that combination
+    is exactly what went unnoticed before this existed.
+    """
+    if len(lmk_series) < 3:
+        return None
+    try:
+        arr = np.stack(lmk_series)          # (frames, points, 2)
+        return round(float(np.mean(np.std(arr, axis=0))) * 1000, 2)
+    except Exception:
+        # A frame where the landmark count differs would break the stack. Never fail scoring
+        # over a diagnostic.
+        return None
 
 
 def as_result_fields(score: Optional[IdentityScore]) -> dict[str, Any]:
