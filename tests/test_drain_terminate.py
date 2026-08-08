@@ -49,6 +49,39 @@ class TestMissingCredentials:
         assert "RUNPOD_API_KEY=MISSING" in msg
 
 
+class TestUsesGraphQLNotRest:
+    """A pod cannot terminate ITSELF through the REST API.
+
+    Found in production: a drain finished its segment, called
+    DELETE /v1/pods/{id}, and got 403 Forbidden. The identical key on the identical endpoint
+    returns 204 when called from outside the pod — so it is not a permissions problem with the
+    key, it is a restriction on self-deletion.
+
+    GraphQL has no such restriction, which is why the earlier podStop worked from inside.
+    podTerminate keeps that property while giving terminate rather than stop semantics.
+    """
+
+    def test_terminate_calls_graphql(self):
+        import inspect
+
+        src = inspect.getsource(main._terminate_runpod_pod)
+        assert "podTerminate" in src, "must use the GraphQL mutation"
+        assert "api.runpod.io/graphql" in src
+        assert "rest.runpod.io" not in src, (
+            "REST DELETE returns 403 when a pod tries to terminate itself"
+        )
+
+    def test_does_not_use_podstop(self):
+        """podStop leaves the pod EXITED and still billing for its disk.
+
+        Matches the mutation call, not the bare word — the comment above it explains why podStop
+        used to work, and a test should not be broken by its own explanation.
+        """
+        import inspect
+
+        assert "podStop(input:" not in inspect.getsource(main._terminate_runpod_pod)
+
+
 class TestReturnValue:
     """The caller now decides whether to deregister based on this, so it has to be honest.
 
@@ -69,14 +102,17 @@ class TestReturnValue:
         monkeypatch.setattr(main.settings, "runpod_api_key", "revoked")
 
         class _Resp:
-            text = "unauthorized"
-            status_code = 401
+            text = "forbidden"
+            status_code = 403
 
             def raise_for_status(self):
                 raise httpx.HTTPStatusError(
-                    "401 Unauthorized", request=httpx.Request("POST", "http://x"),
-                    response=httpx.Response(401),
+                    "403 Forbidden", request=httpx.Request("POST", "http://x"),
+                    response=httpx.Response(403),
                 )
+
+            def json(self):
+                return {}
 
         class _Client:
             async def __aenter__(self):
@@ -85,7 +121,7 @@ class TestReturnValue:
             async def __aexit__(self, *a):
                 return False
 
-            async def delete(self, *a, **k):
+            async def post(self, *a, **k):
                 return _Resp()
 
         monkeypatch.setattr(httpx, "AsyncClient", lambda **k: _Client())
@@ -98,11 +134,14 @@ class TestReturnValue:
         monkeypatch.setattr(main.settings, "runpod_api_key", "goodkey")
 
         class _Resp:
-            text = ""
-            status_code = 204
+            text = '{"data":{"podTerminate":null}}'
+            status_code = 200
 
             def raise_for_status(self):
                 return None
+
+            def json(self):
+                return {"data": {"podTerminate": None}}
 
         class _Client:
             async def __aenter__(self):
@@ -111,7 +150,7 @@ class TestReturnValue:
             async def __aexit__(self, *a):
                 return False
 
-            async def delete(self, *a, **k):
+            async def post(self, *a, **k):
                 return _Resp()
 
         monkeypatch.setattr(httpx, "AsyncClient", lambda **k: _Client())
