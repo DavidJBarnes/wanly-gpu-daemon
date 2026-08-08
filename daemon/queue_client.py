@@ -11,14 +11,37 @@ from daemon.schemas import SegmentClaim, SegmentResult
 logger = logging.getLogger(__name__)
 
 
+def _redact_url(url) -> str:
+    """Host and path only — never the query string.
+
+    Presigned S3 URLs carry AWSAccessKeyId, Signature and x-amz-security-token in the query.
+    They are short-lived, but daemon.log is bind-mounted to the host and gets pasted into
+    tickets, so they must not be written there at all.
+    """
+    try:
+        return f"{url.scheme}://{url.host}{url.path}"
+    except Exception:
+        return "<url unavailable>"
+
+
 def _raise_with_details(resp: httpx.Response, context: str) -> None:
-    """Log HTTP error details before raising."""
+    """Log HTTP error details before raising, without leaking a signed URL.
+
+    httpx builds raise_for_status()'s message from resp.url. After follow_redirects that is the
+    presigned S3 URL, so the default exception put the full credential set into the log and into
+    every traceback. The message is rebuilt here instead. See #112.
+    """
     try:
         body = resp.text[:500]
     except Exception:
         body = "<unreadable>"
-    logger.error("%s — HTTP %d: %s", context, resp.status_code, body)
-    resp.raise_for_status()
+    where = _redact_url(resp.url)
+    logger.error("%s — HTTP %d for %s: %s", context, resp.status_code, where, body)
+    raise httpx.HTTPStatusError(
+        f"{context} — HTTP {resp.status_code} for {where}",
+        request=resp.request,
+        response=resp,
+    )
 
 
 class QueueClient:
