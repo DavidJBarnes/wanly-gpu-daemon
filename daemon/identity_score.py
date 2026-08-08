@@ -313,7 +313,8 @@ def score_video(
                 w = max(1.0, float(x2 - x1))
                 h = max(1.0, float(y2 - y1))
                 inner = np.asarray(lmk[33:], dtype=np.float64)
-                lmk_series.append(np.stack([(inner[:, 0] - x1) / w, (inner[:, 1] - y1) / h], axis=1))
+                norm = np.stack([(inner[:, 0] - x1) / w, (inner[:, 1] - y1) / h], axis=1)
+                lmk_series.append(norm)
 
             idx += 1
         cap.release()
@@ -370,6 +371,12 @@ def score_video(
                 # persisted as JSON, so this needs no migration and no API change.
                 "face_sharp_mean": round(float(np.mean(sharps)), 1) if sharps else None,
                 "expression": _expression_std(lmk_series),
+                # Per-frame series for the trajectory chart. The headline numbers say where a
+                # clip ended up; these say how it got there — and a mean hides shape. A face
+                # that animates once and then freezes averages the same as one that stays alive
+                # throughout, and those are not the same take.
+                "series_detail": _downsample(sharps),
+                "series_expression": _expression_series(lmk_series),
                 "face_sharp_start": round(float(np.mean(sharps[:3])), 1) if len(sharps) >= 3 else None,
                 "face_sharp_end": round(float(np.mean(sharps[-3:])), 1) if len(sharps) >= 3 else None,
                 "yaw_bands": bands,
@@ -396,6 +403,35 @@ def score_video(
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def _downsample(values: list, cap: int = 600) -> list:
+    """Evenly spaced sample, so a long clip keeps its shape rather than only its opening."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return []
+    if len(vals) <= cap:
+        return [round(float(v), 3) for v in vals]
+    step = len(vals) / cap
+    return [round(float(vals[int(i * step)]), 3) for i in range(cap)]
+
+
+def _expression_series(lmk_series: list) -> list:
+    """Per-frame facial movement: how far the landmarks shifted since the previous frame.
+
+    Deliberately a different quantity from the headline `expression`, which is the deviation
+    over the whole clip. This one answers "is the face alive right now", so it can be read
+    against identity and motion on the same time axis — a dead patch in the middle is visible
+    here and invisible in either aggregate.
+    """
+    if len(lmk_series) < 2:
+        return []
+    try:
+        arr = np.stack(lmk_series)
+        deltas = np.linalg.norm(np.diff(arr, axis=0), axis=2).mean(axis=1) * 1000
+        return _downsample(list(deltas))
+    except Exception:
+        return []
 
 
 def _expression_std(lmk_series: list) -> Optional[float]:

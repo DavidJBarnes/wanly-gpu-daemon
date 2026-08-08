@@ -30,7 +30,7 @@ from PIL import Image
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
 from daemon.lora_sync import ensure_loras_available
 from daemon.motion_extractor import _augment_prompt_with_motion, extract_motion_keywords
-from daemon.motion_analyzer import measure_motion_magnitude
+from daemon.motion_analyzer import measure_motion_series
 from daemon import identity_score
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
@@ -941,7 +941,9 @@ async def execute_segment(
 
         # Optical flow over every frame — synchronous OpenCV, ~38s measured at 289 frames.
         # Off the event loop, or the heartbeat stops for its duration (see below).
-        motion_magnitude = await asyncio.to_thread(measure_motion_magnitude, video_data)
+        motion_magnitude, motion_series = await asyncio.to_thread(
+            measure_motion_series, video_data
+        )
         if motion_magnitude:
             await progress.log(f"[7/7] Motion magnitude: {motion_magnitude:.2f} px/frame")
 
@@ -954,6 +956,13 @@ async def execute_segment(
         identity_fields = await _score_segment_identity(
             segment, video_data, queue, progress,
         )
+
+        # Motion is measured separately from the face metrics, so its series is merged in here
+        # rather than at the source. All four then live in one blob and the chart can read them
+        # together without the console knowing which subsystem produced which.
+        metrics = identity_fields.get("identity_metrics")
+        if isinstance(metrics, dict) and motion_series:
+            metrics["series_motion"] = motion_series
 
         segment_result = SegmentResult(
             status="completed",

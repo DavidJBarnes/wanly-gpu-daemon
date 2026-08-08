@@ -469,3 +469,56 @@ class TestExpressionMetric:
         from daemon.identity_score import _expression_std
 
         assert _expression_std([np.zeros((73, 2)), np.zeros((70, 2)), np.zeros((73, 2))]) is None
+
+
+class TestPerFrameSeries:
+    """Series exist so the axes can be read against each other on one time axis.
+
+    A mean hides shape. A clip that animates once and then freezes averages the same as one
+    that stays alive throughout, and those are not the same take — which is the whole reason
+    the headline numbers were not enough.
+    """
+
+    def test_expression_series_tracks_frame_to_frame_change(self):
+        import numpy as np
+
+        from daemon.identity_score import _expression_series
+
+        base = np.zeros((73, 2))
+        moved = base + 0.05
+        # still, still, jump, still
+        series = _expression_series([base, base, moved, moved])
+        assert len(series) == 3
+        assert series[0] == 0.0 and series[2] == 0.0
+        assert series[1] > 0, "the frame where the face moved must register"
+
+    def test_expression_series_needs_two_frames(self):
+        import numpy as np
+
+        from daemon.identity_score import _expression_series
+
+        assert _expression_series([np.zeros((73, 2))]) == []
+        assert _expression_series([]) == []
+
+    def test_downsample_keeps_the_shape_not_the_opening(self):
+        """Truncating would plot only the first 600 frames of a long clip, which reads as a
+        complete picture and is not one."""
+        from daemon.identity_score import _downsample
+
+        values = list(range(2000))
+        out = _downsample(values, cap=100)
+        assert len(out) == 100
+        assert out[0] == 0
+        assert out[-1] > 1900, "the end of the clip must be represented"
+
+    def test_downsample_leaves_short_series_alone(self):
+        from daemon.identity_score import _downsample
+
+        assert _downsample([1.0, 2.0, 3.0], cap=600) == [1.0, 2.0, 3.0]
+
+    def test_a_ragged_landmark_series_yields_no_series_rather_than_raising(self):
+        import numpy as np
+
+        from daemon.identity_score import _expression_series
+
+        assert _expression_series([np.zeros((73, 2)), np.zeros((70, 2))]) == []
