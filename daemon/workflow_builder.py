@@ -314,7 +314,12 @@ def _add_faceswap(
             "use_occlusion_mask": True,
             "use_area_mask": True,
             "use_region_mask": False,
-            "face_mask_areas": "upper-face,lower-face,mouth",
+            # The FaceFusion masks INTERSECT (box ∩ occlusion ∩ area), so an area only gets
+            # swapped if it's listed here. "mouth" is deliberately excluded: with it in, the
+            # source lips overwrite whatever motion the generation produced, flattening the
+            # face. Leaving it out swaps identity everywhere else (incl. jaw/chin via
+            # "lower-face") while the generated lip/mouth motion survives. See #133.
+            "face_mask_areas": "upper-face,lower-face",
             "face_mask_regions": "skin,nose,mouth,upper-lip,lower-lip",
             "face_mask_padding": "0,0,0,0",
             "reference_image": ["188", 0],
