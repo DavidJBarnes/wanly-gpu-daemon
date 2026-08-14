@@ -29,7 +29,6 @@ from PIL import Image
 
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
 from daemon.lora_sync import ensure_loras_available
-from daemon.motion_extractor import _augment_prompt_with_motion, extract_motion_keywords
 from daemon.motion_analyzer import measure_motion_series
 from daemon import identity_score
 from daemon.progress import ProgressLog
@@ -781,15 +780,6 @@ async def execute_segment(
 
     lora_names = ", ".join(item.high_file or item.low_file or "?" for item in (segment.loras or []))
 
-    augmented_prompt = segment.prompt
-    if segment.previous_motion_keywords:
-        original_prompt = segment.prompt
-        augmented_prompt = _augment_prompt_with_motion(
-            original_prompt, segment.previous_motion_keywords
-        )
-        logger.info("Augmented prompt with motion continuity: %s -> %s", original_prompt[:50], augmented_prompt[:50])
-        segment = segment.model_copy(update={"prompt": augmented_prompt})
-
     logger.info(
         "=== Segment %d (job %s) === prompt: %s%s",
         segment.index, str(segment.job_id)[:8],
@@ -947,10 +937,6 @@ async def execute_segment(
         if motion_magnitude:
             await progress.log(f"[7/7] Motion magnitude: {motion_magnitude:.2f} px/frame")
 
-        motion_keywords = await extract_motion_keywords(segment.prompt, video_data)
-        if motion_keywords:
-            await progress.log(f"[7/7] Motion detected: {', '.join(motion_keywords)}")
-
         # Identity scoring: same shape as motion magnitude - analyse the bytes we already
         # have, attach numbers to the segment. CPU only, and never raises.
         identity_fields = await _score_segment_identity(
@@ -966,7 +952,6 @@ async def execute_segment(
 
         segment_result = SegmentResult(
             status="completed",
-            motion_keywords=motion_keywords if motion_keywords else None,
             motion_magnitude=motion_magnitude,
             **identity_fields,
         )
