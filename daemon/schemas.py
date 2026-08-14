@@ -39,8 +39,6 @@ class SegmentClaim(BaseModel):
     # Identity scoring ground truth: segment 0's start frame. NOT initial_reference_image -
     # that is the PainterLongVideo anchor and is overridable.
     identity_ground_truth: Optional[str] = None
-    motion_keywords: Optional[list[str]] = None
-    previous_motion_keywords: Optional[list[str]] = None
     previous_motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
     lightx2v_strength_high: Optional[float] = None
@@ -89,7 +87,6 @@ class SegmentResult(BaseModel):
     last_frame_path: Optional[str] = None
     error_message: Optional[str] = None
     progress_log: Optional[str] = None
-    motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
     # Identity scoring, measured inline at step 7 alongside motion_magnitude.
     # Two means, not one: _mean_cos is vs the START FRAME (how far this generation drifted),
