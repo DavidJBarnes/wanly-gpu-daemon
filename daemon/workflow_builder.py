@@ -32,7 +32,13 @@ WAN_I2V_API_WORKFLOW: dict[str, Any] = {
         "inputs": {
             "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
             "type": "wan",
-            "device": "default",
+            # Text encoder on CPU. On "default" the 6.4GB umt5-xxl sits in VRAM for the whole
+            # render (ComfyUI never evicts it), and in CFG>1 mode — 13.5GB activation reserve
+            # via /tmp/wanly_estimate — that leaves ~2.6GB for the 14B expert: 11.5GB of
+            # weights stream over PCIe every step. Encoding runs once per segment; the CPU
+            # cost is seconds against minutes-per-step savings. (Keeper edit from #47,
+            # lost in the 2026-07-07 rollback.)
+            "device": "cpu",
         },
     },
     "85": {
