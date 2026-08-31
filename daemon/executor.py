@@ -685,6 +685,7 @@ async def _score_segment_identity(
     video_data: bytes,
     queue: QueueClient,
     progress: "ProgressLog",
+    step: str = "[7/7]",
 ) -> dict:
     """Measure identity on the finished segment. NEVER raises - a scoring failure must not
     fail a generation that already succeeded, so every path returns a dict (empty on failure).
@@ -732,10 +733,10 @@ async def _score_segment_identity(
             identity_score.score_video, video_data, start_bytes, ref_bytes
         )
         if score is None:
-            await progress.log(f"[7/7] Identity: not scored ({reason})")
+            await progress.log(f"{step} Identity: not scored ({reason})")
             logger.info("Identity not scored for segment %d: %s", segment.index, reason)
             return {}
-        await progress.log(f"[7/7] Identity: {score.summary()}")
+        await progress.log(f"{step} Identity: {score.summary()}")
         logger.info("Identity score for segment %d: %s", segment.index, score.summary())
         return identity_score.as_result_fields(score)
     except Exception as e:

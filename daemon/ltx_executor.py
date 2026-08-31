@@ -120,7 +120,11 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         if motion_magnitude:
             await progress.log(f"[6/6] Motion magnitude: {motion_magnitude:.2f} px/frame")
 
-        identity_fields = await _score_segment_identity(segment, video_data, queue, progress)
+        # The shared scorer defaults to the WAN path's "[7/7]"; this path has six steps,
+        # and a progress log that counts 1..6 then prints 7/7 reads as a missing step.
+        identity_fields = await _score_segment_identity(
+            segment, video_data, queue, progress, step="[6/6]"
+        )
         metrics = identity_fields.get("identity_metrics")
         if isinstance(metrics, dict) and motion_series:
             metrics["series_motion"] = motion_series
