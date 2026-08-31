@@ -67,3 +67,34 @@ def test_the_modules_are_not_imported_anywhere_in_the_daemon():
         assert "import identity_score" not in src, f"{f.name} imports identity_score"
         assert "import motion_analyzer" not in src, f"{f.name} imports motion_analyzer"
         assert "from daemon.motion_analyzer" not in src, f"{f.name} imports motion_analyzer"
+
+
+def test_uploading_a_result_is_not_gated_on_any_metric():
+    """The segment's status update must not depend on a measurement existing.
+
+    It used to read `if result and result.motion_magnitude:` — so a render whose motion
+    measured 0.0 never had its result sent, and the segment sat un-updated. Removing the
+    metrics turned that latent bug into an AttributeError on every completed segment.
+
+    Whether a metric was produced has nothing to do with whether the segment finished.
+    """
+    import inspect
+    import textwrap
+    from daemon import queue_client
+
+    # Parsed, not grepped: the explanatory comment in that function names the very attribute
+    # this asserts absent, so a text search matches its own documentation.
+    src = textwrap.dedent(inspect.getsource(queue_client.QueueClient.upload_segment_output))
+    fn = ast.parse(src).body[0]
+    guards = [n.test for n in ast.walk(fn) if isinstance(n, ast.If)]
+    for test in guards:
+        names = {
+            getattr(a, "attr", "") for a in ast.walk(test) if isinstance(a, ast.Attribute)
+        }
+        assert not (names & {"motion_magnitude"}), (
+            "the result upload is gated on a metric again — status has nothing to do with "
+            "whether a measurement was produced"
+        )
+        assert not any(n.startswith("identity_") for n in names), (
+            "the result upload is gated on an identity metric"
+        )

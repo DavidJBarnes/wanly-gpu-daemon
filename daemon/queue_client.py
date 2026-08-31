@@ -124,7 +124,14 @@ class QueueClient:
             _raise_with_details(resp, f"upload_segment_output {segment_id}")
         logger.info("Uploaded segment output via API for %s", segment_id)
 
-        if result and result.motion_magnitude:
+        # Unconditional. This was `if result and result.motion_magnitude:` — the segment's
+        # status update rode on a metric being truthy, so a render whose motion happened to
+        # measure 0.0 never got its result sent at all. Removing motion analysis (#151) turned
+        # that latent bug into an AttributeError on every completed segment.
+        #
+        # `result` carries the status. Whether any metric was produced has nothing to do with
+        # whether the segment finished.
+        if result:
             await self.update_segment(segment_id, result)
 
     async def upload_hologram_output(
