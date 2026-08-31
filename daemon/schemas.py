@@ -55,10 +55,6 @@ class SegmentClaim(BaseModel):
     continuation_mode: str = "traditional"
     generation_engine: Optional[str] = None
     previous_output_path: Optional[str] = None
-    # Seed re-anchor: when True (resolved API-side — setting on AND this segment has a
-    # successor), faceswap the extracted last frame to the canonical identity face before
-    # it seeds the next i2v segment. Falls back to the raw seed if no face is detected.
-    # AR hologram (reprocess_type="ar_hologram"): source = the job's finalized stitched video.
     hologram_source_path: Optional[str] = None
     hologram_key_color: Optional[str] = None
     hologram_subject_height_m: Optional[float] = None

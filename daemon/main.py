@@ -530,7 +530,7 @@ async def run():
         if executing_event.is_set():
             # executing_event wraps the WHOLE of execute_segment, including the [7/7] upload —
             # so clearing it means the segment is finished and reported, not merely that the GPU
-            # went quiet. That distinction matters: decode, RIFE, stitching, faceswap and
+            # went quiet. That distinction matters: decode, RIFE and stitching all
             # identity scoring all run after the GPU idles, for 47s to over 2 minutes.
             logger.info(
                 "Waiting for current segment to finish (up to %ds)...",

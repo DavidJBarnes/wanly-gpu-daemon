@@ -25,7 +25,7 @@ LORA_NODE_IDS = {
 }
 
 # Base Wan2.2 14B Image-to-Video workflow in ComfyUI API format.
-# Dynamic nodes (RIFE, VHS_VideoCombine, faceswap, user LoRAs) are added at runtime.
+# Dynamic nodes (RIFE, VHS_VideoCombine, user LoRAs) are added at runtime.
 WAN_I2V_API_WORKFLOW: dict[str, Any] = {
     "84": {
         "class_type": "CLIPLoader",
