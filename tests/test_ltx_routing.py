@@ -70,3 +70,31 @@ def test_wan_model_validation_is_skipped_for_an_ltx_worker():
     assert 'settings.engine == "ltx"' in src
     head = src.index('if settings.engine == "ltx":')
     assert src.index("validate_models(comfyui)", head) > head
+
+
+def test_an_ltx_worker_does_not_clear_comfyuis_queue_at_startup():
+    """ltx-engine owns ComfyUI's queue on the LTX path.
+
+    The daemon clearing it at startup would kill whatever the engine is rendering — there is
+    one GPU and one queue, and a wholesale clear takes the in-flight job with it. The damage
+    is invisible from the daemon's side too: the engine reports its job failed, and nothing
+    connects that to a worker restart.
+
+    Under WAN the daemon DID own the queue, so the clear was correct there and stays.
+    """
+    src = _source("daemon/main.py")
+    tree = ast.parse(src)
+    guarded = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        # the clear_queue call has to sit under a test that mentions the engine
+        body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+        if "clear_queue" not in body:
+            continue
+        if "engine" in ast.dump(node.test):
+            guarded = True
+    assert guarded, (
+        "clear_queue at startup is not gated on settings.engine — an LTX worker restarting "
+        "mid-render would clear the engine's job out from under it"
+    )

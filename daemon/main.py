@@ -440,12 +440,26 @@ async def run():
         a1111_stat["a1111_running"],
     )
 
-    # Clear any orphaned ComfyUI queue items from previous daemon runs
-    if comfyui_running:
+    # Clear any orphaned ComfyUI queue items from previous daemon runs.
+    #
+    # NEVER on the LTX path. There, ltx-engine owns ComfyUI's queue — it patches the workflow,
+    # submits, and polls for its own job — so a daemon restarting mid-render would clear that
+    # job out from under it. There is one GPU and one queue, and clearing it kills whatever is
+    # actually rendering; the right way to remove something is to delete a specific pending
+    # item by prompt id.
+    #
+    # The damage would also be invisible from here: the engine reports its job failed or
+    # vanished, and the daemon never learns it caused that. A worker restart is exactly when
+    # someone is already debugging something else.
+    #
+    # Under WAN the daemon DID own the queue, so the clear was correct there and stays.
+    if comfyui_running and settings.engine != "ltx":
         if await comfyui.clear_queue():
             logger.info("Cleared ComfyUI queue")
         else:
             logger.warning("Failed to clear ComfyUI queue")
+    elif comfyui_running:
+        logger.info("Not clearing the ComfyUI queue — ltx-engine owns it")
 
     # Check and install required ComfyUI custom nodes
     nodes_ok = await check_and_install_nodes(comfyui)
