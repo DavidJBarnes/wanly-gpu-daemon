@@ -36,7 +36,7 @@ def test_character_lora_is_sent_per_stage_not_flat():
     not the signed-off configuration.
     """
     lora = _payload()["loras"][0]
-    assert lora["name"] == "k3lly2026_v2"
+    assert lora["name"] == "k3lly2026_v2.safetensors"
     assert lora["strength_stage_1"] == 0.8
     assert lora["strength_stage_2"] == 1.5
 
@@ -88,3 +88,48 @@ def test_start_frame_becomes_a_data_uri_keyframe():
 
 def test_no_start_frame_is_an_empty_keyframe_list():
     assert _payload(image_bytes=None)["keyframes"] == []
+
+
+def test_strengths_arrive_as_strings_from_the_sheet_and_are_coerced():
+    """GET /recipes returns char_s1/char_s2 as STRINGS — '0.8', not 0.8.
+
+    Verified against the live engine on 2026-08-31. The recipe sheet is the source of truth
+    and its cells serialise as text, so the blob stored on the segment carries strings. Sent
+    unconverted they would reach the engine as strings too; float() here is load-bearing, not
+    defensive tidying.
+    """
+    lora = _payload(recipe={**RECIPE, "char_s1": "0.8", "char_s2": "1.5"})["loras"][0]
+    assert lora["strength_stage_1"] == 0.8
+    assert lora["strength_stage_2"] == 1.5
+    assert isinstance(lora["strength_stage_2"], float)
+
+
+def test_payload_keys_match_the_engines_request_model():
+    """Every key must exist on ltx-engine's JobRequest.
+
+    Checked against the live /openapi.json on 2026-08-31: 27 fields, only `keyframes`
+    required, and nothing the daemon sends is rejected. This encodes the field NAMES so a
+    rename on either side shows up here rather than as a 422 ten minutes into a render.
+    """
+    engine_job_request_fields = {
+        "prompt", "negative_prompt", "loras", "workflow", "checkpoint", "cfg",
+        "multimodal_guidance", "stg", "rescale", "stg_blocks", "cfg_stage_1", "cfg_stage_2",
+        "distilled_lora_strength", "steps_stage_1", "steps_stage_2", "recipe", "character",
+        "keyframes", "width", "height", "num_frames", "frame_rate", "seed", "snap_indices",
+    }
+    assert set(_payload()) <= engine_job_request_fields
+
+
+def test_lora_name_is_sent_with_its_file_extension():
+    """The engine matches LoRAs by exact filename.
+
+    A real render failed with `no such lora 'pay_v2_e05'` while
+    'pay_v2_e05.safetensors' sat in the list the error itself printed. Names arrive bare
+    because that is how the recipe sheet wrote them and how the console displays them.
+    """
+    assert _payload()["loras"][0]["name"] == "k3lly2026_v2.safetensors"
+
+
+def test_an_already_qualified_name_is_not_double_suffixed():
+    lora = _payload(recipe={**RECIPE, "char_lora": "k3lly2026_v2.safetensors"})["loras"][0]
+    assert lora["name"] == "k3lly2026_v2.safetensors"
