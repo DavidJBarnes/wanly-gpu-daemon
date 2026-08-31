@@ -12,6 +12,28 @@ class Settings(BaseSettings):
     queue_api_key: str = ""
     poll_interval: int = 5
 
+    # Which generation engine this worker drives.
+    #
+    # "wan22" -> ComfyUI directly, via workflow_builder (the original path)
+    # "ltx"   -> ltx-engine over HTTP, which owns graph assembly itself
+    #
+    # LTX 2.3 replaces WAN 2.2 (wanly-gpu-docker#41), but the default stays "wan22" so that
+    # merging LTX support cannot change what an existing worker does. start.sh git-pulls this
+    # daemon on every boot, so a default flip here would retarget any running worker the moment
+    # it restarted. The LTX image sets ENGINE=ltx explicitly instead.
+    engine: str = "wan22"
+
+    # ltx-engine's job API, in the same container. NOT ComfyUI on 8191: the engine owns the
+    # graph — it uploads keyframes, resolves the recipe, patches the workflow and submits.
+    # Driving ComfyUI directly for LTX would put graph assembly back in a caller, which is
+    # where every structural bug on that project came from.
+    ltx_engine_url: str = "http://localhost:8190"
+    # A render is 8-12 minutes and can queue behind another. Sized from the slowest realistic
+    # case and then doubled: a timeout that gives up early costs a finished render, and that
+    # has happened before (4 of 9 lost to a 90-minute wait loop).
+    ltx_timeout_seconds: int = 5400
+    ltx_poll_interval: int = 5
+
     # Model filenames (vary per GPU worker — override in .env)
     clip_model: str = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
     vae_model: str = "wan_2.1_vae.safetensors"
