@@ -43,7 +43,10 @@ def test_default_engine_is_wan_so_merging_this_changes_no_running_worker():
     ENGINE explicitly instead (wanly-gpu-docker#41).
     """
     from daemon.config import Settings
-    assert Settings().engine == "wan22"
+    # The FIELD default, not Settings(): instantiating reads .env, so this asserted whatever
+    # the local worker happened to be configured as. It passed in CI and failed on any box
+    # with a real .env — a test that measures the environment instead of the code.
+    assert Settings.model_fields["engine"].default == "wan22"
 
 
 def test_ltx_worker_does_not_claim_while_the_engine_is_down():

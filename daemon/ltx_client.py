@@ -74,6 +74,17 @@ def build_submit_payload(
         lora = recipe.get("char_lora")
         s1, s2 = recipe.get("char_s1"), recipe.get("char_s2")
         if lora and s1 is not None and s2 is not None:
+            # The engine matches LoRAs by EXACT filename. Its own recipe path appends the
+            # extension; the explicit-lora path this uses does not. Names arrive bare because
+            # that is how the recipe sheet wrote them and how the console displays them, so a
+            # real render died on `no such lora 'pay_v2_e05'` while 'pay_v2_e05.safetensors'
+            # sat in the very list the error printed.
+            #
+            # Normalised here, at the boundary that talks to the engine, rather than in the
+            # database: what a LoRA is CALLED is a display concern and what file it IS is the
+            # engine's, and everything in between should not have to agree on the extension.
+            if not lora.endswith(".safetensors"):
+                lora = f"{lora}.safetensors"
             # Per-stage, never flat. Stage 1 generates at half size from noise and stage 2
             # refines the 2x-upscaled latent; the validated recipe runs 0.8 then 1.5, and
             # collapsing them to one number is a different configuration.
