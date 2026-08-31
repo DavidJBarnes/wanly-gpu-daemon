@@ -27,14 +27,6 @@ class SegmentClaim(BaseModel):
     speed: float = 1.0
     start_image: Optional[str] = None
     loras: Optional[list[LoraItem]] = None
-    faceswap_enabled: bool
-    faceswap_method: Optional[str] = None
-    faceswap_source_type: Optional[str] = None
-    faceswap_image: Optional[str] = None
-    faceswap_model: Optional[str] = None
-    faceswap_pixel_boost: Optional[str] = None
-    faceswap_faces_order: Optional[str] = None
-    faceswap_faces_index: Optional[str] = None
     initial_reference_image: Optional[str] = None
     # Identity scoring ground truth: segment 0's start frame. NOT initial_reference_image -
     # that is the PainterLongVideo anchor and is overridable.
@@ -66,7 +58,6 @@ class SegmentClaim(BaseModel):
     # Seed re-anchor: when True (resolved API-side — setting on AND this segment has a
     # successor), faceswap the extracted last frame to the canonical identity face before
     # it seeds the next i2v segment. Falls back to the raw seed if no face is detected.
-    seed_faceswap: bool = False
     # AR hologram (reprocess_type="ar_hologram"): source = the job's finalized stitched video.
     hologram_source_path: Optional[str] = None
     hologram_key_color: Optional[str] = None

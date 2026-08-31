@@ -18,7 +18,7 @@ The reference-image parameters are still ACCEPTED, because segments queued with 
 identity_reference_image must keep building.
 """
 
-from tests.test_seed_reanchor import make_segment
+from tests.conftest import make_segment
 
 from daemon.workflow_builder import build_workflow
 
