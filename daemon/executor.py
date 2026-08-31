@@ -758,6 +758,17 @@ async def execute_segment(
     if segment.reprocess_type == "smashcut_concat":
         return await _execute_smashcut_concat(segment, queue)
 
+    # LTX 2.3 renders go to ltx-engine, which owns graph assembly. Imported here rather than
+    # at module scope because ltx_executor reuses this module's helpers — the deferred import
+    # is what keeps that from being a cycle.
+    #
+    # Selected by config, not by inspecting the segment: ENGINE is a property of the worker
+    # (which models and services its container actually has), not of the job. A worker without
+    # ltx-engine must never claim-and-attempt an LTX render on the strength of a field.
+    if settings.engine == "ltx":
+        from daemon.ltx_executor import execute_ltx_segment
+        return await execute_ltx_segment(segment, queue)
+
     # Retired engines. wanly-api may still set these fields on older jobs, so they are
     # handled here rather than ignored silently:
     #   lynx — a different base model family (Wan2.1 T2V). No sensible fallback exists, and

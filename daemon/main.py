@@ -156,6 +156,19 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
             logger.error("Heartbeat failed: %s: %s", type(e).__name__, e)
 
 
+async def _ltx_healthy() -> bool:
+    """Is ltx-engine up and answering? Never raises — a probe failure means 'not now'."""
+    from daemon.ltx_client import LtxClient
+    client = LtxClient()
+    try:
+        await client.health()
+        return True
+    except Exception:
+        return False
+    finally:
+        await client.close()
+
+
 async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event):
     """Poll the queue for segments and execute them one at a time."""
     poll_count = 0
@@ -180,6 +193,15 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
         if not await comfyui.check_health():
             if poll_count == 0 or poll_count % 60 == 0:
                 logger.warning("ComfyUI offline — skipping poll")
+            poll_count += 1
+            continue
+
+        # Same rule for ltx-engine: claiming a segment this worker cannot render burns it.
+        # The segment would fail, and a failed segment is not free — it needs a human to
+        # notice and retry. Better to leave it queued for a worker that can take it.
+        if settings.engine == "ltx" and not await _ltx_healthy():
+            if poll_count == 0 or poll_count % 60 == 0:
+                logger.warning("ltx-engine offline — skipping poll")
             poll_count += 1
             continue
 
@@ -450,13 +472,27 @@ async def run():
     if cleaned:
         logger.info("Cleaned %d partial download(s)", cleaned)
 
-    # Pre-flight: validate all required models
-    models_ok = await validate_models(comfyui)
-    if not models_ok:
-        logger.error("Model validation failed. Exiting.")
-        await comfyui.close()
-        await queue.close()
-        return
+    # Which engine this worker drives, stated before anything else uses it. Per AGENTS.md the
+    # expensive failure here is silence: a worker on the wrong engine still produces plausible
+    # output that is not comparable to anything.
+    logger.info("ENGINE=%s", settings.engine)
+
+    # Pre-flight: validate all required models.
+    #
+    # MODEL_CHECKS describes the WAN 2.2 model set, so it is meaningless for an LTX worker and
+    # would refuse a perfectly good one. ltx-engine validates its own models at startup, and
+    # the LTX health gate below will not let this worker claim until it is up — so an LTX
+    # worker is checked, just by the service that knows what to check for.
+    # Replacing MODEL_CHECKS with the LTX set is wanly-gpu-docker#41.
+    if settings.engine == "ltx":
+        logger.info("Skipping WAN model validation — ltx-engine validates its own models")
+    else:
+        models_ok = await validate_models(comfyui)
+        if not models_ok:
+            logger.error("Model validation failed. Exiting.")
+            await comfyui.close()
+            await queue.close()
+            return
 
     # Log GPU/VRAM info
     system_info = await comfyui.get_system_info()

@@ -51,6 +51,11 @@ class SegmentClaim(BaseModel):
     sampler_name: Optional[str] = None       # KSampler sampler (None/"" -> daemon default euler)
     scheduler: Optional[str] = None          # KSampler scheduler (None/"" -> simple)
     negative_prompt: Optional[str] = None
+    # LTX recipe render: the RESOLVED (character, pose) configuration, passed through by the
+    # API. Never looked up here — an engine that cannot look a recipe up cannot look up a
+    # STALE one, which is the failure this shape exists to prevent (wanly-api#207).
+    # None means "not a recipe render"; an LTX free-form render is prompt-only.
+    ltx_recipe: Optional[dict] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
     # Retired engine selectors, still sent by wanly-api on older jobs. Kept on the schema so
