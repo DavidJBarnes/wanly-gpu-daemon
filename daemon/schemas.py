@@ -92,21 +92,3 @@ class SegmentResult(BaseModel):
     last_frame_path: Optional[str] = None
     error_message: Optional[str] = None
     progress_log: Optional[str] = None
-    motion_magnitude: Optional[float] = None
-    # Identity scoring, measured inline at step 7 alongside motion_magnitude.
-    # Two means, not one: _mean_cos is vs the START FRAME (how far this generation drifted),
-    # _mean_cos_ref is vs the identity reference (is it the character at all). A low mean with
-    # a flat slope is a weak-identity problem; a good mean with a steep slope is temporal drift.
-    identity_mean_cos: Optional[float] = None
-    identity_mean_cos_ref: Optional[float] = None
-    identity_min_cos: Optional[float] = None
-    identity_slope: Optional[float] = None
-    identity_frames: Optional[int] = None
-    identity_no_face: Optional[int] = None
-    identity_face_px_p50: Optional[float] = None
-    identity_yaw_max: Optional[float] = None
-    # Trajectory endpoints vs the job's ground truth. Loss across a segment is
-    # start - end; a continuation begins where the previous ended, so these chain.
-    identity_start_cos_ref: Optional[float] = None
-    identity_end_cos_ref: Optional[float] = None
-    identity_metrics: Optional[dict] = None

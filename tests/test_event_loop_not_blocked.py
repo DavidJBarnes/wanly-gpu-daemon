@@ -15,42 +15,55 @@ Three consequences, in increasing severity:
   3. The stale-claim reaper is documented as safe because "a healthy worker mid-render is still
      heartbeating". That premise was false, so a segment still being finished could be reclaimed
      by another worker.
+
+**Both analyses were removed entirely in #151** — they cost more wall clock than the render
+they measured, and they existed to compensate for WAN 2.2 drifting. So the stall cannot happen
+today for want of a subject.
+
+This file stays because the LESSON outlives the code: any heavy CPU work added to the
+execution path has to go off the event loop, and the third consequence above means the cost of
+forgetting is not cosmetic. These tests now guard the removal, so the stall cannot come back by
+the same door.
 """
 
 import ast
 import inspect
 from pathlib import Path
 
-from daemon import executor
+from daemon import executor, ltx_executor
 
-BLOCKING_CALLS = ["measure_motion_series", "identity_score.score_video"]
-
-
-def _executor_source() -> str:
-    return Path(inspect.getfile(executor)).read_text()
+REMOVED = ["measure_motion_series", "identity_score", "_score_segment_identity"]
 
 
-class TestOffloaded:
-    def test_heavy_analysis_runs_in_a_thread(self):
-        src = _executor_source()
-        for call in BLOCKING_CALLS:
-            # The call must appear as an argument to to_thread, never invoked directly.
-            assert f"asyncio.to_thread(\n            {call}" in src or f"asyncio.to_thread({call}" in src, (
-                f"{call} must be offloaded with asyncio.to_thread — inline it blocks the "
-                f"heartbeat for its whole duration"
+def _sources() -> dict[str, str]:
+    return {
+        "executor": Path(inspect.getfile(executor)).read_text(),
+        "ltx_executor": Path(inspect.getfile(ltx_executor)).read_text(),
+    }
+
+
+def test_the_blocking_analyses_are_gone_from_both_executors():
+    for name, src in _sources().items():
+        tree = ast.parse(src)
+        called = {
+            n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", "")
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+        }
+        for gone in REMOVED:
+            assert gone not in called, (
+                f"{name} calls {gone}, removed in #151. If heavy analysis is ever "
+                f"reintroduced it must be offloaded with asyncio.to_thread — inline it "
+                f"blocks the heartbeat, and the stale-claim reaper assumes heartbeats "
+                f"continue mid-render."
             )
 
-    def test_no_direct_invocation_remains(self):
-        """A leftover direct call would reintroduce the stall even with a threaded one present."""
-        tree = ast.parse(_executor_source())
-        offenders = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            name = ast.unparse(node.func)
-            if name not in BLOCKING_CALLS:
-                continue
-            # Fine when it is the *argument* to to_thread (that is a Name/Attribute, not a Call),
-            # so any Call node with these names is a direct invocation.
-            offenders.append(name)
-        assert not offenders, f"called directly on the event loop: {offenders}"
+
+def test_the_modules_are_not_imported_anywhere_in_the_daemon():
+    """An import is how a removal quietly grows back."""
+    root = Path(inspect.getfile(executor)).parent
+    for f in root.glob("*.py"):
+        src = f.read_text()
+        assert "import identity_score" not in src, f"{f.name} imports identity_score"
+        assert "import motion_analyzer" not in src, f"{f.name} imports motion_analyzer"
+        assert "from daemon.motion_analyzer" not in src, f"{f.name} imports motion_analyzer"

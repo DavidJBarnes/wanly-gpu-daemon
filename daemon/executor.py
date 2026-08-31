@@ -29,8 +29,6 @@ from PIL import Image
 
 from daemon.comfyui_client import ComfyUIClient, ComfyUIExecutionError
 from daemon.lora_sync import ensure_loras_available
-from daemon.motion_analyzer import measure_motion_series
-from daemon import identity_score
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
@@ -680,69 +678,6 @@ async def _execute_smashcut_concat(segment: SegmentClaim, queue: QueueClient) ->
 
 
 
-async def _score_segment_identity(
-    segment: SegmentClaim,
-    video_data: bytes,
-    queue: QueueClient,
-    progress: "ProgressLog",
-) -> dict:
-    """Measure identity on the finished segment. NEVER raises - a scoring failure must not
-    fail a generation that already succeeded, so every path returns a dict (empty on failure).
-
-    Two references, because they answer different questions:
-      start frame       - how far did THIS generation drift from where it began
-      identity reference- is it the character at all
-    The start frame is the one that isolates the model's own drift; the identity reference is
-    bounded by how close the start frame already was (0.708 on the CTRL clip).
-    """
-    try:
-        start_bytes = None
-        if segment.start_image and segment.start_image.startswith("s3://"):
-            try:
-                start_bytes = await _download_with_retry(
-                    lambda: queue.download_file(segment.start_image), "identity_start_frame"
-                )
-            except Exception as e:
-                logger.info("identity: could not fetch start frame (%s)", e)
-
-        # Ground truth is segment 0's start frame - the job's starting image - and nothing
-        # else. Explicitly NOT initial_reference_image: that field is the PainterLongVideo
-        # anchor and can be overridden, which would silently change what "her" means
-        # partway through a measurement. "Her" is where the job began.
-        ref_bytes = None
-        truth = segment.identity_ground_truth
-        if truth and truth.startswith("s3://"):
-            try:
-                ref_bytes = await _download_with_retry(
-                    lambda: queue.download_file(truth), "identity_ground_truth",
-                )
-            except Exception as e:
-                logger.info("identity: could not fetch ground truth (%s)", e)
-
-        # insightface detection + recognition over every frame: 9s at 480p, but 126s on a 720p
-        # segment and 3m43s on one continuation. Run inline it blocked the daemon's event loop
-        # for that whole time, which stopped the heartbeat — and the API marks a worker offline
-        # after 120s of silence.
-        #
-        # That was not merely cosmetic. The offline sweep overwrites a `draining` status, so a
-        # pending drain was silently lost; and the stale-claim reaper's premise is explicitly
-        # "a healthy worker mid-render is still heartbeating", which stopped being true, putting
-        # a still-running segment at risk of being reclaimed by another worker.
-        score, reason = await asyncio.to_thread(
-            identity_score.score_video, video_data, start_bytes, ref_bytes
-        )
-        if score is None:
-            await progress.log(f"[7/7] Identity: not scored ({reason})")
-            logger.info("Identity not scored for segment %d: %s", segment.index, reason)
-            return {}
-        await progress.log(f"[7/7] Identity: {score.summary()}")
-        logger.info("Identity score for segment %d: %s", segment.index, score.summary())
-        return identity_score.as_result_fields(score)
-    except Exception as e:
-        logger.warning("identity: scoring wrapper failed (%s) - segment unaffected", e)
-        return {}
-
-
 async def execute_segment(
     segment: SegmentClaim,
     comfyui: ComfyUIClient,
@@ -940,32 +875,9 @@ async def execute_segment(
                 segment, last_frame_data, comfyui, queue, progress,
             )
 
-        # Optical flow over every frame — synchronous OpenCV, ~38s measured at 289 frames.
-        # Off the event loop, or the heartbeat stops for its duration (see below).
-        motion_magnitude, motion_series = await asyncio.to_thread(
-            measure_motion_series, video_data
-        )
-        if motion_magnitude:
-            await progress.log(f"[7/7] Motion magnitude: {motion_magnitude:.2f} px/frame")
-
-        # Identity scoring: same shape as motion magnitude - analyse the bytes we already
-        # have, attach numbers to the segment. CPU only, and never raises.
-        identity_fields = await _score_segment_identity(
-            segment, video_data, queue, progress,
-        )
-
-        # Motion is measured separately from the face metrics, so its series is merged in here
-        # rather than at the source. All four then live in one blob and the chart can read them
-        # together without the console knowing which subsystem produced which.
-        metrics = identity_fields.get("identity_metrics")
-        if isinstance(metrics, dict) and motion_series:
-            metrics["series_motion"] = motion_series
-
-        segment_result = SegmentResult(
-            status="completed",
-            motion_magnitude=motion_magnitude,
-            **identity_fields,
-        )
+        # Identity scoring and motion analysis removed — see #151. They cost more wall clock
+        # than the render they measured, and they existed to compensate for WAN 2.2 drifting.
+        segment_result = SegmentResult(status="completed")
         await queue.upload_segment_output(segment.id, video_data, last_frame_data, segment_result)
         step_times.append(("upload", time.monotonic() - t0))
 

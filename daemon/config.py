@@ -68,19 +68,6 @@ class Settings(BaseSettings):
     depth_scale_m: float = 0.30
 
 
-    # Identity scoring device. Defaults to CPU, which is what every recorded identity score to
-    # date was produced on.
-    #
-    # Moving it to GPU is issue #106 and is NOT yet justified: the measurement that motivated it
-    # (scoring = 23-29% of job time) did not reproduce — a later run scored 289 frames in 9s, and
-    # motion analysis, not scoring, dominated that phase. Worse, nobody has yet checked whether
-    # CUDA and CPU produce the SAME embeddings. If they differ, every score after the switch sits
-    # on a different scale from every score before it, and the recorded history stops being
-    # comparable — the same hazard the DET_SIZE comment warns about.
-    #
-    # So: opt in per worker, never on by default, until #106 measures both the speedup and the
-    # embedding agreement.
-    identity_scoring_gpu: bool = False
 
     # How long a drain waits for the in-flight segment before giving up.
     #
