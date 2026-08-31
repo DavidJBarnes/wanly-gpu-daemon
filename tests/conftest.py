@@ -24,7 +24,6 @@ def make_segment(**overrides: Any) -> SegmentClaim:
         "index": 0,
         "prompt": "a woman walking through a forest",
         "duration_seconds": 5.4,
-        "faceswap_enabled": False,
         "width": 832,
         "height": 480,
         "fps": 15,

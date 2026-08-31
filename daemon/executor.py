@@ -32,11 +32,7 @@ from daemon.lora_sync import ensure_loras_available
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
-from daemon.workflow_builder import (
-    build_workflow,
-    build_faceswap_workflow,
-    build_seed_faceswap_workflow,
-)
+from daemon.workflow_builder import build_workflow
 from daemon.config import settings
 from daemon.hologram import (
     GUARD_PX,
@@ -123,29 +119,6 @@ async def _resolve_start_image(
     return start_image
 
 
-async def _resolve_faceswap_image(
-    segment: SegmentClaim, comfyui: ComfyUIClient, queue: QueueClient
-) -> str | None:
-    """If faceswap_image is an S3 path, download via API and upload to ComfyUI."""
-    if not segment.faceswap_enabled or not segment.faceswap_image:
-        return None
-
-    faceswap_image = segment.faceswap_image
-    if faceswap_image.startswith("s3://"):
-        logger.info("Downloading faceswap image via API: %s", faceswap_image)
-        data = await _download_with_retry(
-            lambda: queue.download_file(faceswap_image), "faceswap_image"
-        )
-        _validate_image_data(data, "faceswap_image")
-        ext = os.path.splitext(faceswap_image)[1] or ".png"
-        filename = f"faceswap_{segment.id}{ext}"
-        comfyui_filename = await comfyui.upload_image(data, filename)
-        logger.info("Uploaded faceswap image to ComfyUI as: %s", comfyui_filename)
-        return comfyui_filename
-
-    return faceswap_image
-
-
 def _find_image_output(history: dict) -> dict | None:
     """Find a SaveImage output (node 186) in ComfyUI history. Returns filename info or None."""
     outputs = history.get("outputs", {})
@@ -168,102 +141,6 @@ def _images_differ(a: bytes, b: bytes, threshold: float = 1.0) -> bool:
     if ia is None or ib is None or ia.shape != ib.shape:
         return True
     return float(np.abs(ia.astype(np.int16) - ib.astype(np.int16)).mean()) > threshold
-
-
-async def _clean_seed_frame(history: dict, comfyui: ComfyUIClient) -> bytes | None:
-    """Fetch the pre-swap last frame the workflow saved at node 206, if it is there.
-
-    Returns None when faceswap was off (no such node) or the download fails, in which case the
-    caller falls back to extracting from the finished video. Never raises: a missing seed must
-    degrade to the old behaviour, not fail a completed generation."""
-    try:
-        node = (history.get("outputs") or {}).get("206") or {}
-        images = node.get("images") or []
-        if not images:
-            return None
-        im = images[0]
-        data = await comfyui.download_output(
-            im["filename"], im.get("subfolder", ""), im.get("type", "output"),
-        )
-        _validate_image_data(data, "clean_seed")
-        return data
-    except Exception as e:
-        logger.warning("clean seed unavailable (%s) - falling back to the swapped frame", e)
-        return None
-
-
-async def _reanchor_seed_frame(
-    segment: SegmentClaim,
-    last_frame_data: bytes,
-    comfyui: ComfyUIClient,
-    queue: QueueClient,
-    progress: "ProgressLog",
-) -> bytes:
-    """Re-anchor the continuation seed (last frame) to the segment's own faceswap face
-    before it seeds the next i2v segment. FaceFusion passes the frame through unchanged when
-    no face is detected, so we diff the result and fall back to the raw seed on no-op/error.
-    NEVER raises — always returns a usable seed frame (swapped or raw), and logs which.
-
-    The face comes from segment.faceswap_image, which execute_segment has already resolved
-    to a ComfyUI filename by this point (see _resolve_faceswap_image). It used to come from
-    a hardcoded lora_id -> S3 face map, which limited the feature to two characters."""
-    try:
-        # Anchor to the SAME image identity is measured against — the job's starting image,
-        # which is segment 0's start frame. A separate faceswap portrait pulls the seed toward
-        # a different face than the one we score against, so even a perfect swap reads as a
-        # failure. Falls back to the configured faceswap face when no ground truth is set.
-        face_fn = segment.identity_ground_truth or segment.faceswap_image
-        if not face_fn:
-            logger.info("Seed re-anchor: segment %d has no faceswap face — kept raw seed", segment.index)
-            await progress.log("[seed] No faceswap face configured — kept raw frame")
-            return last_frame_data
-
-        # Normally already a ComfyUI filename. If the segment carries an unresolved S3 URI
-        # (faceswap disabled for the video but a face still selected), resolve it here.
-        if face_fn.startswith("s3://"):
-            face_data = await _download_with_retry(
-                lambda: queue.download_file(face_fn), "seed_face"
-            )
-            _validate_image_data(face_data, "seed_face")
-            ext = os.path.splitext(face_fn)[1] or ".png"
-            face_fn = await comfyui.upload_image(face_data, f"seedface_{segment.id}{ext}")
-
-        seed_fn = await comfyui.upload_image(last_frame_data, f"seed_{segment.id}.png")
-
-        # ALWAYS facefusion for a seed re-anchor, whatever the video's method is.
-        # ReActor selects the target face by POSITION (faces_index 0, left-right), so on a
-        # two-person frame it swaps the leftmost face — often the wrong person entirely. It
-        # still changes pixels, so the caller's diff reports success while her face is
-        # untouched. Measured cost of that on a real job: +0.014 cosine from a full swap.
-        # FaceFusion uses face_selector_mode="reference" and targets the face MATCHING the
-        # source, which is the only correct semantics for re-anchoring one specific identity.
-        seg = segment.model_copy(update={
-            "faceswap_image": face_fn,
-            "faceswap_method": "facefusion",
-        })
-        workflow = build_seed_faceswap_workflow(seg, seed_fn)
-        prompt_id, client_id = await comfyui.submit_workflow(workflow)
-        await comfyui.monitor_execution(prompt_id, client_id, progress=progress)
-        history = await comfyui.get_history(prompt_id)
-        img = _find_image_output(history)
-        if not img:
-            raise RuntimeError("no image output from seed faceswap")
-        swapped = await comfyui.download_output(
-            img["filename"], img.get("subfolder", ""), img.get("type", "output"),
-        )
-        _validate_image_data(swapped, "swapped_seed")
-
-        if _images_differ(last_frame_data, swapped):
-            logger.info("Seed re-anchor: identity faceswapped onto segment %d seed", segment.index)
-            await progress.log("[seed] Re-anchored identity via faceswap")
-            return swapped
-        logger.info("Seed re-anchor: no face detected on segment %d seed — kept raw", segment.index)
-        await progress.log("[seed] No face detected on seed — kept raw frame")
-        return last_frame_data
-    except Exception as e:  # graceful fallback — a bad swap must never break continuation
-        logger.warning("Seed re-anchor failed on segment %d (%s) — kept raw seed", segment.index, e)
-        await progress.log(f"[seed] Faceswap errored ({type(e).__name__}) — kept raw frame")
-        return last_frame_data
 
 
 async def _extract_last_frame(video_data: bytes) -> bytes:
@@ -312,96 +189,6 @@ async def _run_ffmpeg(args: list[str]) -> None:
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-500:]}")
-
-
-async def _execute_faceswap_reprocess(
-    segment: SegmentClaim,
-    comfyui: ComfyUIClient,
-    queue: QueueClient,
-) -> None:
-    """Apply faceswap to an existing completed video without regenerating it."""
-    logger.info(
-        "=== Faceswap reprocess segment %d (job %s) === method: %s",
-        segment.index, str(segment.job_id)[:8], segment.faceswap_method or "facefusion",
-    )
-
-    progress = ProgressLog(segment.id, queue)
-    segment_start = time.monotonic()
-
-    try:
-        if not segment.output_path:
-            raise RuntimeError("No output_path on segment — cannot reprocess without existing video")
-        # Step 1: Download existing video from S3
-        await progress.log("[1/5] Downloading existing video...")
-        video_data = await _download_with_retry(
-            lambda: queue.download_file(segment.output_path), "existing_video"
-        )
-        video_mb = len(video_data) / (1024 * 1024)
-        await progress.log(f"[1/5] Video downloaded ({video_mb:.1f} MB)")
-
-        # Step 2: Upload video + faceswap image to ComfyUI
-        await progress.log("[2/5] Uploading to ComfyUI...")
-        video_filename = f"reprocess_{segment.id}.mp4"
-        comfyui_video = await comfyui.upload_video(video_data, video_filename)
-        logger.info("Uploaded existing video to ComfyUI as: %s", comfyui_video)
-
-        faceswap_comfyui_filename = await _resolve_faceswap_image(segment, comfyui, queue)
-        if faceswap_comfyui_filename:
-            segment = segment.model_copy(update={"faceswap_image": faceswap_comfyui_filename})
-        await progress.log("[2/5] Files ready in ComfyUI")
-
-        # Step 3: Build and submit faceswap-only workflow
-        await progress.log("[3/5] Building faceswap workflow...")
-        workflow = build_faceswap_workflow(segment, comfyui_video)
-        prompt_id, client_id = await comfyui.submit_workflow(workflow)
-        await progress.log(f"[3/5] Submitted (prompt_id={prompt_id[:8]})")
-
-        # Step 4: Wait for execution
-        await progress.log("[4/5] Waiting for faceswap execution...")
-        await comfyui.monitor_execution(prompt_id, client_id, progress=progress)
-        await progress.log("[4/5] Execution complete")
-
-        # Step 5: Download output, extract last frame, upload
-        await progress.log("[5/5] Downloading result and uploading...")
-        history = await comfyui.get_history(prompt_id)
-        video_info = comfyui.find_video_output(history)
-        if not video_info:
-            raise RuntimeError("No video output found in ComfyUI history")
-
-        result_data = await comfyui.download_output(
-            filename=video_info["filename"],
-            subfolder=video_info.get("subfolder", ""),
-            output_type=video_info.get("type", "output"),
-        )
-        last_frame_data = await _extract_last_frame(result_data)
-
-        segment_result = SegmentResult(status="completed")
-        await queue.upload_segment_output(segment.id, result_data, last_frame_data, segment_result)
-
-        total = time.monotonic() - segment_start
-        logger.info("Faceswap reprocess segment %d complete in %.1fs", segment.index, total)
-
-    except ComfyUIExecutionError as e:
-        error_msg = f"ComfyUI error: {e}"
-        if e.node_id:
-            error_msg += f" (node {e.node_id} [{e.node_type}])"
-        logger.error(error_msg)
-        if e.traceback:
-            logger.error("Traceback:\n%s", e.traceback)
-        await queue.update_segment(
-            segment.id,
-            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
-        )
-
-    except Exception as e:
-        error_msg = f"{type(e).__name__}: {e}"
-        if hasattr(e, "response") and hasattr(e.response, "text"):
-            error_msg += f"\nResponse: {e.response.text[:500]}"
-        logger.exception("Faceswap reprocess segment %s failed", segment.id)
-        await queue.update_segment(
-            segment.id,
-            SegmentResult(status="failed", error_message=error_msg[:2000], progress_log=progress.text),
-        )
 
 
 def _holo_process_frames_sync(
@@ -684,9 +471,6 @@ async def execute_segment(
     queue: QueueClient,
 ) -> None:
     """Execute a single segment end-to-end."""
-    if segment.reprocess_type == "faceswap":
-        return await _execute_faceswap_reprocess(segment, comfyui, queue)
-
     if segment.reprocess_type == "ar_hologram":
         return await _execute_ar_hologram(segment, comfyui, queue)
 
@@ -764,11 +548,6 @@ async def execute_segment(
             else:
                 initial_ref_filename = ref_image
 
-        # Step 1c: Resolve faceswap image
-        faceswap_comfyui_filename = await _resolve_faceswap_image(segment, comfyui, queue)
-        if faceswap_comfyui_filename:
-            await progress.log(f"[1/7] Faceswap image ready: {faceswap_comfyui_filename}")
-            segment = segment.model_copy(update={"faceswap_image": faceswap_comfyui_filename})
         step_times.append(("images", time.monotonic() - t0))
 
         # Step 2: Ensure LoRA files
@@ -857,23 +636,7 @@ async def execute_segment(
         # Step 7: Extract last frame + measure motion + upload
         t0 = time.monotonic()
         await progress.log("[7/7] Extracting last frame and uploading...")
-        # Prefer the PRE-SWAP last frame as the continuation seed. A swap costs ~18% of face
-        # detail (inswapper rebuilds the face from a 512-d embedding), and seeding the next
-        # segment from a swapped frame makes that compound: measured 233 -> 130 across seg0,
-        # 101 after it became conditioning, 79 by the end of seg1. The seed does not need to
-        # carry identity -- the next segment's own faceswap restores it on every output frame.
-        last_frame_data = await _clean_seed_frame(history, comfyui)
-        if last_frame_data is not None:
-            await progress.log("[7/7] Continuation seed taken BEFORE the faceswap (keeps face detail)")
-        else:
-            last_frame_data = await _extract_last_frame(video_data)
-
-        # Seed re-anchor: faceswap the last frame to the canonical identity before it seeds
-        # the next segment (only fires when API resolved seed_faceswap=True). Never raises.
-        if getattr(segment, "seed_faceswap", False):
-            last_frame_data = await _reanchor_seed_frame(
-                segment, last_frame_data, comfyui, queue, progress,
-            )
+        last_frame_data = await _extract_last_frame(video_data)
 
         # Identity scoring and motion analysis removed — see #151. They cost more wall clock
         # than the render they measured, and they existed to compensate for WAN 2.2 drifting.

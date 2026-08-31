@@ -25,7 +25,7 @@ LORA_NODE_IDS = {
 }
 
 # Base Wan2.2 14B Image-to-Video workflow in ComfyUI API format.
-# Dynamic nodes (RIFE, VHS_VideoCombine, faceswap, user LoRAs) are added at runtime.
+# Dynamic nodes (RIFE, VHS_VideoCombine, user LoRAs) are added at runtime.
 WAN_I2V_API_WORKFLOW: dict[str, Any] = {
     "84": {
         "class_type": "CLIPLoader",
@@ -232,205 +232,6 @@ def _add_user_loras(workflow: dict, loras: list[dict]) -> None:
     workflow["102"]["inputs"]["model"] = [last_low_node, 0]
 
 
-def _add_faceswap(
-    workflow: dict,
-    segment: SegmentClaim,
-    input_node: str = "87",
-    reference_face_distance: float = 0.8,
-) -> None:
-    """Add face swap nodes (188 LoadImage + 183 FaceSwap).
-
-    input_node controls where frames come from: "87" (VAEDecode) for generation
-    workflows, or "400" (VHS_LoadVideo) for faceswap-only reprocessing.
-
-    reference_face_distance is the threshold FaceFusion uses in face_selector_mode
-    "reference": a target face is swapped only when its embedding is within this
-    distance of the source. That is how the RIGHT person gets picked in a two-person
-    frame — by identity, not by position. The seed re-anchor overrides it upward; see
-    build_seed_faceswap_workflow for why.
-    """
-    workflow["188"] = {
-        "class_type": "LoadImage",
-        "inputs": {"image": segment.faceswap_image},
-        "_meta": {"title": "Face Swap Source"},
-    }
-
-    faces_order = segment.faceswap_faces_order or "left-right"
-    faces_index = segment.faceswap_faces_index or "0"
-
-    if segment.faceswap_method == "reactor":
-        workflow["189"] = {
-            "class_type": "ReActorOptions",
-            "inputs": {
-                "input_faces_order": faces_order,
-                "input_faces_index": faces_index,
-                "detect_gender_input": "no",
-                "source_faces_order": "left-right",
-                "source_faces_index": "0",
-                "detect_gender_source": "no",
-                "console_log_level": 1,
-                "restore_swapped_only": True,
-            },
-            "_meta": {"title": "ReActor Options"},
-        }
-        workflow["183"] = {
-            "class_type": "ReActorFaceSwapOpt",
-            "inputs": {
-                "enabled": True,
-                "swap_model": "inswapper_128.onnx",
-                "facedetection": "retinaface_resnet50",
-                "face_restore_model": "codeformer-v0.1.0.pth",
-                "face_restore_visibility": 1.0,
-                "codeformer_weight": 0.8,
-                "input_image": [input_node, 0],
-                "source_image": ["188", 0],
-                "options": ["189", 0],
-            },
-            "_meta": {"title": "ReActor Face Swap"},
-        }
-        logger.info("Added ReActor face swap nodes")
-    else:
-        # FaceFusion (default)
-        facefusion_inputs: dict[str, Any] = {
-            "source_images": ["188", 0],
-            "target_image": [input_node, 0],
-            "api_token": "-1",
-            # inswapper_128 is 128px native, so a 256/512 model stretches the crop
-            # half as far or not at all. The node's own default is hyperswap_1c_256.
-            "face_swapper_model": segment.faceswap_model or "inswapper_128",
-            "face_detector_model": "retinaface",
-            # 512x512 on a ~100px face interpolates 5x then pixel-unshuffles into 16
-            # strided sub-images carrying no extra real signal - ~16x compute for nothing.
-            # Only worth raising when the face genuinely has >128px of detail.
-            "pixel_boost": segment.faceswap_pixel_boost or "512x512",
-            "face_occluder_model": "xseg_1",
-            "face_parser_model": "bisenet_resnet_34",
-            "face_mask_blur": 0.3,
-            "face_selector_mode": "reference",
-            "face_position": int(faces_index),
-            "sort_order": faces_order,
-            "score_threshold": 0.5,
-            "use_box_mask": True,
-            "use_occlusion_mask": True,
-            "use_area_mask": True,
-            "use_region_mask": False,
-            # The FaceFusion masks INTERSECT (box ∩ occlusion ∩ area), so an area only gets
-            # swapped if it's listed here. "mouth" is deliberately excluded: with it in, the
-            # source lips overwrite whatever motion the generation produced, flattening the
-            # face. Leaving it out swaps identity everywhere else (incl. jaw/chin via
-            # "lower-face") while the generated lip/mouth motion survives. See #133.
-            "face_mask_areas": "upper-face,lower-face",
-            "face_mask_regions": "skin,nose,mouth,upper-lip,lower-lip",
-            "face_mask_padding": "0,0,0,0",
-            "reference_image": ["188", 0],
-            "reference_face_distance": reference_face_distance,
-        }
-        workflow["183"] = {
-            "class_type": "AdvancedSwapFaceImage",
-            "inputs": facefusion_inputs,
-            "_meta": {"title": "FaceFusion Face Swap"},
-        }
-        logger.info("Added FaceFusion face swap nodes")
-
-
-def build_faceswap_workflow(segment: SegmentClaim, video_filename: str) -> dict:
-    """Build a faceswap-only workflow: load video at 15fps → faceswap → RIFE → encode.
-
-    Matches the normal generation pipeline: faceswap on native-rate frames,
-    then RIFE interpolates back to target fps.
-    """
-    gen = _calculate_generation_params(segment.fps, segment.duration_seconds, segment.speed)
-    workflow: dict[str, Any] = {}
-
-    workflow["400"] = {
-        "class_type": "VHS_LoadVideo",
-        "inputs": {
-            "video": video_filename,
-            "force_rate": float(GENERATION_FPS),
-            "custom_width": 0,
-            "custom_height": 0,
-            "frame_load_cap": 0,
-            "skip_first_frames": 0,
-            "select_every_nth": 1,
-        },
-        "_meta": {"title": "Load Existing Video @ 15fps"},
-    }
-
-    _add_faceswap(workflow, segment, input_node="400")
-
-    rife_multiplier = gen["rife_multiplier"]
-    workflow["200"] = {
-        "class_type": "RIFE VFI",
-        "inputs": {
-            "ckpt_name": "rife49.pth",
-            "clear_cache_after_n_frames": 10,
-            "multiplier": rife_multiplier,
-            "fast_mode": True,
-            "ensemble": True,
-            "scale_factor": 1.0,
-            "dtype": "float16",
-            "torch_compile": False,
-            "batch_size": 1,
-            "frames": ["183", 0],
-        },
-        "_meta": {"title": f"RIFE {rife_multiplier}x Interpolation"},
-    }
-
-    workflow["186"] = {
-        "class_type": "VHS_VideoCombine",
-        "inputs": {
-            "frame_rate": gen["output_fps"],
-            "loop_count": 0,
-            "filename_prefix": "output",
-            "format": "video/h264-mp4",
-            "pix_fmt": "yuv420p",
-            "crf": 15,
-            "save_metadata": True,
-            "trim_to_audio": False,
-            "pingpong": False,
-            "save_output": True,
-            "images": ["200", 0],
-        },
-        "_meta": {"title": "Video Combine"},
-    }
-
-    logger.info("Built faceswap-only workflow (%d nodes, rife %dx) for video: %s",
-                len(workflow), rife_multiplier, video_filename)
-    return workflow
-
-
-def build_seed_faceswap_workflow(segment: SegmentClaim, seed_filename: str) -> dict:
-    """Single-image faceswap of a continuation SEED frame (the extracted last frame),
-    re-anchoring identity to the canonical face before it seeds the next i2v segment.
-
-    Reuses the FaceFusion/ReActor node stack (node 183) on one still image instead of a
-    video. `segment.faceswap_image` must already point at the canonical face (the caller
-    sets it). If FaceFusion finds no face it passes the frame through unchanged — the
-    caller diffs the result to detect that and falls back to the raw seed.
-    """
-    workflow: dict[str, Any] = {}
-    workflow["400"] = {
-        "class_type": "LoadImage",
-        "inputs": {"image": seed_filename},
-        "_meta": {"title": "Seed frame (last frame)"},
-    }
-    # Looser reference threshold than the video path (0.8), and deliberately so.
-    # In a two-person frame the right face is chosen by matching the SOURCE identity, but
-    # the seed frame is by definition the drifted one — that is the reason to re-anchor it.
-    # A face measured at 0.663 cosine against the reference can fall outside a 0.8 threshold,
-    # in which case FaceFusion swaps nothing and the fix silently no-ops exactly when it is
-    # needed most. 1.0 is the value validated on the NSFW face-swap work. It still excludes
-    # the male partner, whose embedding distance from her is far larger than either bound.
-    _add_faceswap(workflow, segment, input_node="400", reference_face_distance=1.0)
-    workflow["186"] = {
-        "class_type": "SaveImage",
-        "inputs": {"filename_prefix": "seed_swap", "images": ["183", 0]},
-        "_meta": {"title": "Re-anchored seed"},
-    }
-    logger.info("Built seed-faceswap workflow (%d nodes) for seed: %s", len(workflow), seed_filename)
-    return workflow
-
-
 def build_workflow(
     segment: SegmentClaim,
     start_image_filename: str | None = None,
@@ -542,16 +343,9 @@ def build_workflow(
     if segment.loras:
         _add_user_loras(workflow, [item.model_dump() for item in segment.loras])
 
-    # Face swap (before RIFE so it processes only native WAN frames, not
-    # interpolated ones — cuts faceswap frame count by 50-75%)
-    faceswap = segment.faceswap_enabled and segment.faceswap_image
-    if faceswap:
-        _add_faceswap(workflow, segment)
-
-    # RIFE frame interpolation — reads from faceswap output if enabled,
-    # otherwise directly from VAEDecode
+    # RIFE frame interpolation, straight from VAEDecode
     rife_multiplier = gen["rife_multiplier"]
-    rife_input = ["183", 0] if faceswap else ["87", 0]
+    rife_input = ["87", 0]   # straight from VAEDecode; nothing sits between any more
     workflow["200"] = {
         "class_type": "RIFE VFI",
         "inputs": {
@@ -568,29 +362,6 @@ def build_workflow(
         },
         "_meta": {"title": f"RIFE {rife_multiplier}x Interpolation"},
     }
-
-    # Clean continuation seed: the last PRE-SWAP frame, saved alongside the swapped video.
-    #
-    # The deliverable keeps the swap, but the frame that seeds the NEXT segment should not.
-    # Measured on a real 2x5s chain: face detail runs 233 -> 130 across seg0, drops to 101 as
-    # that swapped frame becomes conditioning, then 101 -> 79 in seg1 — 66% of facial detail
-    # gone by the end. A swap costs ~18% detail because inswapper rebuilds the face from a
-    # 512-d embedding, and seeding from it makes that cost compound segment over segment.
-    #
-    # The seed does not need to carry identity: the next segment's own faceswap restores it on
-    # every output frame. So seed from the sharp original instead and let the swap do its job
-    # downstream. Pre-RIFE index, because node 87 is the raw VAEDecode batch.
-    if faceswap:
-        workflow["205"] = {
-            "class_type": "ImageFromBatch",
-            "inputs": {"image": ["87", 0], "batch_index": gen["wan_frames"] - 1, "length": 1},
-            "_meta": {"title": "Last frame, pre-swap"},
-        }
-        workflow["206"] = {
-            "class_type": "SaveImage",
-            "inputs": {"filename_prefix": "clean_seed", "images": ["205", 0]},
-            "_meta": {"title": "Clean continuation seed"},
-        }
 
     # VHS_VideoCombine output — always reads from RIFE (last processing step)
     video_input = ["200", 0]
@@ -613,7 +384,7 @@ def build_workflow(
     }
 
     logger.info(
-        "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, speed=%.1fx, seed=%d, faceswap=%s",
+        "Built workflow: %dx%d, %d frames @ %dfps, RIFE %dx, speed=%.1fx, seed=%d",
         segment.width,
         segment.height,
         gen["wan_frames"],
@@ -621,6 +392,5 @@ def build_workflow(
         rife_multiplier,
         segment.speed,
         segment.seed,
-        faceswap,
     )
     return workflow
