@@ -8,24 +8,21 @@ and driving ComfyUI over a websocket, this hands the job to ltx-engine, which ow
 assembly and recipe resolution.
 
 What is the SAME is everything either side of that, and deliberately so — the start image
-still comes from the queue, and the finished mp4 still gets its last frame extracted, its
-motion measured, its identity scored and its bytes uploaded through exactly the same calls.
-That is what makes an LTX render appear in Videos, carry identity chips and accept
-observations without any of that machinery knowing which engine produced it.
+still comes from the queue, and the finished mp4 still gets its last frame extracted and its
+bytes uploaded through exactly the same calls. That is what makes an LTX render appear in
+Videos and accept observations without any of that machinery knowing which engine produced
+it.
 """
 
-import asyncio
 import logging
 import time
 
 from daemon.executor import (
     _download_with_retry,
     _extract_last_frame,
-    _score_segment_identity,
     _validate_image_data,
 )
 from daemon.ltx_client import LtxClient, LtxEngineError
-from daemon.motion_analyzer import measure_motion_series
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
@@ -112,23 +109,19 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         await progress.log("[6/6] Extracting last frame and uploading...")
         last_frame_data = await _extract_last_frame(video_data)
 
-        # Identical to the WAN path from here. Motion is synchronous OpenCV over every frame
-        # (~38s at 289 frames), so it goes off the event loop or the heartbeat stops with it.
-        motion_magnitude, motion_series = await asyncio.to_thread(
-            measure_motion_series, video_data
-        )
-        if motion_magnitude:
-            await progress.log(f"[6/6] Motion magnitude: {motion_magnitude:.2f} px/frame")
-
-        identity_fields = await _score_segment_identity(segment, video_data, queue, progress)
-        metrics = identity_fields.get("identity_metrics")
-        if isinstance(metrics, dict) and motion_series:
-            metrics["series_motion"] = motion_series
-
+        # No identity scoring, no motion analysis. Measured on a 241-frame render they cost
+        # 326s and 15-39s against a 263s render — post-processing outweighed the render it
+        # analysed.
+        #
+        # They existed to compensate for WAN 2.2 drifting: measure the damage, then re-roll
+        # or re-anchor against the measurement. LTX holds identity from the character LoRA
+        # and the start frame, so there is nothing to compensate for, and the metrics were
+        # never trustworthy anyway — expression rewards the mouth-gape artifact it should
+        # penalise, and motion scored a 5-rated segment BELOW a 3-rated one. Human ratings
+        # are the judgement that counts. See #151.
         await queue.upload_segment_output(
             segment.id, video_data, last_frame_data,
-            SegmentResult(status="completed", motion_magnitude=motion_magnitude,
-                          **identity_fields),
+            SegmentResult(status="completed"),
         )
         logger.info("Segment %d complete in %.1fs", segment.index, time.monotonic() - started)
 
