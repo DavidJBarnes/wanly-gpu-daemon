@@ -71,6 +71,11 @@ def build_submit_payload(
         for key in ("recipe", "character"):
             if recipe.get(key):
                 payload[key] = recipe[key]
+        # `is not None`, not truthiness: img_compression 0 is a real setting — it bypasses
+        # the conditioning-frame encode — and a falsy check would drop it, leaving the engine
+        # on its workflow default while the pose said otherwise.
+        if recipe.get("img_compression") is not None:
+            payload["img_compression"] = int(recipe["img_compression"])
         lora = recipe.get("char_lora")
         s1, s2 = recipe.get("char_s1"), recipe.get("char_s2")
         if lora and s1 is not None and s2 is not None:
