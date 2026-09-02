@@ -159,3 +159,90 @@ async def test_prefixed_keys_land_flat_where_comfyui_looks(lora_dir):
     assert (lora_dir / "k3lly2026_v2.safetensors").exists()          # flat
     assert not (lora_dir / "character").exists()                     # no subdirectory
     assert q.downloaded == ["s3://ltx-loras/character/k3lly2026_v2.safetensors"]
+
+
+# ---------------------------------------------------------------------------------------
+# On-demand fetch at claim time.
+#
+# The boot sync is a snapshot; the console offers a LoRA the moment it reaches the bucket.
+# Without this, a pose naming a newly published LoRA fails every segment until somebody
+# restarts the pod — the queue waiting on an operator for something the worker could just
+# download.
+# ---------------------------------------------------------------------------------------
+
+
+async def test_a_lora_published_after_boot_is_fetched_at_claim(lora_dir):
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([{
+        "name": "sfbehind_LTX2_3_v0_1.safetensors", "kind": "content",
+        "key": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors",
+    }])
+    got = await lora_sync.ensure_named_loras_present(["sfbehind_LTX2_3_v0_1"], q)
+    assert got == ["sfbehind_LTX2_3_v0_1.safetensors"]
+    assert (lora_dir / "sfbehind_LTX2_3_v0_1.safetensors").exists()
+
+
+async def test_the_common_case_costs_no_network_call(lora_dir):
+    """Both LoRAs already present — the overwhelmingly normal claim.
+
+    It must not list the catalogue, and must not re-hash: 650 MB per LoRA per segment to
+    re-answer what boot already answered would be seconds of GPU time thrown away.
+    """
+    _write(str(lora_dir / "k3lly2026_v2.safetensors"), b"X")
+    _write(str(lora_dir / "sfbehind_LTX2_3_v0_1.safetensors"), b"Y")
+
+    class Loud(FakeQueue):
+        async def list_loras(self):
+            raise AssertionError("must not hit the API when everything is present")
+
+    got = await lora_sync.ensure_named_loras_present(
+        ["k3lly2026_v2", "sfbehind_LTX2_3_v0_1"], Loud([]))
+    assert got == []
+
+
+async def test_none_and_empty_are_not_treated_as_filenames(lora_dir):
+    """"none" is how a pose says "no content LoRA". Looking it up would fetch nothing and
+    log a scary "not in the bucket" for a perfectly normal pose."""
+    class Loud(FakeQueue):
+        async def list_loras(self):
+            raise AssertionError("must not hit the API for 'none'")
+
+    assert await lora_sync.ensure_named_loras_present(["none", "", None], Loud([])) == []
+
+
+async def test_a_truncated_local_file_is_replaced_not_trusted(lora_dir):
+    """Present-but-tiny is what an interrupted fetch leaves behind. Treated as a hit, it
+    would be trusted forever and every render with it would fail in ComfyUI instead."""
+    p = lora_dir / "k3lly2026_v2.safetensors"
+    p.write_bytes(b"truncated")
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([{
+        "name": "k3lly2026_v2.safetensors", "kind": "character",
+        "key": "character/k3lly2026_v2.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/character/k3lly2026_v2.safetensors",
+    }])
+    assert await lora_sync.ensure_named_loras_present(["k3lly2026_v2"], q) == [
+        "k3lly2026_v2.safetensors"]
+    assert p.stat().st_size == BIG
+
+
+async def test_a_lora_that_was_never_uploaded_is_named_plainly(lora_dir, caplog):
+    """The pose references something not in the bucket at all. Nothing to fetch — but the
+    cause is "never published", not "download failed", and the log should say which."""
+    got = await lora_sync.ensure_named_loras_present(["ghost_lora"], FakeQueue([]))
+    assert got == []
+    assert "never uploaded" in caplog.text
+
+
+async def test_a_corrupt_on_demand_download_does_not_land(lora_dir):
+    """Same rule as the boot sync: verify before the rename, so the next claim never
+    inherits a bad file that now looks present."""
+    q = FakeQueue([{
+        "name": "k3lly2026_v2.safetensors", "kind": "character",
+        "key": "character/k3lly2026_v2.safetensors", "size": BIG, "etag": "0" * 32,
+        "multipart": False, "uri": "s3://ltx-loras/character/k3lly2026_v2.safetensors",
+    }])
+    assert await lora_sync.ensure_named_loras_present(["k3lly2026_v2"], q) == []
+    assert not (lora_dir / "k3lly2026_v2.safetensors").exists()
+    assert not (lora_dir / "k3lly2026_v2.safetensors.tmp").exists()
