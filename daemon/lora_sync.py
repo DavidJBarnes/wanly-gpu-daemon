@@ -245,3 +245,84 @@ async def sync_lora_catalog(queue: QueueClient) -> bool:
 
     logger.info("LoRA sync: %d fetched, %d already current", fetched, len(catalog) - fetched)
     return ok
+
+
+async def ensure_named_loras_present(
+    names: list[str | None], queue: QueueClient
+) -> list[str]:
+    """Fetch any of `names` this worker does not already hold. Returns what was fetched.
+
+    The boot sync (sync_lora_catalog) answers "is my whole set correct?" and verifies by
+    CONTENT, because a retrained LoRA republished under the same name is the failure that
+    renders a stranger. This answers a narrower question at claim time — "do I have a file
+    by this name at all?" — and deliberately does NOT re-verify hashes.
+
+    That split is the point. Hashing 650 MB per LoRA on every claim would cost seconds of
+    GPU time per segment to re-answer a question boot already answered, while the case this
+    exists for is simply a LoRA published after this worker booted. Correctness stays with
+    boot; availability lives here.
+
+    Missing LoRAs are fetched, not merely reported: a worker that could have downloaded the
+    file and instead failed the segment is a worker that made the queue wait for a restart.
+    """
+    lora_dir = _loras_dir()
+    os.makedirs(lora_dir, exist_ok=True)
+
+    wanted: list[str] = []
+    for raw in names:
+        if not raw:
+            continue
+        n = str(raw).strip()
+        if not n or n.lower() == "none":
+            continue
+        if not n.endswith(".safetensors"):
+            n += ".safetensors"
+        local = os.path.join(lora_dir, n)
+        # Size floor as well as existence: a truncated file from an interrupted fetch is
+        # present but useless, and would otherwise be treated as a hit forever.
+        if os.path.exists(local) and os.path.getsize(local) >= MIN_LORA_SIZE:
+            continue
+        wanted.append(n)
+
+    if not wanted:
+        return []
+
+    logger.info("LoRA on-demand: %s not present locally — fetching", ", ".join(wanted))
+    try:
+        catalog = {o["name"]: o for o in await queue.list_loras()}
+    except Exception as e:
+        logger.error("LoRA on-demand: could not list the catalogue (%s)", e)
+        return []
+
+    fetched: list[str] = []
+    for name in wanted:
+        remote = catalog.get(name)
+        if remote is None:
+            # Nothing to fetch. Said plainly here so the engine's later "no such lora" is
+            # not the first hint, and so the cause reads as "not published" rather than
+            # "download failed".
+            logger.error(
+                "       %s: not in the bucket at all — the pose names a LoRA that was "
+                "never uploaded", name,
+            )
+            continue
+        local = os.path.join(lora_dir, name)
+        _cleanup_partials(lora_dir, name)
+        tmp = local + ".tmp"
+        try:
+            got = await queue.stream_file(remote["uri"], tmp)
+        except Exception as e:
+            logger.error("       %s: download failed: %s", name, e)
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            continue
+        # Verified before the rename, exactly as the boot sync does. A bad transfer must
+        # never take the place of a file the next claim will trust.
+        if not remote.get("multipart") and got != remote["etag"]:
+            logger.error("       %s: md5 mismatch after download — discarding", name)
+            os.remove(tmp)
+            continue
+        os.rename(tmp, local)
+        fetched.append(name)
+        logger.info("       %s: fetched (%.1f MB)", name, os.path.getsize(local) / (1024 * 1024))
+    return fetched

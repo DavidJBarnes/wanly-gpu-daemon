@@ -22,6 +22,7 @@ from daemon.executor import (
     _extract_last_frame,
     _validate_image_data,
 )
+from daemon.lora_sync import ensure_named_loras_present
 from daemon.ltx_client import LtxClient, LtxEngineError
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
@@ -79,6 +80,17 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         # back to duration x fps — but a recipe's own frame count wins, because it is part of
         # the configuration that was validated.
         num_frames = recipe.get("frames") or round(segment.duration_seconds * segment.fps)
+
+        # A LoRA the pose names may have been published AFTER this worker booted — the boot
+        # sync is a snapshot, and the console offers a LoRA the moment it reaches the bucket.
+        # Fetching it here turns "this segment fails until someone restarts the pod" into a
+        # one-off download. Costs a stat() per LoRA in the normal case, where both are
+        # already on disk.
+        fetched = await ensure_named_loras_present(
+            [recipe.get("char_lora"), recipe.get("content_lora")], queue
+        )
+        if fetched:
+            await progress.log(f"[2/6] Fetched missing LoRA(s): {', '.join(fetched)}")
 
         await progress.log("[2/6] Submitting to ltx-engine...")
         job_id = await client.submit(
