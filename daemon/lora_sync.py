@@ -4,6 +4,7 @@ Only downloads files that are missing locally. Files are cached forever.
 Uses atomic writes (.tmp → rename) to prevent corrupt partial files.
 """
 
+import hashlib
 import logging
 import os
 
@@ -91,3 +92,137 @@ async def ensure_loras_available(
                 f.write(data)
             os.rename(tmp_path, local_path)
             logger.info("       %s: %s saved (%.1f MB)", label, filename, mb)
+
+
+# ---------------------------------------------------------------------------
+# Catalogue sync: hold every LoRA the bucket has, not just the one a claim named.
+#
+# ensure_loras_available() above is the WAN-era, pull-on-demand path: it fetches what a
+# claimed segment names, and skips anything already on disk WITH THAT NAME. The LTX path
+# never had an equivalent at all, so an LTX worker could only ever use whatever happened to
+# be baked onto its volume — which is why a fresh pod renders nothing with a character.
+#
+# The trap this fixes, and the reason the diff is on content and not on names: LoRAs get
+# RETRAINED and republished under the same name. k3lly2026_v2 today is not the file that
+# name meant last week. A name-only check calls that a hit, keeps the old weights, and the
+# worker renders the wrong character while the console shows the right one — wrong output
+# rather than a failure, which is the expensive kind.
+# ---------------------------------------------------------------------------
+
+
+def _local_md5(path: str) -> str:
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _needs_download(local_path: str, remote: dict) -> str | None:
+    """Return a human reason to download, or None when the local copy is already right.
+
+    The reason is returned rather than logged here so the caller can put it in one line
+    per LoRA — when this goes wrong on a pod, the question is always "why did it decide
+    to (not) fetch this one", and the answer should be in the log without a rerun.
+    """
+    if not os.path.exists(local_path):
+        return "missing"
+
+    size = os.path.getsize(local_path)
+    if size < MIN_LORA_SIZE:
+        return f"local copy is only {size / (1024 * 1024):.1f} MB — truncated"
+
+    if remote.get("multipart"):
+        # A multipart ETag is "<md5-of-md5s>-<partcount>", not the md5 of the content, so
+        # there is nothing to compare it against. Falling back to size keeps us from
+        # re-downloading the same file on every single sync, forever; it also cannot catch
+        # a retrain that happened to land on the same byte count. Say so, out loud, rather
+        # than let a silent weaker check look like the strong one.
+        if size != remote["size"]:
+            return f"size {size} != remote {remote['size']}"
+        logger.warning(
+            "       %s: multipart ETag — verified by SIZE ONLY, a same-size retrain "
+            "would not be detected", os.path.basename(local_path),
+        )
+        return None
+
+    if size != remote["size"]:
+        return f"size {size} != remote {remote['size']}"
+
+    local = _local_md5(local_path)
+    if local != remote["etag"]:
+        return f"content changed (local md5 {local[:12]}, remote {remote['etag'][:12]})"
+
+    return None
+
+
+async def sync_lora_catalog(queue: QueueClient) -> bool:
+    """Diff the local LoRA directory against the bucket and fetch what differs.
+
+    Returns True when the local set matches the catalogue. Deliberately NOT fatal to boot:
+    a worker that exits here restart-loops, and a restart loop on a rented pod costs real
+    money and is miserable to diagnose (we have already lost an hour to one). A worker with
+    a missing LoRA fails the segment that needs it, loudly, with the name in the error —
+    which is a better failure than no worker at all.
+    """
+    lora_dir = _loras_dir()
+    os.makedirs(lora_dir, exist_ok=True)
+
+    try:
+        catalog = await queue.list_loras()
+    except Exception as e:
+        logger.error("LoRA sync: could not list the catalogue (%s) — keeping what is on disk", e)
+        return False
+
+    logger.info("LoRA sync: %d in the catalogue, checking %s", len(catalog), lora_dir)
+
+    ok = True
+    fetched = 0
+    for remote in catalog:
+        name = remote["name"]
+        local_path = os.path.join(lora_dir, name)
+        _cleanup_partials(lora_dir, name)
+
+        reason = _needs_download(local_path, remote)
+        if reason is None:
+            logger.info("       %s: current", name)
+            continue
+
+        logger.info("       %s: %s — downloading", name, reason)
+        tmp_path = local_path + ".tmp"
+        try:
+            got = await queue.stream_file(remote["uri"], tmp_path)
+        except Exception as e:
+            logger.error("       %s: download failed: %s", name, e)
+            ok = False
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            continue
+
+        # Verify BEFORE the rename, so a bad transfer can never take the place of a good
+        # local copy. The .tmp is dropped and whatever was there is left alone.
+        if not remote.get("multipart") and got != remote["etag"]:
+            logger.error(
+                "       %s: md5 mismatch after download (got %s, expected %s) — discarding",
+                name, got[:12], remote["etag"][:12],
+            )
+            os.remove(tmp_path)
+            ok = False
+            continue
+
+        size = os.path.getsize(tmp_path)
+        if size != remote["size"]:
+            logger.error(
+                "       %s: size mismatch after download (got %d, expected %d) — discarding",
+                name, size, remote["size"],
+            )
+            os.remove(tmp_path)
+            ok = False
+            continue
+
+        os.rename(tmp_path, local_path)
+        fetched += 1
+        logger.info("       %s: saved (%.1f MB)", name, size / (1024 * 1024))
+
+    logger.info("LoRA sync: %d fetched, %d already current", fetched, len(catalog) - fetched)
+    return ok

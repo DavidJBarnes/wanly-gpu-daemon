@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 import uuid
 from typing import Optional
@@ -201,6 +202,46 @@ class QueueClient:
         )
 
     # --- Worker registry methods (formerly in RegistryClient) ---
+
+    async def list_loras(self) -> list[dict]:
+        """Every character LoRA the API can serve, so this worker can diff against its disk.
+
+        Workers hold no AWS credentials on purpose, so they cannot list the bucket
+        themselves — the API does it for them. Returns [{name, size, etag, multipart, uri}].
+        """
+        resp = await self._request_with_retry("GET", "/loras", timeout=30)
+        if not resp.is_success:
+            _raise_with_details(resp, "list_loras")
+        return resp.json()
+
+    async def stream_file(self, s3_path: str, dest: str) -> str:
+        """Download to `dest`, returning the md5 of what actually landed.
+
+        Streams rather than using download_file(): that returns bytes, and a 700 MB LoRA
+        held whole in RAM on a pod sized for the GPU rather than the CPU is a needless way
+        to get OOM-killed. Hashing during the stream is free here and is what lets the
+        caller verify content instead of trusting the filename.
+
+        Same granular timeout as download_file: `read` caps the gap between chunks, so a
+        stall fails in ~60s while a slow-but-steady transfer of any size still completes.
+        """
+        timeout = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=15.0)
+        digest = hashlib.md5()
+        total = 0
+        with open(dest, "wb") as f:
+            async with self.client.stream(
+                "GET", "/files", params={"path": s3_path},
+                timeout=timeout, follow_redirects=True,
+            ) as resp:
+                if not resp.is_success:
+                    await resp.aread()
+                    _raise_with_details(resp, f"stream_file {s3_path}")
+                async for chunk in resp.aiter_bytes(1024 * 1024):
+                    f.write(chunk)
+                    digest.update(chunk)
+                    total += len(chunk)
+        logger.info("       streamed %.1f MB from %s", total / (1024 * 1024), s3_path)
+        return digest.hexdigest()
 
     async def register(
         self,
