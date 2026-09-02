@@ -279,6 +279,7 @@ class QueueClient:
         gpu_stats: dict | None = None,
         sd_scripts_status: dict | None = None,
         a1111_status: dict | None = None,
+        loras: dict | None = None,
     ) -> dict:
         """Send heartbeat. Returns full worker data including current friendly_name."""
         payload: dict = {"comfyui_running": comfyui_running}
@@ -288,6 +289,10 @@ class QueueClient:
             payload["sd_scripts"] = sd_scripts_status
         if a1111_status is not None:
             payload["a1111"] = a1111_status
+        # What the last sync concluded about this worker's LoRA directory. A cached verdict,
+        # not a fresh check — see lora_sync.inventory().
+        if loras is not None:
+            payload["loras"] = loras
         resp = await self._request_with_retry(
             "POST", f"/workers/{worker_id}/heartbeat", json=payload
         )
