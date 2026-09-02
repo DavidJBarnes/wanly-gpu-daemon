@@ -121,3 +121,41 @@ async def test_an_unreachable_catalogue_leaves_the_disk_alone(lora_dir):
 
     assert await lora_sync.sync_lora_catalog(Broken([])) is False
     assert open(path, "rb").read(7) == b"KEEP-ME"
+
+
+async def test_two_prefixes_claiming_one_filename_are_both_refused(lora_dir):
+    """The bucket files under character/ and content/, but files land here FLAT.
+
+    ComfyUI's LoraLoader and ltx_characters.char_lora both use the bare filename and neither
+    knows a prefix exists, so flattening is required. The cost is that two kinds can claim
+    one name — and the loser is silently overwritten, which renders a stranger successfully.
+    Refuse the pair; a skipped LoRA fails loudly, a swapped one does not.
+    """
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([
+        {"name": "clash.safetensors", "kind": "character", "key": "character/clash.safetensors",
+         "size": BIG, "etag": md5, "multipart": False, "uri": "s3://ltx-loras/character/clash.safetensors"},
+        {"name": "clash.safetensors", "kind": "content", "key": "content/clash.safetensors",
+         "size": BIG, "etag": md5, "multipart": False, "uri": "s3://ltx-loras/content/clash.safetensors"},
+    ])
+    assert await lora_sync.sync_lora_catalog(q) is False   # reported, not silently resolved
+    assert q.downloaded == []                              # neither one wins
+    assert not os.path.exists(lora_dir / "clash.safetensors")
+
+
+async def test_prefixed_keys_land_flat_where_comfyui_looks(lora_dir):
+    """A character/ key must become <lora_dir>/<basename>, not <lora_dir>/character/...
+
+    ComfyUI resolves lora_name relative to its loras directory, and the DB stores the bare
+    name. A file written into a subdirectory is a file ComfyUI cannot find.
+    """
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([{
+        "name": "k3lly2026_v2.safetensors", "kind": "character",
+        "key": "character/k3lly2026_v2.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/character/k3lly2026_v2.safetensors",
+    }])
+    assert await lora_sync.sync_lora_catalog(q) is True
+    assert (lora_dir / "k3lly2026_v2.safetensors").exists()          # flat
+    assert not (lora_dir / "character").exists()                     # no subdirectory
+    assert q.downloaded == ["s3://ltx-loras/character/k3lly2026_v2.safetensors"]

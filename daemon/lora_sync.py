@@ -176,10 +176,29 @@ async def sync_lora_catalog(queue: QueueClient) -> bool:
 
     logger.info("LoRA sync: %d in the catalogue, checking %s", len(catalog), lora_dir)
 
-    ok = True
+    # The bucket files LoRAs under character/ and content/, but they land here FLAT, because
+    # that is what a ComfyUI LoraLoader and ltx_characters.char_lora both expect — neither
+    # knows the prefix exists. Flattening means two kinds could claim one filename, and the
+    # second would silently overwrite the first: a character LoRA replaced by a motion LoRA
+    # renders a stranger, successfully. Refuse the pair rather than pick one.
+    seen: dict[str, str] = {}
+    clashing: set[str] = set()
+    for r in catalog:
+        prior = seen.get(r["name"])
+        if prior is not None and prior != r.get("key", r["name"]):
+            clashing.add(r["name"])
+            logger.error(
+                "       %s: same filename under two prefixes (%s and %s) — SKIPPING BOTH, "
+                "rename one in the bucket", r["name"], prior, r.get("key", r["name"]),
+            )
+        seen[r["name"]] = r.get("key", r["name"])
+
+    ok = not clashing
     fetched = 0
     for remote in catalog:
         name = remote["name"]
+        if name in clashing:
+            continue
         local_path = os.path.join(lora_dir, name)
         _cleanup_partials(lora_dir, name)
 
