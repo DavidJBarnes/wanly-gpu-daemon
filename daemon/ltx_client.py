@@ -100,25 +100,25 @@ def build_submit_payload(
                 "strength_stage_2": float(s2),
             }]
 
-    # The POSE's content LoRA — motion and act — chained ahead of the character LoRA on both
-    # stage branches. Sent as its own field, not appended to `loras`: that list is the
-    # CHARACTER LoRA on this path and the engine reads loras[0] as such, so a second entry
-    # would be silently taken for a character.
-    content = recipe.get("content_lora")
-    if content and str(content).strip().lower() != "none":
-        content = str(content).strip()
-        # Same extension normalisation, and for the same reason: names are stored bare
-        # because that is how they are displayed, and the engine matches files exactly.
-        if not content.endswith(".safetensors"):
-            content = f"{content}.safetensors"
-        payload["content_lora"] = content
-        # `is not None`, exactly as img_compression above. A content strength of 0 is a REAL
-        # setting: it loads the LoRA and gives it no weight, which is how you measure what it
-        # contributes. A falsy check would drop it and the engine would apply its 0.6
-        # default, so the measurement would silently be of a different configuration.
-        for key, field in (("content_s1", "content_s1"), ("content_s2", "content_s2")):
-            if recipe.get(key) is not None:
-                payload[field] = float(recipe[key])
+        # The POSE's content LoRA — motion and act — chained ahead of the character LoRA on both
+        # stage branches. Sent as its own field, not appended to `loras`: that list is the
+        # CHARACTER LoRA on this path and the engine reads loras[0] as such, so a second entry
+        # would be silently taken for a character.
+        content = recipe.get("content_lora")
+        if content and str(content).strip().lower() != "none":
+            content = str(content).strip()
+            # Same extension normalisation, and for the same reason: names are stored bare
+            # because that is how they are displayed, and the engine matches files exactly.
+            if not content.endswith(".safetensors"):
+                content = f"{content}.safetensors"
+            payload["content_lora"] = content
+            # `is not None`, exactly as img_compression above. A content strength of 0 is a REAL
+            # setting: it loads the LoRA and gives it no weight, which is how you measure what it
+            # contributes. A falsy check would drop it and the engine would apply its 0.6
+            # default, so the measurement would silently be of a different configuration.
+            for key, field in (("content_s1", "content_s1"), ("content_s2", "content_s2")):
+                if recipe.get(key) is not None:
+                    payload[field] = float(recipe[key])
     return payload
 
 
