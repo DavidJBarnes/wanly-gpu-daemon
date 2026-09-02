@@ -156,10 +156,31 @@ def _needs_download(local_path: str, remote: dict) -> str | None:
     return None
 
 
-async def sync_lora_catalog(queue: QueueClient) -> bool:
+async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = ("character",)) -> bool:
     """Diff the local LoRA directory against the bucket and fetch what differs.
 
-    Returns True when the local set matches the catalogue. Deliberately NOT fatal to boot:
+    EAGER ONLY FOR SOME KINDS, and by default only for character LoRAs.
+
+    Boot sync blocks registration, so every byte fetched here is a worker not yet taking
+    work. Measured on the 3090: one 408 MB content LoRA published while the pod was down
+    added FIVE MINUTES to boot, during which the queue had no worker. A content library is
+    expected to grow, so eager-fetching all of it makes every worker's boot slower forever,
+    for LoRAs most of them will never be asked for.
+
+    Character LoRAs stay eager because the set is small, bounded by how many characters
+    exist, and effectively every job names one — so fetching them at boot is work that was
+    going to happen on the first claim anyway.
+
+    Content LoRAs are left to ensure_named_loras_present() at claim time. The cost moves
+    from every boot to the first claim that actually needs one, which is the claim that was
+    going to wait for that download regardless.
+
+    Non-eager kinds are still CHECKED, and a stale one is reported — the diff is cheap and
+    silence about a LoRA that is present but wrong is exactly what the content comparison
+    exists to prevent. Only the download is deferred.
+
+    Returns True when everything eager is in place and nothing deferred looks broken.
+    Deliberately NOT fatal to boot:
     a worker that exits here restart-loops, and a restart loop on a rented pod costs real
     money and is miserable to diagnose (we have already lost an hour to one). A worker with
     a missing LoRA fails the segment that needs it, loudly, with the name in the error —
@@ -195,6 +216,7 @@ async def sync_lora_catalog(queue: QueueClient) -> bool:
 
     ok = not clashing
     fetched = 0
+    deferred: list[str] = []
     for remote in catalog:
         name = remote["name"]
         if name in clashing:
@@ -205,6 +227,14 @@ async def sync_lora_catalog(queue: QueueClient) -> bool:
         reason = _needs_download(local_path, remote)
         if reason is None:
             logger.info("       %s: current", name)
+            continue
+
+        kind = remote.get("kind", "character")
+        if kind not in eager_kinds:
+            # Checked, reported, and deliberately not fetched here. The claim that names it
+            # will fetch it; boot does not wait for a LoRA nothing has asked for yet.
+            deferred.append(name)
+            logger.info("       %s: %s — deferred (%s, fetched on demand)", name, reason, kind)
             continue
 
         logger.info("       %s: %s — downloading", name, reason)
@@ -243,7 +273,11 @@ async def sync_lora_catalog(queue: QueueClient) -> bool:
         fetched += 1
         logger.info("       %s: saved (%.1f MB)", name, size / (1024 * 1024))
 
-    logger.info("LoRA sync: %d fetched, %d already current", fetched, len(catalog) - fetched)
+    logger.info(
+        "LoRA sync: %d fetched, %d already current%s",
+        fetched, len(catalog) - fetched - len(deferred),
+        f", {len(deferred)} deferred to first use ({', '.join(deferred)})" if deferred else "",
+    )
     return ok
 
 

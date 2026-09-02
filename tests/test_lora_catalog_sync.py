@@ -6,6 +6,7 @@ the wrong character while the console shows the right one. That is wrong output 
 than a failure, so it is the one this file guards hardest.
 """
 import hashlib
+import logging
 import os
 
 import pytest
@@ -246,3 +247,74 @@ async def test_a_corrupt_on_demand_download_does_not_land(lora_dir):
     assert await lora_sync.ensure_named_loras_present(["k3lly2026_v2"], q) == []
     assert not (lora_dir / "k3lly2026_v2.safetensors").exists()
     assert not (lora_dir / "k3lly2026_v2.safetensors.tmp").exists()
+
+
+# ---------------------------------------------------------------------------------------
+# Boot sync is eager for characters only.
+#
+# Boot sync blocks registration, so every byte fetched there is a worker not yet taking
+# work. Measured on the 3090: one 408 MB content LoRA published while the pod was down
+# added five minutes to boot, with no worker on the queue for that time. The content
+# library is expected to grow; the character set is bounded by how many characters exist.
+# ---------------------------------------------------------------------------------------
+
+
+async def test_a_missing_character_lora_is_still_fetched_at_boot(lora_dir):
+    """Effectively every job names one, so this download was going to happen on the first
+    claim anyway. Doing it at boot costs nothing extra and keeps the first claim fast."""
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([{
+        "name": "k3lly2026_v2.safetensors", "kind": "character",
+        "key": "character/k3lly2026_v2.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/character/k3lly2026_v2.safetensors",
+    }])
+    assert await lora_sync.sync_lora_catalog(q) is True
+    assert q.downloaded == ["s3://ltx-loras/character/k3lly2026_v2.safetensors"]
+
+
+async def test_a_missing_content_lora_is_not_downloaded_at_boot(lora_dir):
+    """The five minutes this saves is five minutes of no worker on the queue, for a LoRA
+    that may never be asked for on this box."""
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([{
+        "name": "sfbehind_LTX2_3_v0_1.safetensors", "kind": "content",
+        "key": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors",
+    }])
+    assert await lora_sync.sync_lora_catalog(q) is True
+    assert q.downloaded == []                                     # deferred
+    assert not (lora_dir / "sfbehind_LTX2_3_v0_1.safetensors").exists()
+
+
+async def test_a_deferred_lora_is_still_checked_and_named(lora_dir, caplog):
+    """Deferring the DOWNLOAD must not mean skipping the CHECK.
+
+    A content LoRA that is present but stale is exactly what the content comparison exists
+    to catch, and silence about it would be the failure that renders the wrong motion.
+    """
+    # caplog captures WARNING and above by default; the deferral line is INFO, which is the
+    # right level for it — this is normal operation, not a problem.
+    caplog.set_level(logging.INFO, logger="daemon.lora_sync")
+    _write(str(lora_dir / "sfbehind_LTX2_3_v0_1.safetensors"), b"OLD")
+    q = FakeQueue([{
+        "name": "sfbehind_LTX2_3_v0_1.safetensors", "kind": "content",
+        "key": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": BIG,
+        "etag": hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest(),
+        "multipart": False, "uri": "s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors",
+    }])
+    await lora_sync.sync_lora_catalog(q)
+    assert "sfbehind_LTX2_3_v0_1.safetensors" in caplog.text
+    assert "deferred" in caplog.text
+    assert "content changed" in caplog.text     # the reason, not just the fact
+
+
+async def test_eager_kinds_is_overridable(lora_dir):
+    """A box that wants everything up front can still say so, without editing this file."""
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([{
+        "name": "sfbehind_LTX2_3_v0_1.safetensors", "kind": "content",
+        "key": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors",
+    }])
+    assert await lora_sync.sync_lora_catalog(q, eager_kinds=("character", "content")) is True
+    assert q.downloaded == ["s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors"]
