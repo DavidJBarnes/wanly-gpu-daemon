@@ -12,6 +12,7 @@ from daemon.model_validator import cleanup_partial_downloads, validate_models
 from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.gpu_stats import get_gpu_stats
+from daemon.lora_sync import sync_lora_catalog
 from daemon.resource_sync import sync_resources
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
 from daemon.a1111_monitor import get_status as get_a1111_status
@@ -476,6 +477,16 @@ async def run():
         await comfyui.close()
         await queue.close()
         return
+
+    # Pre-flight: pull down any character LoRA this worker does not already hold.
+    #
+    # Before the GPU loop starts, so a fresh pod is useful on its first claim instead of
+    # failing the first character segment it is handed. Non-fatal by design — see
+    # sync_lora_catalog(): a restart loop is a worse failure than a missing LoRA.
+    if not await sync_lora_catalog(queue):
+        logger.warning(
+            "LoRA sync incomplete — this worker may fail segments that name a missing LoRA"
+        )
 
     # Pre-flight: clean up partial downloads
     cleaned = cleanup_partial_downloads(settings.comfyui_path)
