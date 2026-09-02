@@ -86,11 +86,16 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         # Fetching it here turns "this segment fails until someone restarts the pod" into a
         # one-off download. Costs a stat() per LoRA in the normal case, where both are
         # already on disk.
+        # progress.log is passed in so the DOWNLOAD is visible on the job page, not just its
+        # completion. A 400 MB LoRA takes minutes; without this the segment sits at
+        # "[1/6] Start image ready" the whole time and is indistinguishable from a wedged
+        # worker. See console#392.
         fetched = await ensure_named_loras_present(
-            [recipe.get("char_lora"), recipe.get("content_lora")], queue
+            [recipe.get("char_lora"), recipe.get("content_lora")], queue,
+            progress=progress.log,
         )
         if fetched:
-            await progress.log(f"[2/6] Fetched missing LoRA(s): {', '.join(fetched)}")
+            await progress.log(f"[2/6] LoRA(s) ready: {', '.join(fetched)}")
 
         await progress.log("[2/6] Submitting to ltx-engine...")
         job_id = await client.submit(

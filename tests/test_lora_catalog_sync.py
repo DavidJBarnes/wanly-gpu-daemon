@@ -33,8 +33,13 @@ class FakeQueue:
     async def list_loras(self):
         return self.catalog
 
-    async def stream_file(self, uri, dest):
+    async def stream_file(self, uri, dest, on_progress=None, total: int = 0):
+        # Signature must track QueueClient.stream_file. When it drifted, the real code
+        # raised TypeError and the download loop's `except Exception` reported it as a
+        # failed transfer — a fake that is wrong in a way the tests cannot see.
         self.downloaded.append(uri)
+        if on_progress and total:
+            await on_progress(total, total)
         return _write(dest, self.content)
 
 
@@ -408,3 +413,64 @@ async def test_a_failed_download_reports_missing_not_current(lora_dir):
         "multipart": False, "uri": "s3://ltx-loras/character/k3lly2026_v2.safetensors",
     }]))
     assert _state("k3lly2026_v2.safetensors") == "missing"
+
+
+# ---------------------------------------------------------------------------------------
+# Download progress reaches the SEGMENT's log, not just the daemon's (console#392).
+#
+# This download happens inside a claimed segment and takes minutes on a 400 MB LoRA. Without
+# these lines the job page sits at "[1/6] Start image ready" the whole time, which is
+# indistinguishable from the wedged-worker failure in #160 — a slow step and a broken one
+# must not look the same.
+# ---------------------------------------------------------------------------------------
+
+
+async def test_the_job_page_is_told_before_the_download_starts(lora_dir):
+    """Announced up front, with the size, so a five-minute gap has a stated reason."""
+    lines: list[str] = []
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([{
+        "name": "sfbehind_LTX2_3_v0_1.safetensors", "kind": "content",
+        "key": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors",
+    }])
+    await lora_sync.ensure_named_loras_present(
+        ["sfbehind_LTX2_3_v0_1"], q, progress=lambda m: _collect(lines, m))
+
+    assert any("not on this worker" in ln for ln in lines)
+    assert any("Downloading sfbehind_LTX2_3_v0_1.safetensors" in ln and "MB" in ln
+               for ln in lines)
+
+
+async def test_progress_is_reported_while_it_transfers(lora_dir):
+    """A percentage moving is what distinguishes "slow" from "hung"."""
+    lines: list[str] = []
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    q = FakeQueue([{
+        "name": "x.safetensors", "kind": "content", "key": "content/x.safetensors",
+        "size": BIG, "etag": md5, "multipart": False, "uri": "s3://ltx-loras/content/x.safetensors",
+    }])
+    await lora_sync.ensure_named_loras_present(["x"], q, progress=lambda m: _collect(lines, m))
+    assert any("%" in ln for ln in lines)
+
+
+async def test_a_lora_that_was_never_uploaded_says_so_on_the_job_page(lora_dir):
+    """Otherwise the segment just fails later in the engine with `no such lora`, and the
+    cause — never published — is only visible to someone with shell on the box."""
+    lines: list[str] = []
+    await lora_sync.ensure_named_loras_present(
+        ["ghost"], FakeQueue([]), progress=lambda m: _collect(lines, m))
+    assert any("not in the bucket" in ln for ln in lines)
+
+
+async def test_nothing_is_posted_when_everything_is_present(lora_dir):
+    """The overwhelmingly common claim. It must not add noise to every segment's log."""
+    _write(str(lora_dir / "k3lly2026_v2.safetensors"), b"X")
+    lines: list[str] = []
+    await lora_sync.ensure_named_loras_present(
+        ["k3lly2026_v2"], FakeQueue([]), progress=lambda m: _collect(lines, m))
+    assert lines == []
+
+
+async def _collect(sink: list, msg: str) -> None:
+    sink.append(msg)
