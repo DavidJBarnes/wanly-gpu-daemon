@@ -366,7 +366,7 @@ async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = (
 
 
 async def ensure_named_loras_present(
-    names: list[str | None], queue: QueueClient
+    names: list[str | None], queue: QueueClient, progress=None
 ) -> list[str]:
     """Fetch any of `names` this worker does not already hold. Returns what was fetched.
 
@@ -382,6 +382,12 @@ async def ensure_named_loras_present(
 
     Missing LoRAs are fetched, not merely reported: a worker that could have downloaded the
     file and instead failed the segment is a worker that made the queue wait for a restart.
+
+    `progress` is the SEGMENT's progress log, not the daemon's. This download happens inside
+    a claimed segment and can take minutes on a 400 MB LoRA — without it the job page sits at
+    "[1/6] Start image ready" for five minutes and looks wedged, which is indistinguishable
+    from the real wedge in #160. Saying "downloading a LoRA, 40% of 408 MB" is the difference
+    between a slow step and a broken worker.
     """
     lora_dir = _loras_dir()
     os.makedirs(lora_dir, exist_ok=True)
@@ -406,6 +412,10 @@ async def ensure_named_loras_present(
         return []
 
     logger.info("LoRA on-demand: %s not present locally — fetching", ", ".join(wanted))
+    if progress:
+        await progress(
+            f"[2/6] {len(wanted)} LoRA(s) not on this worker — fetching: {', '.join(wanted)}"
+        )
     try:
         catalog = {o["name"]: o for o in await queue.list_loras()}
     except Exception as e:
@@ -423,12 +433,23 @@ async def ensure_named_loras_present(
                 "       %s: not in the bucket at all — the pose names a LoRA that was "
                 "never uploaded", name,
             )
+            if progress:
+                await progress(f"[2/6] {name} is not in the bucket — never uploaded")
             continue
         local = os.path.join(lora_dir, name)
         _cleanup_partials(lora_dir, name)
         tmp = local + ".tmp"
+        mb = remote.get("size", 0) / (1024 * 1024)
+        if progress:
+            await progress(f"[2/6] Downloading {name} ({mb:.0f} MB)...")
+
+        async def _tick(done, total, _name=name):
+            if progress and total:
+                await progress(f"[2/6] {_name}: {done * 100 // total}% of {total / (1024 * 1024):.0f} MB")
+
         try:
-            got = await queue.stream_file(remote["uri"], tmp)
+            got = await queue.stream_file(remote["uri"], tmp,
+                                          on_progress=_tick, total=remote.get("size", 0))
         except Exception as e:
             logger.error("       %s: download failed: %s", name, e)
             if os.path.exists(tmp):

@@ -214,7 +214,7 @@ class QueueClient:
             _raise_with_details(resp, "list_loras")
         return resp.json()
 
-    async def stream_file(self, s3_path: str, dest: str) -> str:
+    async def stream_file(self, s3_path: str, dest: str, on_progress=None, total: int = 0) -> str:
         """Download to `dest`, returning the md5 of what actually landed.
 
         Streams rather than using download_file(): that returns bytes, and a 700 MB LoRA
@@ -227,7 +227,6 @@ class QueueClient:
         """
         timeout = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=15.0)
         digest = hashlib.md5()
-        total = 0
         with open(dest, "wb") as f:
             async with self.client.stream(
                 "GET", "/files", params={"path": s3_path},
@@ -236,11 +235,20 @@ class QueueClient:
                 if not resp.is_success:
                     await resp.aread()
                     _raise_with_details(resp, f"stream_file {s3_path}")
+                # Report at quarters, not per chunk. Each callback is an API write on the
+                # segment's progress log, so per-chunk would post hundreds of rows for one
+                # download; quarters are enough to show it is moving and not wedged.
+                step = max(total // 4, 1) if total else 0
+                next_mark = step
+                done = 0
                 async for chunk in resp.aiter_bytes(1024 * 1024):
                     f.write(chunk)
                     digest.update(chunk)
-                    total += len(chunk)
-        logger.info("       streamed %.1f MB from %s", total / (1024 * 1024), s3_path)
+                    done += len(chunk)
+                    if on_progress and step and done >= next_mark:
+                        await on_progress(done, total)
+                        next_mark += step
+        logger.info("       streamed %.1f MB from %s", done / (1024 * 1024), s3_path)
         return digest.hexdigest()
 
     async def register(
