@@ -6,6 +6,7 @@ Uses atomic writes (.tmp → rename) to prevent corrupt partial files.
 
 import hashlib
 import logging
+from datetime import datetime, timezone
 import os
 
 from daemon.config import settings
@@ -108,6 +109,55 @@ async def ensure_loras_available(
 # worker renders the wrong character while the console shows the right one — wrong output
 # rather than a failure, which is the expensive kind.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------------------
+# The inventory this worker reports to the API (console#... / daemon#165).
+#
+# Deliberately a CACHE of what the last sync concluded, never a fresh computation. The
+# honest answer to "do I hold the right k3lly2026_v2?" is an md5 of 650 MB; doing that on
+# every heartbeat would hash gigabytes a minute to render a status page. sync_lora_catalog()
+# already reaches that verdict — this stores it.
+#
+# Which means it can go stale in one specific way: ensure_named_loras_present() changes the
+# disk mid-life, hours after boot. It updates this too. Without that the page would show
+# "deferred" for a LoRA already downloaded, which is worse than showing nothing — it is
+# confidently wrong.
+# ---------------------------------------------------------------------------------------
+
+# state          meaning                                            severity
+# current        present, md5 matches the ETag                      fine
+# deferred       absent BY DESIGN (content, fetched on demand)      fine
+# unverifiable   present, multipart ETag, size-only check           note
+# stale          present but the content differs                    the one that matters
+# missing        should be here and is not                          real problem
+_INVENTORY: dict = {"synced_at": None, "dir": None, "items": []}
+
+
+def inventory() -> dict:
+    """What the last sync concluded, for the heartbeat. Never recomputes."""
+    return dict(_INVENTORY, items=list(_INVENTORY["items"]))
+
+
+def _record(items: list[dict]) -> None:
+    _INVENTORY["synced_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _INVENTORY["dir"] = _loras_dir()
+    _INVENTORY["items"] = items
+
+
+def _note_fetched(names: list[str]) -> None:
+    """Mark on-demand fetches current, so the report does not contradict the disk."""
+    if not names:
+        return
+    by_name = {i["name"]: i for i in _INVENTORY["items"]}
+    for n in names:
+        item = by_name.get(n)
+        if item is not None:
+            item["state"] = "current"
+            item.pop("note", None)
+        else:
+            _INVENTORY["items"].append({"name": n, "kind": "unknown", "state": "current"})
+    _INVENTORY["synced_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _local_md5(path: str) -> str:
@@ -217,6 +267,10 @@ async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = (
     ok = not clashing
     fetched = 0
     deferred: list[str] = []
+    # One entry per catalogue object, carrying the verdict _needs_download() already reached.
+    # Built here rather than in a second pass so there is exactly one implementation of
+    # "is this current" — two would drift, which is the recipes.json trap in the wiki.
+    report: list[dict] = []
     for remote in catalog:
         name = remote["name"]
         if name in clashing:
@@ -227,6 +281,14 @@ async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = (
         reason = _needs_download(local_path, remote)
         if reason is None:
             logger.info("       %s: current", name)
+            report.append({
+                "name": name, "kind": remote.get("kind", "unknown"),
+                # A multipart ETag is not an md5, so "current" here rests on size alone.
+                # Surfaced rather than folded into "current", because the difference is
+                # exactly whether a same-size retrain would have been caught.
+                "state": "unverifiable" if remote.get("multipart") else "current",
+                **({"note": "multipart ETag — size only"} if remote.get("multipart") else {}),
+            })
             continue
 
         kind = remote.get("kind", "character")
@@ -235,6 +297,14 @@ async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = (
             # will fetch it; boot does not wait for a LoRA nothing has asked for yet.
             deferred.append(name)
             logger.info("       %s: %s — deferred (%s, fetched on demand)", name, reason, kind)
+            # "missing" is by design here and must not read as a fault; but a file that is
+            # PRESENT AND WRONG is a fault whether or not we chose to defer the download,
+            # so the two are reported differently.
+            report.append({
+                "name": name, "kind": kind,
+                "state": "deferred" if reason == "missing" else "stale",
+                "note": reason,
+            })
             continue
 
         logger.info("       %s: %s — downloading", name, reason)
@@ -271,7 +341,21 @@ async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = (
 
         os.rename(tmp_path, local_path)
         fetched += 1
+        report.append({"name": name, "kind": remote.get("kind", "unknown"),
+                       "state": "current"})
         logger.info("       %s: saved (%.1f MB)", name, size / (1024 * 1024))
+
+    # Whatever never made it into the report failed to download — present in the catalogue,
+    # absent from disk, and not deferred. That is the "real problem" state.
+    seen = {r["name"] for r in report}
+    for remote in catalog:
+        if remote["name"] not in seen and remote["name"] not in clashing:
+            report.append({"name": remote["name"], "kind": remote.get("kind", "unknown"),
+                           "state": "missing", "note": "download failed"})
+    for name in sorted(clashing):
+        report.append({"name": name, "kind": "conflict", "state": "missing",
+                       "note": "same filename on two shelves — refused"})
+    _record(report)
 
     logger.info(
         "LoRA sync: %d fetched, %d already current%s",
@@ -359,4 +443,6 @@ async def ensure_named_loras_present(
         os.rename(tmp, local)
         fetched.append(name)
         logger.info("       %s: fetched (%.1f MB)", name, os.path.getsize(local) / (1024 * 1024))
+    # Keep the reported inventory honest: this ran hours after boot and changed the disk.
+    _note_fetched(fetched)
     return fetched

@@ -318,3 +318,93 @@ async def test_eager_kinds_is_overridable(lora_dir):
     }])
     assert await lora_sync.sync_lora_catalog(q, eager_kinds=("character", "content")) is True
     assert q.downloaded == ["s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors"]
+
+
+# ---------------------------------------------------------------------------------------
+# The inventory reported to the API (daemon#165).
+#
+# The states carry intent, not just presence. Since #164 a content LoRA that is absent is
+# absent BY DESIGN, and a page that paints that red is amber on every worker forever — at
+# which point nobody reads it, and the one state worth seeing (stale) is lost in the noise.
+# ---------------------------------------------------------------------------------------
+
+
+def _state(name):
+    return next((i["state"] for i in lora_sync.inventory()["items"] if i["name"] == name), None)
+
+
+async def test_a_deferred_content_lora_is_not_reported_as_a_fault(lora_dir):
+    """Absent by design. This is the normal state for content LoRAs after #164."""
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    await lora_sync.sync_lora_catalog(FakeQueue([{
+        "name": "sfbehind_LTX2_3_v0_1.safetensors", "kind": "content",
+        "key": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors",
+    }]))
+    assert _state("sfbehind_LTX2_3_v0_1.safetensors") == "deferred"
+
+
+async def test_a_present_but_outdated_lora_reports_stale_even_when_deferred(lora_dir):
+    """The state this whole feature is for.
+
+    A worker holding an outdated k3lly2026_v2 renders the PREVIOUS character, successfully.
+    Choosing not to download it does not make a wrong file on disk acceptable, so deferral
+    must not swallow this into "deferred".
+    """
+    _write(str(lora_dir / "sfbehind_LTX2_3_v0_1.safetensors"), b"OLD")
+    await lora_sync.sync_lora_catalog(FakeQueue([{
+        "name": "sfbehind_LTX2_3_v0_1.safetensors", "kind": "content",
+        "key": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": BIG,
+        "etag": hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest(),
+        "multipart": False, "uri": "s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors",
+    }]))
+    assert _state("sfbehind_LTX2_3_v0_1.safetensors") == "stale"
+
+
+async def test_a_multipart_object_reports_unverifiable_not_current(lora_dir):
+    """"current" would overstate it: that verdict rests on size alone, so a same-size
+    retrain would have gone unnoticed. The difference is the whole point of saying so."""
+    _write(str(lora_dir / "big.safetensors"), b"X")
+    await lora_sync.sync_lora_catalog(FakeQueue([{
+        "name": "big.safetensors", "kind": "content", "key": "content/big.safetensors",
+        "size": BIG, "etag": "abc-7", "multipart": True,
+        "uri": "s3://ltx-loras/content/big.safetensors",
+    }]), eager_kinds=("character", "content"))
+    assert _state("big.safetensors") == "unverifiable"
+
+
+async def test_an_on_demand_fetch_updates_the_report(lora_dir):
+    """The disk changes hours after boot. Without this the page shows "deferred" for a LoRA
+    already downloaded — confidently wrong, which is worse than showing nothing."""
+    md5 = hashlib.md5(b"NEW" + b"\0" * (BIG - 3)).hexdigest()
+    obj = {"name": "sfbehind_LTX2_3_v0_1.safetensors", "kind": "content",
+           "key": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": BIG, "etag": md5,
+           "multipart": False, "uri": "s3://ltx-loras/content/sfbehind_LTX2_3_v0_1.safetensors"}
+    await lora_sync.sync_lora_catalog(FakeQueue([obj]))
+    assert _state("sfbehind_LTX2_3_v0_1.safetensors") == "deferred"
+
+    await lora_sync.ensure_named_loras_present(["sfbehind_LTX2_3_v0_1"], FakeQueue([obj]))
+    assert _state("sfbehind_LTX2_3_v0_1.safetensors") == "current"
+
+
+async def test_the_report_is_stamped_so_the_page_can_say_as_of(lora_dir):
+    """A cached verdict presented as live truth is a lie with a timestamp missing."""
+    _write(str(lora_dir / "k3lly2026_v2.safetensors"), b"X")
+    md5 = hashlib.md5(b"X" + b"\0" * (BIG - 1)).hexdigest()
+    await lora_sync.sync_lora_catalog(FakeQueue([{
+        "name": "k3lly2026_v2.safetensors", "kind": "character",
+        "key": "character/k3lly2026_v2.safetensors", "size": BIG, "etag": md5,
+        "multipart": False, "uri": "s3://ltx-loras/character/k3lly2026_v2.safetensors",
+    }]))
+    inv = lora_sync.inventory()
+    assert inv["synced_at"] and inv["dir"]
+
+
+async def test_a_failed_download_reports_missing_not_current(lora_dir):
+    """A character LoRA that should be here and is not. The genuinely broken case."""
+    await lora_sync.sync_lora_catalog(FakeQueue([{
+        "name": "k3lly2026_v2.safetensors", "kind": "character",
+        "key": "character/k3lly2026_v2.safetensors", "size": BIG, "etag": "0" * 32,
+        "multipart": False, "uri": "s3://ltx-loras/character/k3lly2026_v2.safetensors",
+    }]))
+    assert _state("k3lly2026_v2.safetensors") == "missing"

@@ -12,7 +12,7 @@ from daemon.model_validator import cleanup_partial_downloads, validate_models
 from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.gpu_stats import get_gpu_stats
-from daemon.lora_sync import sync_lora_catalog
+from daemon.lora_sync import inventory as lora_inventory, sync_lora_catalog
 from daemon.resource_sync import sync_resources
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
 from daemon.a1111_monitor import get_status as get_a1111_status
@@ -115,7 +115,8 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
         is_busy = comfyui_busy or sd_scripts_training
 
         try:
-            data = await queue.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status, a1111_status)
+            data = await queue.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status, a1111_status,
+                                         loras=lora_inventory())
             beat_count += 1
 
             # Pick up renames from the registry
