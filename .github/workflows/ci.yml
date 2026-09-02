@@ -1,0 +1,45 @@
+# The daemon had no test CI at all until now — 85 tests that ran only when someone
+# remembered to run them. This repo is the one that has caused most of the production
+# incidents, and every one of them was a name that did not resolve at request time or a
+# path nobody exercised. Tests that only run by hand are tests that do not run.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The daemon's runtime deps include torch and insightface, which are enormous and
+      # need a GPU image to be meaningful. The tests do not touch them — they exercise
+      # routing, parsing and sync logic against fakes — so CI installs only what the suite
+      # actually imports. If a test ever needs the real stack, it belongs on a GPU runner,
+      # not here.
+      # This list was derived by running the suite in a clean venv until it went green,
+      # not by reading imports — two guesses were wrong. opencv is the HEADLESS build on
+      # purpose: plain opencv-python needs libGL, which a bare runner does not have.
+      - name: Install test dependencies
+        run: |
+          pip install pytest pytest-asyncio httpx pydantic pydantic-settings \
+                      numpy pillow websockets opencv-python-headless pyyaml
+
+      - name: Test
+        run: python -m pytest -q
+
+      # Undefined names are the single failure class that has cost this project the most:
+      # three production 500s this month, each one a name that imported fine and blew up at
+      # request time. Ruff catches them statically in under a second. Same guard as
+      # wanly-api, for the same reason.
+      - name: No undefined names
+        run: |
+          pip install "ruff>=0.5"
+          python -m ruff check --select F821 --output-format concise daemon/
