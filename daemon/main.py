@@ -199,6 +199,24 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
             shutdown_event.set()
             break
 
+        # A worker that cannot reach the API is not available, and the expensive failure is
+        # that it keeps SAYING it is. On 2026-09-02 one sat registered and healthy-looking
+        # for 4.6 hours claiming nothing, with work queued behind it — nothing errored,
+        # nothing paged, the queue simply stopped (#160).
+        #
+        # Exiting rather than looping: the daemon is PID 1, so a clean exit restarts the
+        # container under its restart policy, which rebuilds every connection from scratch.
+        # That is the action a human took by hand to fix this last time, and there is no
+        # reason to make them do it again.
+        if queue.is_wedged():
+            logger.error(
+                "Cannot reach the API after %d consecutive failures — exiting so this "
+                "worker stops advertising itself as available. It will restart and "
+                "re-register with fresh connections.", queue._fail_streak,
+            )
+            shutdown_event.set()
+            break
+
         # Don't claim work if ComfyUI isn't running
         if not await comfyui.check_health():
             if poll_count == 0 or poll_count % 60 == 0:
