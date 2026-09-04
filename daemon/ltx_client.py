@@ -71,6 +71,16 @@ def build_submit_payload(
         for key in ("recipe", "character"):
             if recipe.get(key):
                 payload[key] = recipe[key]
+        # The pose's base model. Forwarded as-is; the engine appends .safetensors when
+        # missing and moves every loader that names the file, because 2.3 checkpoints are
+        # monoliths rather than a transformer plus separate parts.
+        #
+        # Worth knowing when reading a render that came back wrong: character LoRAs were
+        # trained against sulphur, and against another base a LoRA whose keys do not line up
+        # fuses NOTHING, silently. The engine logs its fusion count per render — that number
+        # is the thing to check first, not the prompt.
+        if recipe.get("checkpoint"):
+            payload["checkpoint"] = str(recipe["checkpoint"]).strip()
         # `is not None`, not truthiness: img_compression 0 is a real setting — it bypasses
         # the conditioning-frame encode — and a falsy check would drop it, leaving the engine
         # on its workflow default while the pose said otherwise.
