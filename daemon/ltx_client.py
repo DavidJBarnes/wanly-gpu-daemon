@@ -87,6 +87,17 @@ def build_submit_payload(
         if recipe.get("img_compression") is not None:
             payload["img_compression"] = int(recipe["img_compression"])
         lora = recipe.get("char_lora")
+        # "none" is how a render says "no character" — useful for judging what the LoRA is
+        # actually contributing, and for a shot whose start frame already carries the
+        # identity (console#412).
+        #
+        # It has to be filtered HERE, not left to the engine. `if lora` alone passes,
+        # because the STRING "none" is truthy, and the entry would then be normalised to
+        # "none.safetensors" — which is no longer the literal "none" the engine's own
+        # want_char check looks for, so it would sail past that and 422 on a file that does
+        # not exist, ten minutes into a claimed segment.
+        if lora and str(lora).strip().lower() == "none":
+            lora = None
         s1, s2 = recipe.get("char_s1"), recipe.get("char_s2")
         if lora and s1 is not None and s2 is not None:
             # The engine matches LoRAs by EXACT filename. Its own recipe path appends the

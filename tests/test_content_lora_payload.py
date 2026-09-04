@@ -96,3 +96,23 @@ def test_no_checkpoint_means_the_engine_default():
     """Every pose today. The key must be absent rather than null, so the engine applies its
     own default rather than being handed one to interpret."""
     assert "checkpoint" not in _payload()
+
+
+def test_a_character_lora_of_none_is_not_sent():
+    """"none" means render without a character LoRA (console#412).
+
+    It must be filtered here rather than left to the engine: `if lora` alone passes, because
+    the STRING "none" is truthy, and the entry would then be normalised to
+    "none.safetensors" — no longer the literal "none" the engine's want_char check looks
+    for. It would sail past that and 422 on a file that does not exist, ten minutes into a
+    claimed segment.
+    """
+    for spelling in ("none", "NONE", " None "):
+        p = _payload(char_lora=spelling)
+        assert "loras" not in p or p["loras"] == [], f"{spelling!r} was forwarded as a LoRA"
+
+
+def test_a_real_character_lora_is_still_sent():
+    """The guard must not swallow the normal case."""
+    p = _payload(char_lora="k3lly2026_v2")
+    assert p["loras"][0]["name"] == "k3lly2026_v2.safetensors"
