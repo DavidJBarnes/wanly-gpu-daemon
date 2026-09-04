@@ -13,6 +13,14 @@ from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.gpu_stats import get_gpu_stats
 from daemon.lora_sync import inventory as lora_inventory, sync_lora_catalog
+from daemon.ltx_client import LtxClient
+
+# Base models this worker can load, asked of the engine once it is healthy and then reported
+# on every heartbeat. Cached rather than re-fetched: the set only changes when someone puts a
+# 46 GB file on the box, and asking ComfyUI costs a round trip that a heartbeat should not
+# spend. See console#404 — the console needs a real list to offer, and the daemon is the only
+# thing that can see one, because the engine binds to 127.0.0.1 inside the container.
+_CHECKPOINTS: list[str] = []
 from daemon.resource_sync import sync_resources
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
 from daemon.a1111_monitor import get_status as get_a1111_status
@@ -116,7 +124,8 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
 
         try:
             data = await queue.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status, a1111_status,
-                                         loras=lora_inventory())
+                                         loras=lora_inventory(),
+                                         checkpoints=_CHECKPOINTS or None)
             beat_count += 1
 
             # Pick up renames from the registry
@@ -484,6 +493,17 @@ async def run():
     # Before the GPU loop starts, so a fresh pod is useful on its first claim instead of
     # failing the first character segment it is handed. Non-fatal by design — see
     # sync_lora_catalog(): a restart loop is a worse failure than a missing LoRA.
+    # Ask the engine what base models it can load, for the console's dropdown. Non-fatal:
+    # a worker that cannot answer simply offers nothing, and the field falls back to the
+    # stack default rather than blocking a render.
+    if settings.engine == "ltx":
+        try:
+            _CHECKPOINTS[:] = await LtxClient().checkpoints()
+            logger.info("Checkpoints available: %s", ", ".join(_CHECKPOINTS) or "none")
+        except Exception as e:
+            logger.warning("Could not list checkpoints from ltx-engine (%s) — "
+                           "the console will offer none from this worker", e)
+
     if not await sync_lora_catalog(queue):
         logger.warning(
             "LoRA sync incomplete — this worker may fail segments that name a missing LoRA"

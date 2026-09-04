@@ -71,6 +71,16 @@ def build_submit_payload(
         for key in ("recipe", "character"):
             if recipe.get(key):
                 payload[key] = recipe[key]
+        # The pose's base model. Forwarded as-is; the engine appends .safetensors when
+        # missing and moves every loader that names the file, because 2.3 checkpoints are
+        # monoliths rather than a transformer plus separate parts.
+        #
+        # Worth knowing when reading a render that came back wrong: character LoRAs were
+        # trained against sulphur, and against another base a LoRA whose keys do not line up
+        # fuses NOTHING, silently. The engine logs its fusion count per render — that number
+        # is the thing to check first, not the prompt.
+        if recipe.get("checkpoint"):
+            payload["checkpoint"] = str(recipe["checkpoint"]).strip()
         # `is not None`, not truthiness: img_compression 0 is a real setting — it bypasses
         # the conditioning-frame encode — and a falsy check would drop it, leaving the engine
         # on its workflow default while the pose said otherwise.
@@ -136,6 +146,26 @@ class LtxClient:
         r.raise_for_status()
         result: dict[str, Any] = r.json()
         return result
+
+    async def checkpoints(self) -> list[str]:
+        """Base models this worker can actually load.
+
+        Asked of the engine rather than globbed off disk, because the engine asks ComfyUI,
+        and ComfyUI answers from the folder mapping in extra_model_paths.yaml. A file the
+        mapping does not cover is invisible to a render however present it is on the
+        filesystem — so this lists what will LOAD, not what exists.
+
+        The daemon is the only thing that can ask: the engine binds to 127.0.0.1 inside the
+        container, so nothing upstream can reach it. That is why this is reported through
+        the heartbeat rather than fetched by the API (console#404).
+        """
+        r = await self._client.get("/checkpoints", timeout=30.0)
+        r.raise_for_status()
+        names = r.json().get("checkpoints") or []
+        # Bare names, matching how a recipe stores one and how the console shows it. The
+        # engine re-appends the extension when it resolves the file.
+        return sorted({n[: -len(".safetensors")] if n.endswith(".safetensors") else n
+                       for n in names})
 
     async def submit(
         self,

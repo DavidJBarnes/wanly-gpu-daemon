@@ -76,3 +76,16 @@ def test_strengths_without_a_lora_are_not_sent_alone():
     misleading record of what ran."""
     p = _payload(content_s1=0.3, content_s2=1.1)
     assert "content_s1" not in p and "content_s2" not in p
+
+
+def test_the_pose_checkpoint_is_forwarded():
+    """Without this the engine falls back to its default and every render uses one base
+    model — which is exactly the state that made sulphur-vs-10Eros impossible to compare."""
+    p = _payload(checkpoint="10Eros_v1.5_bf16")
+    assert p["checkpoint"] == "10Eros_v1.5_bf16"
+
+
+def test_no_checkpoint_means_the_engine_default():
+    """Every pose today. The key must be absent rather than null, so the engine applies its
+    own default rather than being handed one to interpret."""
+    assert "checkpoint" not in _payload()
