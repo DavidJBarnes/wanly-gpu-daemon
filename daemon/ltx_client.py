@@ -172,6 +172,19 @@ class LtxClient:
         result: dict[str, Any] = r.json()
         return result
 
+    async def purge(self, job_id: str) -> dict:
+        """Drop the engine's local media for a finished job (console#380).
+
+        Only ever called AFTER a successful upload: the local file is the only copy until
+        that upload lands, and reclaiming disk is not worth risking a render.
+
+        The engine keeps graph.json and prompt.txt — ~7 MB across 500 jobs against 2.7 GB of
+        media, and the only local record of what a render actually did.
+        """
+        r = await self._client.post(f"/job/{job_id}/purge", timeout=30.0)
+        r.raise_for_status()
+        return r.json()
+
     async def checkpoints(self) -> list[str]:
         """Base models this worker can actually load.
 

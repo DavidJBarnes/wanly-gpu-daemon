@@ -195,6 +195,22 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         )
         logger.info("Segment %d complete in %.1fs", segment.index, time.monotonic() - started)
 
+        # Reclaim the engine's local copies now that S3 has them (console#380). AFTER the
+        # upload, never before — the local file is the only copy until that call returns.
+        #
+        # Failure here is logged and swallowed. The segment is already complete and
+        # uploaded; turning a successful render into a failure over disk housekeeping would
+        # be a much worse outcome than 5 MB left behind, which the next sweep collects
+        # anyway.
+        try:
+            purged = await client.purge(job_id)
+            if purged.get("removed"):
+                logger.info("Purged %d local file(s), %.1f MB reclaimed",
+                            len(purged["removed"]), purged.get("freed_bytes", 0) / 1e6)
+        except Exception as e:
+            logger.warning("Could not purge engine job %s (%s) — leaving it for the sweep",
+                           job_id, e)
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
         logger.exception("LTX segment %s failed", segment.id)

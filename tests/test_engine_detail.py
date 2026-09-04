@@ -52,3 +52,30 @@ def test_it_is_silent_when_there_is_nothing_to_say():
     noise here is noise on everything."""
     assert _engine_detail({}) == []
     assert _engine_detail({"loras": [], "stages": []}) == []
+
+
+class TestPurgeIsNonFatal:
+    """Reclaiming disk must never turn a successful render into a failure (console#380).
+
+    The purge runs AFTER the upload. At that point the segment is complete and S3 has the
+    video; the local copy is a duplicate. Failing the segment over housekeeping would trade
+    a finished render for 5 MB, and the next sweep collects it anyway.
+    """
+
+    def test_the_purge_is_wrapped_and_only_warns(self):
+        import inspect
+        from daemon import ltx_executor as mod
+        src = inspect.getsource(mod.execute_ltx_segment)
+        i = src.index("client.purge(")
+        window = src[i - 400:i + 400]
+        assert "try:" in window
+        assert "logger.warning" in window
+        assert "raise" not in window.split("except")[-1], "a purge failure must not propagate"
+
+    def test_it_runs_after_the_upload_not_before(self):
+        """The local file is the only copy until the upload returns."""
+        import inspect
+        from daemon import ltx_executor as mod
+        src = inspect.getsource(mod.execute_ltx_segment)
+        assert src.index("upload_segment_output") < src.index("client.purge("), \
+            "purge must come after the upload"
