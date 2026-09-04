@@ -147,6 +147,26 @@ class LtxClient:
         result: dict[str, Any] = r.json()
         return result
 
+    async def checkpoints(self) -> list[str]:
+        """Base models this worker can actually load.
+
+        Asked of the engine rather than globbed off disk, because the engine asks ComfyUI,
+        and ComfyUI answers from the folder mapping in extra_model_paths.yaml. A file the
+        mapping does not cover is invisible to a render however present it is on the
+        filesystem — so this lists what will LOAD, not what exists.
+
+        The daemon is the only thing that can ask: the engine binds to 127.0.0.1 inside the
+        container, so nothing upstream can reach it. That is why this is reported through
+        the heartbeat rather than fetched by the API (console#404).
+        """
+        r = await self._client.get("/checkpoints", timeout=30.0)
+        r.raise_for_status()
+        names = r.json().get("checkpoints") or []
+        # Bare names, matching how a recipe stores one and how the console shows it. The
+        # engine re-appends the extension when it resolves the file.
+        return sorted({n[: -len(".safetensors")] if n.endswith(".safetensors") else n
+                       for n in names})
+
     async def submit(
         self,
         *,

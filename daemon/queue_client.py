@@ -288,6 +288,7 @@ class QueueClient:
         sd_scripts_status: dict | None = None,
         a1111_status: dict | None = None,
         loras: dict | None = None,
+        checkpoints: list[str] | None = None,
     ) -> dict:
         """Send heartbeat. Returns full worker data including current friendly_name."""
         payload: dict = {"comfyui_running": comfyui_running}
@@ -301,6 +302,10 @@ class QueueClient:
         # not a fresh check — see lora_sync.inventory().
         if loras is not None:
             payload["loras"] = loras
+        # Base models this worker can load. Reported rather than fetched: the engine binds
+        # to localhost, so the daemon is the only thing that can ask it.
+        if checkpoints is not None:
+            payload["checkpoints"] = checkpoints
         resp = await self._request_with_retry(
             "POST", f"/workers/{worker_id}/heartbeat", json=payload
         )
