@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+import time
 import uuid
 from typing import Optional
 
@@ -48,19 +49,64 @@ def _raise_with_details(resp: httpx.Response, context: str) -> None:
 class QueueClient:
     """HTTP client for the wanly-api (queue + worker registry)."""
 
+    # After this many CONSECUTIVE transport failures the client itself is presumed wedged and
+    # is rebuilt. Not 1 or 2: a reaped keepalive connection and a brief network blip are both
+    # normal and already handled by the single retry below, and rebuilding on those would
+    # throw away a healthy pool constantly.
+    #
+    # 6 is roughly half a minute of solid failure at the claim loop's cadence — long enough
+    # to be real, short enough that a worker is not silently useless for hours (#160).
+    _REBUILD_AFTER = 6
+
+    # And after this many, the worker is not merely unlucky. It has been unable to reach the
+    # API across several fresh connection pools, so it should stop claiming to be available.
+    _GIVE_UP_AFTER = 40
+
     def __init__(self):
         self.base_url = settings.queue_url
-        headers = {}
+        self._headers = {}
         if settings.queue_api_key:
-            headers["X-API-Key"] = settings.queue_api_key
+            self._headers["X-API-Key"] = settings.queue_api_key
+        self.client = self._new_client()
+        # Consecutive transport failures. Reset by ANY success, so this counts a sustained
+        # inability to talk to the API rather than a total over the worker's life.
+        self._fail_streak = 0
+        self._wedged_since: float | None = None
+
+    def _new_client(self) -> httpx.AsyncClient:
         # keepalive_expiry below the far end's idle timeout: httpx otherwise hands out a
         # connection the server has already closed, and only finds out after writing the
         # request — surfacing as "Server disconnected without sending a response". Retiring
         # them locally first removes most of that class. See #105.
         limits = httpx.Limits(max_keepalive_connections=5, keepalive_expiry=30.0)
-        self.client = httpx.AsyncClient(
-            base_url=self.base_url, timeout=10, headers=headers, limits=limits
+        return httpx.AsyncClient(
+            base_url=self.base_url, timeout=10, headers=self._headers, limits=limits
         )
+
+    def is_wedged(self) -> bool:
+        """Has this worker been unable to reach the API for long enough to stop pretending?
+
+        A worker that cannot claim is not available, and the expensive failure mode is that
+        it keeps SAYING it is: on 2026-09-02 one sat registered and healthy-looking for 4.6
+        hours, claiming nothing, while work was queued behind it. Nothing errored and nothing
+        paged — the queue simply stopped.
+        """
+        return self._fail_streak >= self._GIVE_UP_AFTER
+
+    async def _rebuild_client(self) -> None:
+        """Replace the connection pool.
+
+        This is what `docker restart` achieved by accident when a wedged worker was fixed by
+        hand. The pool, not the process, was the broken thing — so replace the pool.
+        """
+        old = self.client
+        self.client = self._new_client()
+        try:
+            await old.aclose()
+        except Exception:
+            # Closing a pool that is already broken can itself raise. The new client is
+            # already in place, so this must not propagate.
+            pass
 
     async def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
         """Issue a request, retrying once on a transport-level failure.
@@ -71,13 +117,55 @@ class QueueClient:
         since claiming is not idempotent.
         """
         try:
-            return await self.client.request(method, url, **kwargs)
+            resp = await self.client.request(method, url, **kwargs)
         except (httpx.TransportError, httpx.RemoteProtocolError) as e:
+            self._note_failure(method, url, e)
+            try:
+                resp = await self.client.request(method, url, **kwargs)
+            except (httpx.TransportError, httpx.RemoteProtocolError) as e2:
+                # Both attempts failed. Count it and, past the threshold, rebuild the pool
+                # before giving up on this call — the next one then starts fresh instead of
+                # inheriting whatever is broken.
+                self._note_failure(method, url, e2)
+                if self._fail_streak >= self._REBUILD_AFTER:
+                    await self._rebuild_client()
+                raise
+        self._note_success()
+        return resp
+
+    def _note_success(self) -> None:
+        if self._fail_streak:
+            held = time.monotonic() - (self._wedged_since or time.monotonic())
+            if self._fail_streak >= self._REBUILD_AFTER:
+                logger.info("API reachable again after %d consecutive failures (%.0fs)",
+                            self._fail_streak, held)
+            self._fail_streak = 0
+            self._wedged_since = None
+
+    def _note_failure(self, method: str, url: str, exc: Exception) -> None:
+        """Count it, and make the log louder as the streak grows.
+
+        The old behaviour logged every failure at INFO, identically, forever. 4.6 hours of
+        that is indistinguishable from 4.6 hours of ordinary polling unless somebody reads
+        the timestamps — which is exactly what happened. A streak is a different event from
+        a blip and should not look the same.
+        """
+        self._fail_streak += 1
+        if self._wedged_since is None:
+            self._wedged_since = time.monotonic()
+        held = time.monotonic() - self._wedged_since
+
+        if self._fail_streak < self._REBUILD_AFTER:
             logger.info(
                 "%s %s failed at the transport layer (%s); retrying once on a fresh connection",
-                method, url, type(e).__name__,
+                method, url, type(exc).__name__,
             )
-            return await self.client.request(method, url, **kwargs)
+        elif self._fail_streak % 10 == 0 or self._fail_streak == self._REBUILD_AFTER:
+            logger.error(
+                "%s %s: %d CONSECUTIVE transport failures over %.0fs (%s). "
+                "Rebuilding the connection pool; this worker is claiming nothing.",
+                method, url, self._fail_streak, held, type(exc).__name__,
+            )
 
     async def claim_next(
         self, worker_id: uuid.UUID, worker_name: str | None = None, kind: str | None = None
