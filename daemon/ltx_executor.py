@@ -53,6 +53,52 @@ async def _start_image_bytes(segment: SegmentClaim, queue: QueueClient) -> bytes
     return data
 
 
+def _engine_detail(job: dict) -> list[str]:
+    """The parts of the engine's job view worth putting in the segment's own record.
+
+    FUSION COVERAGE is the one that matters. A LoRA whose keys do not line up against the
+    checkpoint fuses NOTHING and says nothing about it — no error, no warning, the run looks
+    completely normal and comes back as the base model with none of the character in it.
+    Now that a pose can choose its own base model (console#404), "did it fuse?" is a routine
+    question, and 480/480 is exactly as informative as 0/480. Only the zero case was ever
+    promoted anywhere a person could see it; both belong on the segment.
+
+    STAGES say what each pass actually ran — read off the resolved graph by the engine, not
+    echoed from the request, so a step count the workflow could not express shows up here
+    rather than being silently ignored.
+
+    Deliberately quiet when there is nothing to say: no LoRAs means no lines, so this does
+    not add noise to renders that have none.
+    """
+    out: list[str] = []
+
+    for lo in job.get("loras") or []:
+        name = lo.get("name", "?")
+        fused, targeted = lo.get("fused"), lo.get("targeted")
+        s1, s2 = lo.get("strength_stage_1"), lo.get("strength_stage_2")
+        at = f" @{s1}/{s2}" if s1 is not None and s2 is not None else ""
+        if fused is None or targeted is None:
+            # The engine could not read the checkpoint to compare against. Said out loud,
+            # because "no coverage line" and "coverage of zero" must not look the same.
+            out.append(f"lora {name}{at}: fusion coverage unavailable")
+        elif fused == 0:
+            out.append(f"lora {name}{at}: FUSED 0/{targeted} — this render carries NONE of it")
+        else:
+            out.append(f"lora {name}{at}: fused {fused}/{targeted} weights")
+
+    stages = job.get("stages") or []
+    if stages:
+        parts = []
+        for st in stages:
+            n = st.get("stage", "?")
+            steps = st.get("steps")
+            sched = st.get("schedule", "")
+            parts.append(f"stage {n}: {steps} steps ({sched})" if steps is not None
+                         else f"stage {n}: {sched}")
+        out.append("passes — " + ", ".join(parts))
+
+    return out
+
 async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None:
     """Render one segment on ltx-engine and report the result."""
     recipe = segment.ltx_recipe or {}
@@ -118,6 +164,13 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         # was signed off — so it goes in the segment's own log, not just the engine's.
         for note in job.get("notes") or []:
             await progress.log(f"[4/6] {note}")
+
+        # The engine reports more than its notes, and until now the rest was dropped on the
+        # floor — readable only by shelling into the container and reading
+        # /workspace/logs/ltx-engine.log. That is how answering "did the character LoRA
+        # actually apply on this render?" became a docker exec (console#392).
+        for line in _engine_detail(job):
+            await progress.log(f"[4/6] {line}")
 
         await progress.log("[5/6] Downloading video...")
         video_data = await client.fetch_video(job_id)
