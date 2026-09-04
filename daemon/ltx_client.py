@@ -110,25 +110,39 @@ def build_submit_payload(
                 "strength_stage_2": float(s2),
             }]
 
-        # The POSE's content LoRA — motion and act — chained ahead of the character LoRA on both
-        # stage branches. Sent as its own field, not appended to `loras`: that list is the
-        # CHARACTER LoRA on this path and the engine reads loras[0] as such, so a second entry
-        # would be silently taken for a character.
-        content = recipe.get("content_lora")
-        if content and str(content).strip().lower() != "none":
-            content = str(content).strip()
-            # Same extension normalisation, and for the same reason: names are stored bare
-            # because that is how they are displayed, and the engine matches files exactly.
-            if not content.endswith(".safetensors"):
-                content = f"{content}.safetensors"
-            payload["content_lora"] = content
-            # `is not None`, exactly as img_compression above. A content strength of 0 is a REAL
-            # setting: it loads the LoRA and gives it no weight, which is how you measure what it
-            # contributes. A falsy check would drop it and the engine would apply its 0.6
-            # default, so the measurement would silently be of a different configuration.
-            for key, field in (("content_s1", "content_s1"), ("content_s2", "content_s2")):
-                if recipe.get(key) is not None:
-                    payload[field] = float(recipe[key])
+        # The POSE's content LoRAs — motion and act — chained ahead of the character LoRA on
+        # both stage branches, IN ORDER. They stack: motion, act and framing are separable
+        # and a pose may want several (console#410). Order is part of the configuration, so
+        # it is forwarded exactly as stored.
+        #
+        # Sent as their own field, not appended to `loras`. On this path the engine reads
+        # loras[0] as the CHARACTER LoRA, so a content LoRA added to that list would be
+        # loaded as a character — both load, the render succeeds, and it is the wrong person.
+        contents = []
+        for entry in (recipe.get("content_loras") or []):
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name or name.lower() == "none":
+                # "none" is how a pose says off. Forwarded, the engine would look for
+                # 'none.safetensors' and the segment would die ten minutes into a claim.
+                continue
+            # Same extension normalisation as the character LoRA, for the same reason: names
+            # are stored bare because that is how they are displayed, and the engine matches
+            # files exactly. A real render died on `no such lora 'pay_v2_e05'` while the
+            # .safetensors sat in the very list the error printed.
+            item = {"name": name if name.endswith(".safetensors") else f"{name}.safetensors"}
+            # `is not None`, not truthiness: a strength of 0 is a REAL setting — it loads the
+            # LoRA and gives it no weight, which is how you measure what it contributes. A
+            # falsy check would drop it and the engine would apply its own 0.6 default, so
+            # the measurement would silently be of a different configuration.
+            for k in ("s1", "s2"):
+                if entry.get(k) is not None:
+                    item[k] = float(entry[k])
+            contents.append(item)
+        if contents:
+            payload["content_loras"] = contents
+
     return payload
 
 
