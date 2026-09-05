@@ -21,6 +21,16 @@ from daemon.ltx_client import LtxClient
 # spend. See console#404 — the console needs a real list to offer, and the daemon is the only
 # thing that can see one, because the engine binds to 127.0.0.1 inside the container.
 _CHECKPOINTS: list[str] = []
+
+# Artifact kinds this worker can FETCH on demand, as opposed to the ones it already holds.
+# The API will not hand a worker a segment whose models it cannot load (console#422), and a
+# LoRA this box has never seen must not count against it: lora_sync downloads those inside
+# the claim, and refusing the work would make the queue wait for a restart it does not need.
+#
+# A constant, not a probe, because it describes what this CODE can do. When on-demand
+# checkpoint fetching lands (console#423) it gains "checkpoint" here and the gate opens by
+# itself — the API holds no second opinion about a daemon's abilities.
+FETCHABLE_KINDS: list[str] = ["lora"]
 from daemon.resource_sync import sync_resources
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
 from daemon.a1111_monitor import get_status as get_a1111_status
@@ -125,7 +135,8 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
         try:
             data = await queue.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status, a1111_status,
                                          loras=lora_inventory(),
-                                         checkpoints=_CHECKPOINTS or None)
+                                         checkpoints=_CHECKPOINTS or None,
+                                         fetchable_kinds=FETCHABLE_KINDS)
             beat_count += 1
 
             # Pick up renames from the registry

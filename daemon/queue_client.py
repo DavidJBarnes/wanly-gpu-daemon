@@ -377,6 +377,7 @@ class QueueClient:
         a1111_status: dict | None = None,
         loras: dict | None = None,
         checkpoints: list[str] | None = None,
+        fetchable_kinds: list[str] | None = None,
     ) -> dict:
         """Send heartbeat. Returns full worker data including current friendly_name."""
         payload: dict = {"comfyui_running": comfyui_running}
@@ -394,6 +395,16 @@ class QueueClient:
         # to localhost, so the daemon is the only thing that can ask it.
         if checkpoints is not None:
             payload["checkpoints"] = checkpoints
+        # Artifact kinds this worker can GET, not just the ones it already holds. The API
+        # refuses to hand a worker a segment whose models it cannot load (console#422), and
+        # without this it would also refuse one naming a LoRA this box has never seen — work
+        # the daemon would have handled by itself, since it downloads those at claim time.
+        #
+        # Declared here rather than assumed there on purpose: when this daemon learns to
+        # fetch checkpoints (console#423) it adds "checkpoint" to this list and the gate
+        # opens, with no API change and no coordinated deploy.
+        if fetchable_kinds is not None:
+            payload["fetchable_kinds"] = fetchable_kinds
         resp = await self._request_with_retry(
             "POST", f"/workers/{worker_id}/heartbeat", json=payload
         )
