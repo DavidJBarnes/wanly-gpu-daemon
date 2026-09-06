@@ -31,7 +31,6 @@ _CHECKPOINTS: list[str] = []
 # checkpoint fetching lands (console#423) it gains "checkpoint" here and the gate opens by
 # itself — the API holds no second opinion about a daemon's abilities.
 FETCHABLE_KINDS: list[str] = ["lora"]
-from daemon.resource_sync import sync_resources
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
 from daemon.a1111_monitor import get_status as get_a1111_status
 
@@ -505,14 +504,6 @@ async def run():
     nodes_ok = await check_and_install_nodes(comfyui)
     if not nodes_ok:
         logger.error("Required custom nodes are missing or could not be installed. Exiting.")
-        await comfyui.close()
-        await queue.close()
-        return
-
-    # Pre-flight: sync required resources (model weights for custom nodes)
-    resources_ok = await sync_resources(queue)
-    if not resources_ok:
-        logger.error("Resource sync failed. Exiting.")
         await comfyui.close()
         await queue.close()
         return
