@@ -393,6 +393,8 @@ class QueueClient:
         loras: dict | None = None,
         checkpoints: list[str] | None = None,
         fetchable_kinds: list[str] | None = None,
+        daemon_commit: str | None = None,
+        image_ref: str | None = None,
     ) -> dict:
         """Send heartbeat. Returns full worker data including current friendly_name."""
         payload: dict = {"comfyui_running": comfyui_running}
@@ -406,6 +408,13 @@ class QueueClient:
         # not a fresh check — see lora_sync.inventory().
         if loras is not None:
             payload["loras"] = loras
+        # What code this worker is running (wanly-gpu-docker#72). Omitted when unknown rather
+        # than sent as null: the API reads a missing key as "no change", so a daemon that
+        # cannot tell must not overwrite a value a previous beat established.
+        if daemon_commit:
+            payload["daemon_commit"] = daemon_commit
+        if image_ref:
+            payload["image_ref"] = image_ref
         # Base models this worker can load. Reported rather than fetched: the engine binds
         # to localhost, so the daemon is the only thing that can ask it.
         if checkpoints is not None:
