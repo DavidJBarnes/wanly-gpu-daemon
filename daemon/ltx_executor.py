@@ -136,8 +136,19 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         # completion. A 400 MB LoRA takes minutes; without this the segment sits at
         # "[1/6] Start image ready" the whole time and is indistinguishable from a wedged
         # worker. See console#392.
+        # content_loraS, plural. Content LoRAs became a stacked list in console#410 and every
+        # other reader moved with it -- the API returns content_loras, the console sends it,
+        # and ltx_client builds the engine payload from it. This line kept reading the old
+        # singular key, so it always saw None and fetched nothing (#176).
+        #
+        # It went unseen because the 3090 already holds every content LoRA on disk, so the
+        # boot sync's "deferred (content, fetched on demand)" promise was never actually
+        # tested there. On a fresh pod the deferral is real, and the engine was handed a name
+        # for a file nobody had downloaded: 422 no such lora, after the claim.
+        content_names = [e.get("name") for e in (recipe.get("content_loras") or [])
+                         if isinstance(e, dict)]
         fetched = await ensure_named_loras_present(
-            [recipe.get("char_lora"), recipe.get("content_lora")], queue,
+            [recipe.get("char_lora"), *content_names], queue,
             progress=progress.log,
         )
         if fetched:
