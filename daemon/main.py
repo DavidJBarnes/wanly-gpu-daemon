@@ -6,6 +6,7 @@ import socket
 import sys
 
 from daemon.comfyui_client import ComfyUIClient
+from daemon import build_identity
 from daemon.config import settings
 from daemon.executor import execute_segment
 from daemon.model_validator import cleanup_partial_downloads, validate_models
@@ -162,7 +163,9 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
             data = await queue.heartbeat(worker_id, comfyui_running, gpu_stats, sd_scripts_status, a1111_status,
                                          loras=lora_inventory(),
                                          checkpoints=_CHECKPOINTS or None,
-                                         fetchable_kinds=FETCHABLE_KINDS)
+                                         fetchable_kinds=FETCHABLE_KINDS,
+                                         daemon_commit=build_identity.DAEMON_COMMIT,
+                                         image_ref=build_identity.IMAGE_REF)
             beat_count += 1
 
             # Pick up renames from the registry
@@ -565,6 +568,10 @@ async def run():
     # expensive failure here is silence: a worker on the wrong engine still produces plausible
     # output that is not comparable to anything.
     logger.info("ENGINE=%s", settings.engine)
+    # Said out loud at boot as well as reported upstream. When two workers disagree, the
+    # first question is what each is running, and the boot log is where that gets checked
+    # before anyone thinks to look at the API (wanly-gpu-docker#72).
+    logger.info("BUILD %s", build_identity.describe())
 
     # Pre-flight: validate all required models.
     #
