@@ -302,6 +302,21 @@ class QueueClient:
             _raise_with_details(resp, "list_loras")
         return resp.json()
 
+    async def checkpoint_catalog(self) -> dict:
+        """Where each known base model can be fetched from (console#423).
+
+        Returns the `sources` map, or {} when the API is too old to answer. An empty map
+        means "fetch nothing", which degrades to exactly the behaviour before on-demand
+        fetching existed -- the model gate routes work to a worker that holds the file. That
+        matters because the daemon and the API deploy independently.
+        """
+        resp = await self._request_with_retry("GET", "/ltx/checkpoints/catalog", timeout=30)
+        if resp.status_code == 404:
+            return {}
+        if not resp.is_success:
+            _raise_with_details(resp, "checkpoint_catalog")
+        return resp.json().get("sources") or {}
+
     async def stream_file(self, s3_path: str, dest: str, on_progress=None, total: int = 0) -> str:
         """Download to `dest`, returning the md5 of what actually landed.
 

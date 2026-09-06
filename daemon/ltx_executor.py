@@ -154,6 +154,25 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         if fetched:
             await progress.log(f"[2/6] LoRA(s) ready: {', '.join(fetched)}")
 
+        # And the base model, same idea at 70x the size (console#423). Deliberately AFTER
+        # the LoRAs: those are seconds each and this can be twenty minutes, so a pose that
+        # is going to fail on a missing LoRA should fail before the long download, not after.
+        #
+        # ComfyUI re-scans diffusion_models on every object_info request -- verified on a
+        # live pod mid-render -- so a file that lands here is visible to the render that
+        # follows, with no restart.
+        from daemon.checkpoint_sync import ensure_checkpoint_present
+        if await ensure_checkpoint_present(recipe.get("checkpoint"), queue,
+                                           progress=progress.log):
+            # Tell the API what this worker holds NOW. Without this the model gate keeps
+            # routing around a checkpoint the box has just acquired.
+            #
+            # Imported here, not at module scope: main imports the executor chain, and the
+            # reported-inventory state lives in main. executor.py takes the same approach
+            # for the same reason.
+            from daemon.main import refresh_reported_checkpoints
+            await refresh_reported_checkpoints()
+
         await progress.log("[2/6] Submitting to ltx-engine...")
         job_id = await client.submit(
             image_bytes=image_bytes,

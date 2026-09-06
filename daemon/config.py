@@ -8,6 +8,16 @@ class Settings(BaseSettings):
     comfyui_api_key: str = ""  # Bearer token for ComfyUI auth (RunPod sets this)
     comfyui_path: str = ""  # Path to ComfyUI installation (for custom node management)
     lora_cache_dir: str = ""  # Override LoRA download dir (e.g. /workspace/models/loras for persistence)
+    # Where ComfyUI loads base models from, so a checkpoint fetched on demand (console#423)
+    # lands somewhere a render will actually see. NOT derived from lora_cache_dir: LoRAs and
+    # checkpoints live in different trees, and guessing one from the other would put a 46 GB
+    # file where nothing looks for it -- which fails as "no such checkpoint" after a 20
+    # minute download. Must match wanly-gpu-docker's MODELS_DIR/ltx-2.3/diffusion_models.
+    checkpoint_dir: str = "/workspace/models/ltx-2.3/diffusion_models"
+    # Refuse a fetch that would leave the volume with less than this. The base model set is
+    # ~58 GB into a 150 GB pod volume, so one extra checkpoint fits and a second does not.
+    # Refusing up front beats dying at 92% of 46 GB inside a claimed segment.
+    checkpoint_min_free_gb: int = 12
     queue_url: str = "http://localhost:8001"
     queue_api_key: str = ""
     poll_interval: int = 5
