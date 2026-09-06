@@ -22,6 +22,33 @@ from daemon.ltx_client import LtxClient
 # thing that can see one, because the engine binds to 127.0.0.1 inside the container.
 _CHECKPOINTS: list[str] = []
 
+
+async def refresh_reported_checkpoints() -> list[str]:
+    """Re-ask the engine what base models it can load, and report that from now on.
+
+    Called after an on-demand checkpoint fetch (console#423). Without it the API's view of
+    this worker stays stale until the next full rebuild, and the model gate keeps routing
+    around a file the box now holds -- which is the whole point of having fetched it.
+
+    Asks the ENGINE rather than listing the directory, because ComfyUI answers from the
+    folder mapping in extra_model_paths.yaml: a file the mapping does not cover is invisible
+    to a render however present it is on disk. A fetch that landed somewhere unmapped should
+    NOT be reported as available, and only the engine can tell the difference.
+
+    Failure is non-fatal and deliberately quiet in effect: the previous list stands, which
+    is the pre-fetch behaviour rather than an empty inventory. Reporting [] would make the
+    gate hide every recipe segment from this worker.
+    """
+    try:
+        names = await LtxClient().checkpoints()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not re-read checkpoints after a fetch (%s) — "
+                       "the API keeps the previous list", e)
+        return list(_CHECKPOINTS)
+    _CHECKPOINTS[:] = names
+    logger.info("Checkpoints available: %s", ", ".join(_CHECKPOINTS) or "none")
+    return list(_CHECKPOINTS)
+
 # Artifact kinds this worker can FETCH on demand, as opposed to the ones it already holds.
 # The API will not hand a worker a segment whose models it cannot load (console#422), and a
 # LoRA this box has never seen must not count against it: lora_sync downloads those inside
@@ -30,7 +57,7 @@ _CHECKPOINTS: list[str] = []
 # A constant, not a probe, because it describes what this CODE can do. When on-demand
 # checkpoint fetching lands (console#423) it gains "checkpoint" here and the gate opens by
 # itself — the API holds no second opinion about a daemon's abilities.
-FETCHABLE_KINDS: list[str] = ["lora"]
+FETCHABLE_KINDS: list[str] = ["lora", "checkpoint"]
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
 from daemon.a1111_monitor import get_status as get_a1111_status
 
