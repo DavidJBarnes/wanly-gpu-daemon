@@ -1,4 +1,5 @@
 import asyncio
+import os
 import hashlib
 import logging
 import time
@@ -373,6 +374,16 @@ class QueueClient:
         }
         if settings.runpod_pod_id:
             payload["runpod_pod_id"] = settings.runpod_pod_id
+        # Under the one-container-per-GPU supervisor (wanly-gpu-docker#83) this daemon is the
+        # single registrar for a box that also runs a trainer and a captioner. The supervisor
+        # says what the box is and runs through the environment; an API that predates
+        # `kinds` ignores both keys, so this is safe to send everywhere.
+        kinds = [k.strip() for k in os.environ.get("WORKER_KINDS", "").split(",") if k.strip()]
+        provides = [p.strip() for p in os.environ.get("WORKER_PROVIDES", "").split(",") if p.strip()]
+        if kinds:
+            payload["kinds"] = kinds
+        if provides:
+            payload["provides"] = provides
 
         resp = await self.client.post(
             "/workers",
