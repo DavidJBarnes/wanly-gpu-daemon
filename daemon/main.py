@@ -104,6 +104,27 @@ def _log_system_info(system_info: dict | None) -> None:
         logger.info("RAM: %.1f GB total, %.1f GB free", ram_total / (1024**3), ram_free / (1024**3))
 
 
+def _announce_registered(worker_id) -> None:
+    """Tell a supervisor we are up, and which row we are (wanly-gpu-docker#83).
+
+    Under the one-container-per-GPU supervisor the daemon is a child process with no port,
+    so "is it ready" cannot be probed; it is written down instead. WORKER_ID_FILE lets the
+    trainer in the same container claim under the same worker row -- one row per box, one
+    registrar. Both are optional: outside the supervisor neither variable is set and this
+    does nothing.
+    """
+    for var, content in (("WANLY_READY_FILE", "ready"), ("WORKER_ID_FILE", str(worker_id))):
+        path = os.environ.get(var)
+        if not path:
+            continue
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(content + "\n")
+        except OSError as e:
+            logger.warning("could not write %s (%s): %s", var, path, e)
+
+
 async def register_with_retry(client, *, friendly_name, hostname, ip_address, comfyui_running, shutdown_event):
     """Attempt to register with the API, retrying every 10s until success or shutdown.
     Returns (worker_id, friendly_name) — friendly_name may differ from config if renamed via console."""
@@ -643,6 +664,7 @@ async def run():
 
     # Mutable ref so heartbeat can update the name and poll loop sees it
     friendly_name_ref = [registered_name]
+    _announce_registered(worker_id)
 
     try:
         heartbeat_task = asyncio.create_task(
