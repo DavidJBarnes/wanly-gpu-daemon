@@ -50,6 +50,20 @@ class ComfyUIClient:
         except Exception:
             return False
 
+    async def free_memory(self) -> bool:
+        """Ask ComfyUI to drop its resident models and free VRAM.
+
+        The card is what a drain is FOR on a shared box: the trainer waits for the memory,
+        not for the status. An idle engine keeps 6-13 GB resident, so a parked worker that
+        did not unload would hold the trainer at "waiting" until the timeout.
+        """
+        try:
+            resp = await self.http.post("/free", json={"unload_models": True, "free_memory": True},
+                                        timeout=180)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     async def check_queue_busy(self) -> bool:
         """Check if ComfyUI has an active prompt via GET /queue."""
         try:

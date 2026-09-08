@@ -174,13 +174,25 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
                 logger.info("Friendly name updated: %s → %s", friendly_name_ref[0], new_name)
                 friendly_name_ref[0] = new_name
 
-            # Check if API signals drain
+            # Check if API signals drain -- and, off RunPod, the release. The release arrives
+            # the same way the drain did: the row's status. The trainer's DELETE /drain puts
+            # the row back to online-idle, and that is the signal to claim again. A pod
+            # never resumes; it drains to terminate.
+            on_runpod = bool(settings.runpod_pod_id)
             if data.get("status") == "draining" and not drain_event.is_set():
-                logger.info("Drain requested — will stop after current work")
+                logger.info("Drain requested — will %s after current work",
+                            "stop" if on_runpod else "park")
                 drain_event.set()
+            elif drain_event.is_set() and not on_runpod and data.get("status") != "draining":
+                logger.info("Drain released — resuming claims")
+                drain_event.clear()
+                last_busy_state = None
 
-            # Push status update when busy state changes
-            if is_busy != last_busy_state:
+            # Push status update when busy state changes -- but NOT while parked. Pushing
+            # online-idle from our side would undo the drain, the next heartbeat would read
+            # the row as released, and the worker would claim beside a training run: how
+            # 3090.zero hard-reset on 2026-09-08.
+            if is_busy != last_busy_state and not (drain_event.is_set() and not on_runpod):
                 new_status = "online-busy" if is_busy else "online-idle"
                 try:
                     await queue.update_status(worker_id, new_status)
@@ -222,6 +234,7 @@ async def _ltx_healthy() -> bool:
 async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event):
     """Poll the queue for segments and execute them one at a time."""
     poll_count = 0
+    parked = False
     while not shutdown_event.is_set():
         try:
             await asyncio.wait_for(
@@ -233,11 +246,26 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
         if shutdown_event.is_set():
             break
 
-        # If draining and not executing, trigger shutdown
+        # Draining and nothing in flight. On a pod that means shut down, and the pod is
+        # terminated. On a box with a restart policy it must NOT: the container would come
+        # straight back, register a fresh row with no drain, and claim work while the
+        # trainer holds the card. That is exactly what happened on 2026-09-08 -- the worker
+        # update timer restarted the drained worker mid-training, it claimed a render, and
+        # the box hard-reset under both loads. So off RunPod the worker PARKS: it drops its
+        # models so the card is actually free, keeps heartbeating as "draining", claims
+        # nothing, and resumes when the heartbeat sees the drain released.
         if drain_event.is_set():
-            logger.info("Drain active and no work in progress — shutting down")
-            shutdown_event.set()
-            break
+            if settings.runpod_pod_id:
+                logger.info("Drain active and no work in progress — shutting down")
+                shutdown_event.set()
+                break
+            if not parked:
+                freed = await comfyui.free_memory()
+                logger.info("Drain active — parked: models %s, not claiming until released",
+                            "unloaded" if freed else "NOT unloaded (ComfyUI did not answer /free)")
+                parked = True
+            continue
+        parked = False
 
         # A worker that cannot reach the API is not available, and the expensive failure is
         # that it keeps SAYING it is. On 2026-09-02 one sat registered and healthy-looking
@@ -329,10 +357,14 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
             except Exception:
                 pass
             executing_event.clear()
-            # If draining, don't go back to idle — shut down
+            # If draining: a pod shuts down; a box parks (see the top of the loop) and must
+            # not be pushed back to idle here, which would undo the drain from our own side.
             if drain_event.is_set():
-                logger.info("Drain active — segment finished, shutting down")
-                shutdown_event.set()
+                if settings.runpod_pod_id:
+                    logger.info("Drain active — segment finished, shutting down")
+                    shutdown_event.set()
+                else:
+                    logger.info("Drain active — segment finished, parking")
             else:
                 # Only go idle if sd-scripts isn't training (heartbeat loop handles ongoing busy)
                 sd_status = get_sd_scripts_status()
