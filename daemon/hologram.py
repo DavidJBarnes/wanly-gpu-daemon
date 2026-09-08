@@ -223,11 +223,16 @@ def rvm_matte(
 
 def build_manifest(packed_w: int, packed_h: int, color_w: int, guard_px: int, fps: float,
                    crop_rect: tuple[int, int, int, int], subject_height_m: float,
-                   flavor: str = "2d_matte", depth_scale_m: float | None = None) -> dict:
+                   flavor: str = "2d_matte", depth_scale_m: float | None = None,
+                   has_audio: bool = False) -> dict:
     """Player manifest. UV rects (top-left origin, normalized) so the shader is resolution-agnostic.
 
     "2d_matte" packs [color | guard | alpha]; "2.5d_depth" appends [guard | depth] and adds the
     depth region + relief scale so the player can displace a subdivided mesh (bright = near).
+
+    has_audio (console#475): whether the packed mp4 carries the source's audio track. Older
+    artifacts never recorded it — the field reads as absent, which the player treats as
+    silent, which is what they are.
     """
     total = float(packed_w)
     cw_uv = color_w / total
@@ -236,6 +241,7 @@ def build_manifest(packed_w: int, packed_h: int, color_w: int, guard_px: int, fp
         "flavor": flavor,
         "layout": "sbs_color_alpha_depth" if flavor == "2.5d_depth" else "sbs_color_alpha",
         "codec": "h264",
+        "has_audio": bool(has_audio),
         "fps": round(float(fps), 3),
         "video_width": int(packed_w),
         "video_height": int(packed_h),

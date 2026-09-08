@@ -191,11 +191,27 @@ async def _run_ffmpeg(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-500:]}")
 
 
+async def _probe_has_audio(path: str) -> bool:
+    """Whether a media file carries an audio stream, per ffprobe.
+
+    Decides build_manifest's has_audio and nothing else: the packed encode maps the source's
+    audio optionally, so a silent source must not fail the run — and the player should know
+    not to offer a mute control for a take that has nothing to unmute.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index", "-of", "csv=p=0", path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    return proc.returncode == 0 and bool(stdout.strip())
+
+
 def _holo_process_frames_sync(
     frame_files: list[str], packed_dir: str, key_color: str,
     subject_height_m: float, rvm_model_path: str, fps: float,
     flavor: str = "2d_matte", depth_model_path: str = "", depth_model_url: str = "",
-    depth_scale_m: float = 0.12,
+    depth_scale_m: float = 0.12, has_audio: bool = False,
 ) -> tuple[str, int, int, bytes, dict]:
     """CPU-heavy hologram work: load -> matte (chroma/RVM) -> [depth] -> crop -> pack -> poster + manifest.
 
@@ -247,7 +263,7 @@ def _holo_process_frames_sync(
 
     manifest = build_manifest(
         packed_w, packed_h, cw, GUARD_PX, fps, (x, y, cw, ch), subject_height_m,
-        flavor=flavor, depth_scale_m=depth_scale_m,
+        flavor=flavor, depth_scale_m=depth_scale_m, has_audio=has_audio,
     )
     return mode, packed_w, packed_h, poster_buf.getvalue(), manifest
 
@@ -294,6 +310,7 @@ async def _execute_ar_hologram(
         frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
         if not frame_files:
             raise RuntimeError("No frames extracted from source video")
+        source_has_audio = await _probe_has_audio(src)
 
         # Heavy CPU work (load -> matte -> crop -> pack -> poster + manifest) runs in a thread so
         # this hologram track runs concurrently with GPU generation without stalling the event loop.
@@ -304,20 +321,14 @@ async def _execute_ar_hologram(
             _holo_process_frames_sync, frame_files, packed_dir, key_color,
             subject_height_m, settings.rvm_model_path, fps,
             flavor, settings.depth_model_path, settings.depth_model_url, depth_scale_m,
+            source_has_audio,
         )
         await progress.log(f"[4/6] Matted ({mode}) + packed {len(frame_files)} frames")
 
         await progress.log("[5/6] Encoding packed mp4...")
         packed_mp4 = os.path.join(tmpdir, "hologram.mp4")
-        # Explicit limited-range + bt709 tags: untagged output makes some decoders (Quest
-        # included) guess the range, which crushes/clips the depth + alpha luma regions.
-        await _run_ffmpeg([
-            "-framerate", f"{fps}", "-i", os.path.join(packed_dir, "%05d.png"),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "12",
-            "-color_range", "tv", "-colorspace", "bt709",
-            "-color_primaries", "bt709", "-color_trc", "bt709",
-            "-movflags", "+faststart", packed_mp4,
-        ])
+        # See _packed_encode_args for the full rationale.
+        await _run_ffmpeg(_packed_encode_args(fps, packed_dir, src, packed_mp4))
         with open(packed_mp4, "rb") as f:
             packed_bytes = f.read()
         manifest_bytes = json.dumps(manifest).encode("utf-8")
@@ -340,6 +351,33 @@ async def _execute_ar_hologram(
 SMASHCUT_MAX_FPS = 60
 
 
+def _packed_encode_args(
+    fps: float, packed_dir: str, src: str, out_path: str,
+) -> list[str]:
+    """The argv for the packed mp4 encode — built here, unit-tested in isolation.
+
+    Two inputs: the packed frames (0) and the matted source's original file (1, for audio
+    only). Real LTX renders carry AAC 48 kHz stereo (ffprobe of a 2026-09-08 segment), so
+    the audio is stream-copied, and the packed video it used to accompany silently is the
+    only thing that changed. `-map 1:a?` keeps a silent source working — an old final.mp4
+    has no stream to map, and the manifest then says so. `-shortest` trims a loose audio
+    tail against the packed frames.
+
+    Explicit limited-range + bt709 tags on the video: untagged output makes some decoders
+    (Quest included) guess the range, which crushes/clips the depth + alpha luma regions.
+    """
+    return [
+        "-framerate", f"{fps}", "-i", os.path.join(packed_dir, "%05d.png"),
+        "-i", src,
+        "-map", "0:v", "-map", "1:a?",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "12",
+        "-c:a", "copy", "-shortest",
+        "-color_range", "tv", "-colorspace", "bt709",
+        "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-movflags", "+faststart", out_path,
+    ]
+
+
 def smashcut_output_fps(base_fps: int, speeds: list[float]) -> int:
     """The single fps every retimed clip is encoded at before concatenation.
 
@@ -357,8 +395,10 @@ async def _retime_clip(src: str, dst: str, speed: float, fps: int) -> None:
     """Re-encode one clip at a new playback speed, normalised to the montage's fps.
 
     setpts rescales presentation timestamps — <1 stretches (slow-motion), >1 compresses.
-    -an because generated clips carry no audio; without it a stray stream would survive
-    retiming untouched and drift against the video.
+    -an because retimed audio would drift against the video: setpts moves picture only, and
+    an audio track that played at the original speed over stretched frames is a lip-sync
+    disaster. LTX clips DO carry audio now (console#475) — carrying a speed-corrected track
+    (atempo chains, pitch invariants) is a deliberate follow-up, not this line's job.
     """
     await _run_ffmpeg([
         "-i", src,
