@@ -116,3 +116,22 @@ def test_every_named_content_lora_is_offered_to_the_fetcher():
     ]
     # And the same expression against the shape that caused the bug: no plural key at all.
     assert [e.get("name") for e in ({}.get("content_loras") or []) if isinstance(e, dict)] == []
+
+
+def test_every_character_lora_is_offered_to_the_fetcher(monkeypatch):
+    """Two people, two identity LoRAs (console#473); a second one this box has never seen
+    would otherwise 422 at the engine after the claim."""
+    names = _run_prefetch(monkeypatch, {
+        "char_lora": "pay_v2_e05",
+        "characters": [
+            {"char_lora": "pay_v2_e05", "s1": 0.8, "s2": 1.5},
+            {"char_lora": "david_v1_final", "s1": 0.7, "s2": 1.2},
+        ],
+    })
+    assert "pay_v2_e05" in names and "david_v1_final" in names
+
+
+def test_a_character_with_no_strengths_is_still_fetched(monkeypatch):
+    """What to download must not depend on whether the strengths were filled in."""
+    names = _run_prefetch(monkeypatch, {"characters": [{"char_lora": "david_v1_final"}]})
+    assert "david_v1_final" in names

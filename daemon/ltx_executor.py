@@ -23,7 +23,7 @@ from daemon.executor import (
     _validate_image_data,
 )
 from daemon.lora_sync import ensure_named_loras_present
-from daemon.ltx_client import LtxClient, LtxEngineError
+from daemon.ltx_client import LtxClient, LtxEngineError, character_lora_names
 from daemon.progress import ProgressLog
 from daemon.queue_client import QueueClient
 from daemon.schemas import SegmentClaim, SegmentResult
@@ -147,8 +147,12 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
         # for a file nobody had downloaded: 422 no such lora, after the claim.
         content_names = [e.get("name") for e in (recipe.get("content_loras") or [])
                          if isinstance(e, dict)]
+        # Every person's LoRA, not just the first: a two-person shot (console#473) names
+        # two, and a second one this box has never seen would otherwise 422 at the engine
+        # after the claim, exactly as the content LoRAs used to.
+        character_names = character_lora_names(recipe)
         fetched = await ensure_named_loras_present(
-            [recipe.get("char_lora"), *content_names], queue,
+            [*character_names, *content_names], queue,
             progress=progress.log,
         )
         if fetched:
