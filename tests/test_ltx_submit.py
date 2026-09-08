@@ -6,7 +6,7 @@ validated — which is exactly the class of bug the graph hash exists to catch, 
 worth catching one layer earlier.
 """
 
-from daemon.ltx_client import build_submit_payload
+from daemon.ltx_client import build_submit_payload, character_entries
 
 RECIPE = {
     "recipe": "Missionary POV",
@@ -133,3 +133,48 @@ def test_lora_name_is_sent_with_its_file_extension():
 def test_an_already_qualified_name_is_not_double_suffixed():
     lora = _payload(recipe={**RECIPE, "char_lora": "k3lly2026_v2.safetensors"})["loras"][0]
     assert lora["name"] == "k3lly2026_v2.safetensors"
+
+
+# ---------------------------------------------------------------- two people (console#473)
+
+TWO = dict(RECIPE, characters=[
+    {"name": "p@y", "trigger": "p@y", "char_lora": "pay_v2_e05", "s1": 0.8, "s2": 1.5},
+    {"name": "Me", "trigger": "d@vid", "char_lora": "david_v1_final", "s1": 0.7, "s2": 1.2},
+])
+
+
+def test_two_characters_become_two_lora_entries_in_order():
+    """On the recipe path the engine reads every `loras` entry as a person, slot 0 first."""
+    loras = _payload(recipe=TWO)["loras"]
+    assert [l["name"] for l in loras] == ["pay_v2_e05.safetensors", "david_v1_final.safetensors"]
+    assert (loras[1]["strength_stage_1"], loras[1]["strength_stage_2"]) == (0.7, 1.2)
+
+
+def test_the_scalar_shape_still_builds_exactly_one_entry():
+    """A blob from before console#473, byte for byte."""
+    assert _payload()["loras"] == [{
+        "name": "k3lly2026_v2.safetensors",
+        "strength": 0.8, "strength_stage_1": 0.8, "strength_stage_2": 1.5,
+    }]
+
+
+def test_characters_wins_over_the_mirrored_scalars():
+    """The scalars mirror characters[0]; if a blob disagrees, the list is the record."""
+    blob = dict(TWO, char_lora="something_else")
+    assert _payload(recipe=blob)["loras"][0]["name"] == "pay_v2_e05.safetensors"
+
+
+def test_a_none_second_character_is_dropped_not_sent():
+    blob = dict(TWO)
+    blob["characters"] = [TWO["characters"][0], {"char_lora": "none", "s1": 1, "s2": 1}]
+    assert len(_payload(recipe=blob)["loras"]) == 1
+
+
+def test_a_half_configured_second_slot_is_dropped_like_the_first_always_was():
+    blob = dict(TWO)
+    blob["characters"] = [TWO["characters"][0], {"char_lora": "david_v1_final"}]
+    assert len(_payload(recipe=blob)["loras"]) == 1
+
+
+def test_an_empty_list_falls_back_to_the_scalars():
+    assert _payload(recipe=dict(RECIPE, characters=[]))["loras"][0]["name"] == "k3lly2026_v2.safetensors"

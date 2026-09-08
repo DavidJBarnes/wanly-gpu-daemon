@@ -30,6 +30,72 @@ class LtxEngineError(RuntimeError):
     """The engine reported a failed render, or could not be reached."""
 
 
+def character_entries(recipe: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The people in the shot, as the engine's `loras` entries, in slot order.
+
+    A recipe carries `characters: [{name, trigger, char_lora, s1, s2}, ...]` since
+    console#473 -- two people, two identity LoRAs -- with the older scalar keys
+    (`char_lora`, `char_s1`, `char_s2`) mirrored from the first entry. The list wins when it
+    is there; a blob from before it, or from an older console, still yields the one entry it
+    always did, byte for byte.
+
+    Per entry the rules are the ones the single character always had: "none" in any casing
+    means no LoRA in that slot and is dropped here rather than forwarded (the engine would
+    look for none.safetensors); a slot missing either strength is half-configured and is
+    dropped rather than rendered at a guessed strength; and the file extension is added at
+    this boundary because the engine matches files exactly while everything upstream stores
+    the bare name.
+    """
+    if not recipe:
+        return []
+    raw = recipe.get("characters")
+    if not isinstance(raw, list) or not raw:
+        raw = [{"char_lora": recipe.get("char_lora"),
+                "s1": recipe.get("char_s1"), "s2": recipe.get("char_s2")}]
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        lora = entry.get("char_lora")
+        if not lora or str(lora).strip().lower() == "none":
+            continue
+        s1, s2 = entry.get("s1"), entry.get("s2")
+        if s1 is None or s2 is None:
+            continue
+        lora = str(lora).strip()
+        if not lora.endswith(".safetensors"):
+            lora = f"{lora}.safetensors"
+        out.append({
+            "name": lora,
+            "strength": float(s1),
+            "strength_stage_1": float(s1),
+            "strength_stage_2": float(s2),
+        })
+    return out
+
+
+def character_lora_names(recipe: dict[str, Any] | None) -> list[str]:
+    """Every person's LoRA, by the bare name the catalogue uses, for pre-fetching.
+
+    Separate from `character_entries` on purpose: what to DOWNLOAD must not depend on
+    whether a slot's strengths were filled in. A half-configured slot renders nothing, but a
+    file that is merely absent must still be fetched before the engine is asked about it.
+    """
+    if not recipe:
+        return []
+    raw = recipe.get("characters")
+    if not isinstance(raw, list) or not raw:
+        raw = [{"char_lora": recipe.get("char_lora")}]
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        lora = str(entry.get("char_lora") or "").strip()
+        if lora and lora.lower() != "none":
+            out.append(lora)
+    return out
+
+
 def build_submit_payload(
     *,
     image_bytes: bytes | None,
@@ -86,40 +152,15 @@ def build_submit_payload(
         # on its workflow default while the pose said otherwise.
         if recipe.get("img_compression") is not None:
             payload["img_compression"] = int(recipe["img_compression"])
-        lora = recipe.get("char_lora")
-        # "none" is how a render says "no character" — useful for judging what the LoRA is
-        # actually contributing, and for a shot whose start frame already carries the
-        # identity (console#412).
-        #
-        # It has to be filtered HERE, not left to the engine. `if lora` alone passes,
-        # because the STRING "none" is truthy, and the entry would then be normalised to
-        # "none.safetensors" — which is no longer the literal "none" the engine's own
-        # want_char check looks for, so it would sail past that and 422 on a file that does
-        # not exist, ten minutes into a claimed segment.
-        if lora and str(lora).strip().lower() == "none":
-            lora = None
-        s1, s2 = recipe.get("char_s1"), recipe.get("char_s2")
-        if lora and s1 is not None and s2 is not None:
-            # The engine matches LoRAs by EXACT filename. Its own recipe path appends the
-            # extension; the explicit-lora path this uses does not. Names arrive bare because
-            # that is how the recipe sheet wrote them and how the console displays them, so a
-            # real render died on `no such lora 'pay_v2_e05'` while 'pay_v2_e05.safetensors'
-            # sat in the very list the error printed.
-            #
-            # Normalised here, at the boundary that talks to the engine, rather than in the
-            # database: what a LoRA is CALLED is a display concern and what file it IS is the
-            # engine's, and everything in between should not have to agree on the extension.
-            if not lora.endswith(".safetensors"):
-                lora = f"{lora}.safetensors"
-            # Per-stage, never flat. Stage 1 generates at half size from noise and stage 2
-            # refines the 2x-upscaled latent; the validated recipe runs 0.8 then 1.5, and
-            # collapsing them to one number is a different configuration.
-            payload["loras"] = [{
-                "name": lora,
-                "strength": float(s1),
-                "strength_stage_1": float(s1),
-                "strength_stage_2": float(s2),
-            }]
+        # One `loras` entry per PERSON, in slot order (console#473). On this path the engine
+        # reads every entry of `loras` as a character LoRA -- content LoRAs travel in their
+        # own field below -- and chains them after the content chain, slot 0 then slot 1.
+        # Per-stage, never flat: stage 1 generates at half size from noise and stage 2
+        # refines the 2x-upscaled latent; the validated recipe runs 0.8 then 1.5, and
+        # collapsing them to one number is a different configuration.
+        loras = character_entries(recipe)
+        if loras:
+            payload["loras"] = loras
 
         # The POSE's content LoRAs — motion and act — chained ahead of the character LoRA on
         # both stage branches, IN ORDER. They stack: motion, act and framing are separable

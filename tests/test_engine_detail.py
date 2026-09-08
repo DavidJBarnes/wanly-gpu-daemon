@@ -79,3 +79,16 @@ class TestPurgeIsNonFatal:
         src = inspect.getsource(mod.execute_ltx_segment)
         assert src.index("upload_segment_output") < src.index("client.purge("), \
             "purge must come after the upload"
+
+
+def test_two_character_loras_each_get_a_coverage_line():
+    from daemon.ltx_executor import _engine_detail
+    lines = _engine_detail({"loras": [
+        {"name": "pay_v2_e05.safetensors", "fused": 480, "targeted": 480,
+         "strength_stage_1": 0.8, "strength_stage_2": 1.5},
+        {"name": "david_v1_final.safetensors", "fused": 480, "targeted": 480,
+         "strength_stage_1": 0.7, "strength_stage_2": 1.2},
+    ]})
+    joined = "\n".join(lines)
+    assert "pay_v2_e05.safetensors @0.8/1.5: fused 480/480" in joined
+    assert "david_v1_final.safetensors @0.7/1.2: fused 480/480" in joined
