@@ -149,19 +149,47 @@ async def register_with_retry(client, *, friendly_name, hostname, ip_address, co
     return None, None
 
 
-async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event):
-    """Send heartbeats every heartbeat_interval seconds."""
+async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event,
+                         drain_event, executing_event):
+    """Send heartbeats every heartbeat_interval seconds.
+
+    A SHUTDOWN DOES NOT END THE HEARTBEAT WHILE A SEGMENT IS STILL RUNNING.
+
+    The shutdown path deliberately lets the segment in flight finish -- up to
+    drain_wait_seconds, and a render is ~10-27 minutes. Stopping the heartbeat the instant
+    SIGTERM arrives left the row stale for that whole window, so the API marked a worker
+    OFFLINE while it was actively rendering, and the Workers page said "Nothing is running
+    — 1 segment queued and no workers online — start a worker", with the job beside it
+    correctly reading `processing`. That is worse than cosmetic: it tells an operator to
+    launch a pod for work that is already being done.
+
+    Any `docker stop` did this; wanly-gpu-docker#131's mode switch made it routine, because
+    flipping a busy box to captions is exactly the shutdown-with-work-in-flight case.
+
+    The loop therefore ends on shutdown AND nothing executing. If executing_event were never
+    cleared this would not exit on its own -- the supervisor's stop_grace_s (1800s) and
+    Docker's own stop timeout bound it, which is the same bound the segment wait already
+    relies on.
+    """
     beat_count = 0
     last_busy_state = None
-    while not shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(
-                shutdown_event.wait(), timeout=settings.heartbeat_interval
-            )
-        except asyncio.TimeoutError:
-            pass
+    while True:
+        if shutdown_event.is_set() and not executing_event.is_set():
+            break
 
         if shutdown_event.is_set():
+            # Draining with work in flight: shutdown_event.wait() returns instantly now, so
+            # sleep the interval instead or this spins.
+            await asyncio.sleep(settings.heartbeat_interval)
+        else:
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(), timeout=settings.heartbeat_interval
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        if shutdown_event.is_set() and not executing_event.is_set():
             break
 
         comfyui_running = await comfyui.check_health()
@@ -668,7 +696,8 @@ async def run():
 
     try:
         heartbeat_task = asyncio.create_task(
-            heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, drain_event)
+            heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event,
+                           drain_event, executing_event)
         )
         job_task = asyncio.create_task(
             job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event)
