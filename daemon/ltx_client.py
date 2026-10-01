@@ -107,8 +107,14 @@ def build_submit_payload(
     frame_rate: int,
     seed: int,
     recipe: dict[str, Any] | None,
+    identity_ref: str | None = None,
+    identity_mode: str | None = None,
 ) -> dict[str, Any]:
     """The engine's /job body. Pure, so it can be asserted without an engine.
+
+    `identity_ref` (a data URI) and `identity_mode` ("sheet" | "face") are the character's
+    identity reference (#187). Sent only together, and only when both are given: without them
+    the body is exactly what it was before references existed.
 
     `recipe` is the RESOLVED configuration handed down in the claim. It is read, never
     looked up — see the module docstring.
@@ -195,6 +201,10 @@ def build_submit_payload(
         if contents:
             payload["content_loras"] = contents
 
+    if identity_ref and identity_mode:
+        payload["identity_ref"] = identity_ref
+        payload["identity_mode"] = identity_mode
+
     return payload
 
 
@@ -212,6 +222,15 @@ class LtxClient:
         r.raise_for_status()
         result: dict[str, Any] = r.json()
         return result
+
+    async def features(self) -> set[str]:
+        """What this engine can do beyond the base request, from /health (#187).
+
+        An engine from before a feature existed simply has no such entry -- and, with no
+        extra="forbid" on its request model, would IGNORE the field rather than refuse it.
+        That is why the daemon asks before sending an identity reference.
+        """
+        return set((await self.health()).get("features") or [])
 
     async def purge(self, job_id: str) -> dict:
         """Drop the engine's local media for a finished job (console#380).
@@ -258,12 +277,14 @@ class LtxClient:
         frame_rate: int,
         seed: int,
         recipe: dict[str, Any] | None,
+        identity_ref: str | None = None,
+        identity_mode: str | None = None,
     ) -> str:
         """Queue a render. Returns the engine's job id."""
         payload = build_submit_payload(
             image_bytes=image_bytes, prompt=prompt, negative_prompt=negative_prompt,
             width=width, height=height, num_frames=num_frames, frame_rate=frame_rate,
-            seed=seed, recipe=recipe,
+            seed=seed, recipe=recipe, identity_ref=identity_ref, identity_mode=identity_mode,
         )
         r = await self._client.post("/job", json=payload)
         if r.status_code >= 400:
