@@ -35,7 +35,26 @@ CUSTOM_NODE_PACKAGES: dict[str, dict] = {
         "repo": "https://github.com/princepainter/ComfyUI-PainterLongVideo",
         "nodes": ["PainterLongVideo"],
     },
+    # The identity-reference node (wanly-gpu-docker#156): ltx-engine patches it into the recipe
+    # graph when a render carries a character sheet or face ref. LTX only -- a WAN ComfyUI has
+    # no use for it -- and PINNED to the commit phase 0 proved (wanly-gpu-docker#155), the same
+    # one the image's Dockerfile checks out. The image itself runs with COMFYUI_PATH empty, so
+    # there this entry documents rather than installs; it bites on an LTX host install.
+    "ComfyUI-BFSNodes": {
+        "repo": "https://github.com/alisson-anjos/ComfyUI-BFSNodes",
+        "commit": "bd23236bdde2daf10ec4d879364805c0e97a78eb",
+        "nodes": ["LTXIdentityOverlapConditioning"],
+        "engines": ["ltx"],
+    },
 }
+
+
+def required_packages(engine: str | None = None) -> dict[str, dict]:
+    """The packages this worker's engine needs. An entry with no `engines` is WAN-era and
+    applies everywhere it always did; one with `engines` applies only to those."""
+    engine = engine or settings.engine
+    return {name: info for name, info in CUSTOM_NODE_PACKAGES.items()
+            if engine in info.get("engines", [engine])}
 
 
 async def _run(cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
@@ -50,13 +69,15 @@ async def _run(cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
     return proc.returncode, stdout.decode(errors="replace").strip()
 
 
-async def _git_clone(repo_url: str, target_dir: Path) -> bool:
-    """Clone a git repo into target_dir. Returns True on success."""
-    logger.info("Cloning %s → %s", repo_url, target_dir)
+async def _git_clone(repo_url: str, target_dir: Path, commit: str | None = None) -> bool:
+    """Clone a git repo into target_dir, at `commit` when one is pinned. True on success."""
+    logger.info("Cloning %s → %s%s", repo_url, target_dir, f" @ {commit[:7]}" if commit else "")
     # GIT_TERMINAL_PROMPT=0 prevents git from hanging on credential prompts
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    # A pinned commit needs history to check out; an unpinned one only needs the tip.
+    depth = [] if commit else ["--depth", "1"]
     proc = await asyncio.create_subprocess_exec(
-        "git", "clone", "--depth", "1", repo_url, str(target_dir),
+        "git", "clone", *depth, repo_url, str(target_dir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=env,
@@ -67,6 +88,11 @@ async def _git_clone(repo_url: str, target_dir: Path) -> bool:
     if rc != 0:
         logger.error("git clone failed (rc=%d): %s", rc, output)
         return False
+    if commit:
+        rc, output = await _run(["git", "checkout", "-q", commit], cwd=str(target_dir))
+        if rc != 0:
+            logger.error("git checkout %s failed (rc=%d): %s", commit, rc, output)
+            return False
     logger.info("Cloned %s successfully", repo_url)
     return True
 
@@ -117,13 +143,15 @@ async def check_and_install_nodes(comfyui_client) -> bool:
     # Phase 1: Check which node directories are missing and install them
     installed_any = False
     install_failed: list[str] = []
-    for pkg_name, pkg_info in CUSTOM_NODE_PACKAGES.items():
+    packages = required_packages()
+    for pkg_name, pkg_info in packages.items():
         if _package_dir_present(custom_nodes_dir, pkg_name, pkg_info):
             logger.debug("Node %s: installed", pkg_name)
             continue
 
         logger.warning("✗ %s — not found, installing...", pkg_name)
-        success = await _git_clone(pkg_info["repo"], custom_nodes_dir / pkg_name)
+        success = await _git_clone(pkg_info["repo"], custom_nodes_dir / pkg_name,
+                                   pkg_info.get("commit"))
         if not success:
             logger.error("Failed to install %s — workflows using %s will fail", pkg_name, pkg_info["nodes"])
             install_failed.append(pkg_name)
@@ -171,7 +199,7 @@ async def check_and_install_nodes(comfyui_client) -> bool:
         return True
 
     failed_imports: dict[str, list[str]] = {}
-    for pkg_name, pkg_info in CUSTOM_NODE_PACKAGES.items():
+    for pkg_name, pkg_info in packages.items():
         missing = [n for n in pkg_info["nodes"] if n not in available_nodes]
         if missing:
             failed_imports[pkg_name] = missing

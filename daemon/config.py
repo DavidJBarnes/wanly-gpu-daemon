@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     # has happened before (4 of 9 lost to a 90-minute wait loop).
     ltx_timeout_seconds: int = 5400
     ltx_poll_interval: int = 5
+    # Where fetched identity references (character sheets / face refs, #187) are cached, by
+    # content hash. Empty: a directory under the system temp dir.
+    identity_ref_cache_dir: str = ""
+    # The two Best-Face-ID LoRAs an identity reference renders with (wanly-gpu-docker#156).
+    # Named here for the LTX model check; MUST match the engine's recipe.IDENTITY_LORAS and
+    # wanly-gpu-docker's download_models.sh.
+    identity_face_lora: str = "Best_FaceID_v1.0_LoRA.safetensors"
+    identity_sheet_lora: str = "Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors"
 
     # Model filenames (vary per GPU worker — override in .env)
     clip_model: str = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"

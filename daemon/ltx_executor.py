@@ -22,6 +22,7 @@ from daemon.executor import (
     _extract_last_frame,
     _validate_image_data,
 )
+from daemon.identity_ref import fetch_identity_ref
 from daemon.lora_sync import ensure_named_loras_present
 from daemon.ltx_client import LtxClient, LtxEngineError, character_lora_names
 from daemon.progress import ProgressLog
@@ -177,6 +178,29 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
             from daemon.main import refresh_reported_checkpoints
             await refresh_reported_checkpoints()
 
+        # THE CHARACTER'S IDENTITY REFERENCE (#187), when the claim carries one: a character
+        # sheet or a face close-up, conditioned into both stages by the engine
+        # (wanly-gpu-docker#156). None -- every claim from an API without the feature, and every
+        # character without a reference -- leaves the request exactly as it was.
+        identity = segment.identity_ref
+        ref_data_uri = ref_mode = None
+        if identity is not None:
+            # Asked BEFORE fetching. An engine that predates the feature would ignore the field
+            # and render without it -- for a sheet-only character, simply somebody else, with
+            # nothing in the clip saying so. Refused instead, with the fix in the message.
+            if "identity_ref" not in await client.features():
+                raise LtxEngineError(
+                    "this worker's ltx-engine does not support identity references "
+                    "(wanly-gpu-docker#156): re-pin the worker to an image built after it, or "
+                    "untick 'Use character sheet' on the job")
+            ref = await fetch_identity_ref(identity.url, identity.mode, identity.uri)
+            ref_data_uri, ref_mode = ref.data_uri(), ref.mode
+            who = f" for {identity.character}" if identity.character else ""
+            await progress.log(f"[2/6] {ref.describe()}{who}")
+            if ref.mode == "sheet" and ref.size != (1536, 1024):
+                await progress.log(f"[2/6] WARNING character sheet is {ref.size[0]}x"
+                                   f"{ref.size[1]}, not 1536x1024")
+
         await progress.log("[2/6] Submitting to ltx-engine...")
         job_id = await client.submit(
             image_bytes=image_bytes,
@@ -188,6 +212,8 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
             frame_rate=segment.fps,
             seed=segment.seed,
             recipe=recipe or None,
+            identity_ref=ref_data_uri,
+            identity_mode=ref_mode,
         )
         await progress.log(f"[3/6] Queued as {job_id}")
 

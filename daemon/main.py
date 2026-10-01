@@ -661,15 +661,19 @@ async def run():
     # the LTX health gate below will not let this worker claim until it is up — so an LTX
     # worker is checked, just by the service that knows what to check for.
     # Replacing MODEL_CHECKS with the LTX set is wanly-gpu-docker#41.
+    #
+    # An LTX worker checks LTX_MODEL_CHECKS instead: only the identity-reference LoRAs the
+    # daemon names in a request (#187). Like the WAN set it is a no-op without COMFYUI_PATH,
+    # which the image leaves empty -- there download_models.sh is the gate.
     if settings.engine == "ltx":
-        logger.info("Skipping WAN model validation — ltx-engine validates its own models")
-    else:
-        models_ok = await validate_models(comfyui)
-        if not models_ok:
-            logger.error("Model validation failed. Exiting.")
-            await comfyui.close()
-            await queue.close()
-            return
+        logger.info("Skipping WAN model validation — ltx-engine validates its own models; "
+                    "checking the identity-reference LoRAs only")
+    models_ok = await validate_models(comfyui)
+    if not models_ok:
+        logger.error("Model validation failed. Exiting.")
+        await comfyui.close()
+        await queue.close()
+        return
 
     # Log GPU/VRAM info
     system_info = await comfyui.get_system_info()

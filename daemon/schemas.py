@@ -16,6 +16,20 @@ class LoraItem(BaseModel):
     low_weight: float = 1.0
 
 
+class IdentityRef(BaseModel):
+    """The segment character's identity reference (wanly-api#379, daemon #187).
+
+    `url` is presigned and short-lived -- never log it. `uri` is the S3 object it points at,
+    used only as the content cache's index key. `mode` picks the engine's LoRA and resize:
+    "sheet" (a 1536x1024 character sheet) or "face" (a close-up).
+    """
+
+    url: str
+    mode: str
+    uri: Optional[str] = None
+    character: Optional[str] = None
+
+
 class SegmentClaim(BaseModel):
     """Mirrors wanly-api SegmentClaimResponse."""
 
@@ -48,6 +62,9 @@ class SegmentClaim(BaseModel):
     # STALE one, which is the failure this shape exists to prevent (wanly-api#207).
     # None means "not a recipe render"; an LTX free-form render is prompt-only.
     ltx_recipe: Optional[dict] = None
+    # The character's sheet or face reference, when it has one and the job did not turn it off
+    # (wanly-console#581). None -- the only value an older API sends -- renders exactly as before.
+    identity_ref: Optional[IdentityRef] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
     # Retired engine selectors, still sent by wanly-api on older jobs. Kept on the schema so

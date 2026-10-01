@@ -37,9 +37,21 @@ MODEL_CHECKS = [
 ]
 
 
-def get_model_checks() -> list[tuple]:
-    """Model checks every worker must pass. Kept as a function for call-site stability."""
-    return MODEL_CHECKS
+# The LTX set. ltx-engine and wanly-gpu-docker's download_models.sh own the base models (the
+# image refuses to boot without them), so this lists only what the daemon itself asks for by
+# name in a claim: the two Best-Face-ID LoRAs an identity reference renders with
+# (wanly-gpu-docker#156). Must match download_models.sh's _WANTED and the engine's
+# recipe.IDENTITY_LORAS. Like the WAN set, it only checks anything when COMFYUI_PATH is set --
+# i.e. on a host install; the image leaves it empty and relies on download_models.sh.
+LTX_MODEL_CHECKS = [
+    ("identity_face_lora",  "LoraLoaderModelOnly",  ["loras"],                  MIN_SIZES["loras"]),
+    ("identity_sheet_lora", "LoraLoaderModelOnly",  ["loras"],                  MIN_SIZES["loras"]),
+]
+
+
+def get_model_checks(engine: str | None = None) -> list[tuple]:
+    """The model checks this worker's engine must pass."""
+    return LTX_MODEL_CHECKS if (engine or settings.engine) == "ltx" else MODEL_CHECKS
 
 PARTIAL_EXTENSIONS = {".aria2", ".tmp", ".part"}
 
