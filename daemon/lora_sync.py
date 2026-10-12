@@ -4,10 +4,14 @@ Only downloads files that are missing locally. Files are cached forever.
 Uses atomic writes (.tmp → rename) to prevent corrupt partial files.
 """
 
+import asyncio
 import hashlib
 import logging
-from datetime import datetime, timezone
 import os
+import time
+from datetime import datetime, timezone
+
+from daemon import phase
 
 from daemon.config import settings
 from daemon.queue_client import QueueClient
@@ -206,43 +210,102 @@ def _needs_download(local_path: str, remote: dict) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------------------
+# LoRAs the background sync has not finished with yet (wanly-gpu-daemon#189).
+#
+# The sync used to run BEFORE registration, which made the claim question moot: nothing could
+# claim until every eager LoRA was in place. It now runs AFTER registration, in the
+# background, so a claim can arrive while Payton_v2_final is 358 MB into a 650 MB download.
+# A segment naming that LoRA must not be claimed until the file lands -- not failed, not
+# fetched a second time in parallel into the same .tmp, just left in the queue.
+#
+# So every eager LoRA the sync has not yet VERIFIED or FETCHED is "pending". The daemon
+# sends the set on every claim and the API skips segments naming any of them (wanly-api,
+# `pending_loras`). Same-size files count until their md5 is checked, because a retrain
+# republished under the same name at the same size is exactly what the content check exists
+# to catch; that pass is about a second per file, so the window is short.
+#
+# Each pending name carries an Event, set when the sync is done with it either way, so the
+# claim-time path can WAIT for a file the sync is already fetching rather than race it --
+# the fallback for an API too old to honour `pending_loras`.
+# ---------------------------------------------------------------------------------------
+_PENDING: dict[str, asyncio.Event] = {}
+#: Set once the catalogue has been listed (or listing failed): until then nobody knows which
+#: LoRAs are pending, so the claim loop waits for it. It is one API call -- about a second.
+_LISTED = asyncio.Event()
+
+
+def pending_loras() -> list[str]:
+    """Filenames the background sync has not verified or fetched yet, for the claim."""
+    return sorted(_PENDING)
+
+
+async def wait_until_listed(timeout: float | None = None) -> None:
+    """Block until the sync knows what is pending. Bounded: a hung listing must not stop
+    claims forever, and an unlisted catalogue means nothing is pending."""
+    try:
+        await asyncio.wait_for(_LISTED.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+
+
+def _hold(names) -> None:
+    for n in names:
+        _PENDING.setdefault(n, asyncio.Event())
+
+
+def _release(name: str) -> None:
+    ev = _PENDING.pop(name, None)
+    if ev is not None:
+        ev.set()
+
+
+def _release_all() -> None:
+    for n in list(_PENDING):
+        _release(n)
+
+
+def _fmt_eta(s: float | None) -> str:
+    if s is None:
+        return "?"
+    s = int(s)
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
 async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = ("character",)) -> bool:
     """Diff the local LoRA directory against the bucket and fetch what differs.
 
-    EAGER ONLY FOR SOME KINDS, and by default only for character LoRAs.
+    RUNS IN THE BACKGROUND, AFTER REGISTRATION (wanly-gpu-daemon#189). It used to block
+    registration, and every byte fetched here was a worker missing from the Workers page:
+    on 2026-10-12 a mode switch into render re-ran it, Payton_v2_final (~650 MB at ~0.4 MB/s)
+    took the box offline for 10+ minutes and a training run waited behind it. Now the worker
+    is on the board within seconds, says what it is fetching (daemon/phase.py), and only the
+    segments naming a LoRA still in flight wait for it (pending_loras()).
 
-    Boot sync blocks registration, so every byte fetched here is a worker not yet taking
-    work. Measured on the 3090: one 408 MB content LoRA published while the pod was down
-    added FIVE MINUTES to boot, during which the queue had no worker. A content library is
-    expected to grow, so eager-fetching all of it makes every worker's boot slower forever,
-    for LoRAs most of them will never be asked for.
+    TWO PASSES. First verify everything (cheap: stat, then md5 off the event loop), releasing
+    each LoRA from `pending` as it is found current -- so within about a minute only the files
+    really being downloaded hold anything back. Then download what needs it, one at a time,
+    reporting file / MB / rate / ETA / files left.
 
-    Character LoRAs stay eager because the set is small, bounded by how many characters
-    exist, and effectively every job names one — so fetching them at boot is work that was
-    going to happen on the first claim anyway.
-
-    Content LoRAs are left to ensure_named_loras_present() at claim time. The cost moves
-    from every boot to the first claim that actually needs one, which is the claim that was
-    going to wait for that download regardless.
-
-    Non-eager kinds are still CHECKED, and a stale one is reported — the diff is cheap and
-    silence about a LoRA that is present but wrong is exactly what the content comparison
-    exists to prevent. Only the download is deferred.
+    EAGER ONLY FOR SOME KINDS, and by default only for character LoRAs. Character LoRAs are a
+    small set and effectively every job names one. Content LoRAs are left to
+    ensure_named_loras_present() at claim time: the cost moves from every sync to the first
+    claim that needs one. Non-eager kinds are still CHECKED, and a stale one is reported --
+    only the download is deferred.
 
     Returns True when everything eager is in place and nothing deferred looks broken.
-    Deliberately NOT fatal to boot:
-    a worker that exits here restart-loops, and a restart loop on a rented pod costs real
-    money and is miserable to diagnose (we have already lost an hour to one). A worker with
-    a missing LoRA fails the segment that needs it, loudly, with the name in the error —
-    which is a better failure than no worker at all.
+    Deliberately NOT fatal: a worker with a missing LoRA fails the segment that needs it,
+    loudly, with the name in the error -- a better failure than no worker at all.
     """
     lora_dir = _loras_dir()
     os.makedirs(lora_dir, exist_ok=True)
 
+    phase.set_phase("syncing_loras", "Listing the LoRA catalogue")
     try:
         catalog = await queue.list_loras()
     except Exception as e:
         logger.error("LoRA sync: could not list the catalogue (%s) — keeping what is on disk", e)
+        _LISTED.set()
         return False
 
     logger.info("LoRA sync: %d in the catalogue, checking %s", len(catalog), lora_dir)
@@ -264,92 +327,147 @@ async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = (
             )
         seen[r["name"]] = r.get("key", r["name"])
 
+    candidates = [r for r in catalog if r["name"] not in clashing]
+    # Held BEFORE the claim loop is let go: every eager LoRA is pending until proven current.
+    _hold(r["name"] for r in candidates if r.get("kind", "character") in eager_kinds)
+    _LISTED.set()
+
     ok = not clashing
     fetched = 0
     deferred: list[str] = []
+    to_fetch: list[tuple[dict, str]] = []
     # One entry per catalogue object, carrying the verdict _needs_download() already reached.
     # Built here rather than in a second pass so there is exactly one implementation of
     # "is this current" — two would drift, which is the recipes.json trap in the wiki.
     report: list[dict] = []
-    for remote in catalog:
-        name = remote["name"]
-        if name in clashing:
-            continue
-        local_path = os.path.join(lora_dir, name)
-        _cleanup_partials(lora_dir, name)
+    try:
+        # ---- pass 1: verify ----
+        for i, remote in enumerate(candidates, 1):
+            name = remote["name"]
+            phase.update(f"Checking LoRAs on disk ({i}/{len(candidates)})",
+                         files_checked=i, files_in_catalogue=len(candidates))
+            local_path = os.path.join(lora_dir, name)
+            _cleanup_partials(lora_dir, name)
 
-        reason = _needs_download(local_path, remote)
-        if reason is None:
-            logger.info("       %s: current", name)
-            report.append({
-                "name": name, "kind": remote.get("kind", "unknown"),
-                # A multipart ETag is not an md5, so "current" here rests on size alone.
-                # Surfaced rather than folded into "current", because the difference is
-                # exactly whether a same-size retrain would have been caught.
-                "state": "unverifiable" if remote.get("multipart") else "current",
-                **({"note": "multipart ETag — size only"} if remote.get("multipart") else {}),
-            })
-            continue
+            # Off the event loop: an md5 of 650 MB is about a second, and forty of them on the
+            # loop would stall the heartbeat and the claim this whole change exists to keep
+            # moving.
+            reason = await asyncio.to_thread(_needs_download, local_path, remote)
+            if reason is None:
+                logger.info("       %s: current", name)
+                report.append({
+                    "name": name, "kind": remote.get("kind", "unknown"),
+                    # A multipart ETag is not an md5, so "current" here rests on size alone.
+                    "state": "unverifiable" if remote.get("multipart") else "current",
+                    **({"note": "multipart ETag — size only"} if remote.get("multipart") else {}),
+                })
+                _release(name)
+                continue
 
-        kind = remote.get("kind", "character")
-        if kind not in eager_kinds:
-            # Checked, reported, and deliberately not fetched here. The claim that names it
-            # will fetch it; boot does not wait for a LoRA nothing has asked for yet.
-            deferred.append(name)
-            logger.info("       %s: %s — deferred (%s, fetched on demand)", name, reason, kind)
-            # "missing" is by design here and must not read as a fault; but a file that is
-            # PRESENT AND WRONG is a fault whether or not we chose to defer the download,
-            # so the two are reported differently.
-            report.append({
-                "name": name, "kind": kind,
-                "state": "deferred" if reason == "missing" else "stale",
-                "note": reason,
-            })
-            continue
+            kind = remote.get("kind", "character")
+            if kind not in eager_kinds:
+                # Checked, reported, and deliberately not fetched here. The claim that names it
+                # will fetch it; nothing waits for a LoRA nothing has asked for yet.
+                deferred.append(name)
+                logger.info("       %s: %s — deferred (%s, fetched on demand)", name, reason, kind)
+                # "missing" is by design here and must not read as a fault; but a file that is
+                # PRESENT AND WRONG is a fault whether or not we chose to defer the download.
+                report.append({
+                    "name": name, "kind": kind,
+                    "state": "deferred" if reason == "missing" else "stale",
+                    "note": reason,
+                })
+                continue
+            logger.info("       %s: %s — will download", name, reason)
+            to_fetch.append((remote, reason))
 
-        logger.info("       %s: %s — downloading", name, reason)
-        tmp_path = local_path + ".tmp"
-        try:
-            got = await queue.stream_file(remote["uri"], tmp_path)
-        except Exception as e:
-            logger.error("       %s: download failed: %s", name, e)
-            ok = False
-            if os.path.exists(tmp_path):
+        # ---- pass 2: download ----
+        total_all = sum(int(r.get("size") or 0) for r, _ in to_fetch)
+        done_before = 0
+        for idx, (remote, reason) in enumerate(to_fetch):
+            name = remote["name"]
+            size = int(remote.get("size") or 0)
+            left = len(to_fetch) - idx
+            local_path = os.path.join(lora_dir, name)
+            tmp_path = local_path + ".tmp"
+            started = time.monotonic()
+            stem = name[: -len(".safetensors")] if name.endswith(".safetensors") else name
+            phase.set_phase(
+                "syncing_loras", f"Downloading {stem} (0 / {phase.mb(size)} MB), "
+                f"{left} file{'s' if left != 1 else ''} left",
+                file=name, done_bytes=0, total_bytes=size, rate_bps=None, eta_s=None,
+                files_done=idx, files_total=len(to_fetch), files_remaining=left,
+                all_done_bytes=done_before, all_total_bytes=total_all,
+            )
+            logger.info("       %s: %s — downloading", name, reason)
+
+            async def _tick(done, total, _name=stem, _started=started, _before=done_before,
+                            _left=left, _size=size):
+                elapsed = max(time.monotonic() - _started, 0.001)
+                rate = done / elapsed
+                remaining = (total_all - _before - done)
+                eta = remaining / rate if rate > 0 else None
+                phase.update(
+                    f"Downloading {_name} ({phase.mb(done)} / {phase.mb(_size or total)} MB, "
+                    f"{rate / (1024 * 1024):.1f} MB/s, ETA {_fmt_eta(eta)}), "
+                    f"{_left} file{'s' if _left != 1 else ''} left",
+                    done_bytes=done, rate_bps=round(rate), eta_s=round(eta) if eta else None,
+                    all_done_bytes=_before + done,
+                )
+
+            try:
+                got = await queue.stream_file(remote["uri"], tmp_path, on_progress=_tick,
+                                              total=size, step=4 * 1024 * 1024)
+            except Exception as e:
+                logger.error("       %s: download failed: %s", name, e)
+                ok = False
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                _release(name)
+                done_before += size
+                continue
+            done_before += size
+
+            # Verify BEFORE the rename, so a bad transfer can never take the place of a good
+            # local copy. The .tmp is dropped and whatever was there is left alone.
+            if not remote.get("multipart") and got != remote["etag"]:
+                logger.error(
+                    "       %s: md5 mismatch after download (got %s, expected %s) — discarding",
+                    name, got[:12], remote["etag"][:12],
+                )
                 os.remove(tmp_path)
-            continue
+                ok = False
+                _release(name)
+                continue
 
-        # Verify BEFORE the rename, so a bad transfer can never take the place of a good
-        # local copy. The .tmp is dropped and whatever was there is left alone.
-        if not remote.get("multipart") and got != remote["etag"]:
-            logger.error(
-                "       %s: md5 mismatch after download (got %s, expected %s) — discarding",
-                name, got[:12], remote["etag"][:12],
-            )
-            os.remove(tmp_path)
-            ok = False
-            continue
+            got_size = os.path.getsize(tmp_path)
+            if got_size != remote["size"]:
+                logger.error(
+                    "       %s: size mismatch after download (got %d, expected %d) — discarding",
+                    name, got_size, remote["size"],
+                )
+                os.remove(tmp_path)
+                ok = False
+                _release(name)
+                continue
 
-        size = os.path.getsize(tmp_path)
-        if size != remote["size"]:
-            logger.error(
-                "       %s: size mismatch after download (got %d, expected %d) — discarding",
-                name, size, remote["size"],
-            )
-            os.remove(tmp_path)
-            ok = False
-            continue
-
-        os.rename(tmp_path, local_path)
-        fetched += 1
-        report.append({"name": name, "kind": remote.get("kind", "unknown"),
-                       "state": "current"})
-        logger.info("       %s: saved (%.1f MB)", name, size / (1024 * 1024))
+            os.rename(tmp_path, local_path)
+            fetched += 1
+            report.append({"name": name, "kind": remote.get("kind", "unknown"),
+                           "state": "current"})
+            _release(name)
+            logger.info("       %s: saved (%.1f MB in %.0fs)", name,
+                        got_size / (1024 * 1024), time.monotonic() - started)
+    finally:
+        # Whatever happens -- including a cancel on shutdown -- nothing may stay pending, or a
+        # claim-time waiter would hang on a sync that is no longer running.
+        _release_all()
 
     # Whatever never made it into the report failed to download — present in the catalogue,
     # absent from disk, and not deferred. That is the "real problem" state.
-    seen = {r["name"] for r in report}
-    for remote in catalog:
-        if remote["name"] not in seen and remote["name"] not in clashing:
+    seen_names = {r["name"] for r in report}
+    for remote in candidates:
+        if remote["name"] not in seen_names:
             report.append({"name": remote["name"], "kind": remote.get("kind", "unknown"),
                            "state": "missing", "note": "download failed"})
     for name in sorted(clashing):
@@ -359,7 +477,7 @@ async def sync_lora_catalog(queue: QueueClient, eager_kinds: tuple[str, ...] = (
 
     logger.info(
         "LoRA sync: %d fetched, %d already current%s",
-        fetched, len(catalog) - fetched - len(deferred),
+        fetched, len(candidates) - len(to_fetch) - len(deferred),
         f", {len(deferred)} deferred to first use ({', '.join(deferred)})" if deferred else "",
     )
     return ok
@@ -391,6 +509,22 @@ async def ensure_named_loras_present(
     """
     lora_dir = _loras_dir()
     os.makedirs(lora_dir, exist_ok=True)
+
+    # A LoRA the background sync is still verifying or downloading (#189). The API skips such
+    # segments when it honours `pending_loras`; this is the fallback for one that does not.
+    # WAIT for the sync rather than fetch alongside it: two writers on one .tmp is a corrupt
+    # file, and a same-size retrain still being md5-checked must not be trusted early.
+    for raw in names:
+        n = str(raw or "").strip()
+        if n and not n.endswith(".safetensors"):
+            n += ".safetensors"
+        ev = _PENDING.get(n)
+        if ev is None:
+            continue
+        logger.info("LoRA on-demand: %s is still being synced — waiting for it", n)
+        if progress:
+            await progress(f"[2/6] Waiting for the background LoRA sync to finish {n}")
+        await ev.wait()
 
     wanted: list[str] = []
     for raw in names:

@@ -33,7 +33,7 @@ class FakeQueue:
     async def list_loras(self):
         return self.catalog
 
-    async def stream_file(self, uri, dest, on_progress=None, total: int = 0):
+    async def stream_file(self, uri, dest, on_progress=None, total: int = 0, step: int = 0):
         # Signature must track QueueClient.stream_file. When it drifted, the real code
         # raised TypeError and the download loop's `except Exception` reported it as a
         # failed transfer — a fake that is wrong in a way the tests cannot see.

@@ -13,6 +13,7 @@ from daemon.model_validator import cleanup_partial_downloads, validate_models
 from daemon.node_checker import check_and_install_nodes
 from daemon.queue_client import QueueClient
 from daemon.gpu_stats import get_gpu_stats
+from daemon import lora_sync, phase
 from daemon.lora_sync import inventory as lora_inventory, sync_lora_catalog
 from daemon.ltx_client import LtxClient
 
@@ -59,6 +60,8 @@ async def refresh_reported_checkpoints() -> list[str]:
 # checkpoint fetching lands (console#423) it gains "checkpoint" here and the gate opens by
 # itself — the API holds no second opinion about a daemon's abilities.
 FETCHABLE_KINDS: list[str] = ["lora", "checkpoint"]
+#: Heartbeat cadence while the worker is mid-phase (syncing LoRAs), so MB / ETA move (#189).
+PHASE_HEARTBEAT_S = 10
 from daemon.sd_scripts_monitor import get_status as get_sd_scripts_status
 from daemon.a1111_monitor import get_status as get_a1111_status
 
@@ -137,6 +140,7 @@ async def register_with_retry(client, *, friendly_name, hostname, ip_address, co
                 hostname=hostname,
                 ip_address=ip_address,
                 comfyui_running=comfyui_running,
+                phase=phase.snapshot(),
             )
             logger.info("Registered as %s (id=%s)", registered_name, worker_id)
             return worker_id, registered_name
@@ -177,14 +181,18 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
         if shutdown_event.is_set() and not executing_event.is_set():
             break
 
+        # Faster while the worker is mid-phase (#189): a LoRA download reporting MB / ETA every
+        # 30 s reads as frozen. 10 s is still nothing to the API.
+        interval = (settings.heartbeat_interval if phase.current() == phase.READY
+                    else min(settings.heartbeat_interval, PHASE_HEARTBEAT_S))
         if shutdown_event.is_set():
             # Draining with work in flight: shutdown_event.wait() returns instantly now, so
             # sleep the interval instead or this spins.
-            await asyncio.sleep(settings.heartbeat_interval)
+            await asyncio.sleep(interval)
         else:
             try:
                 await asyncio.wait_for(
-                    shutdown_event.wait(), timeout=settings.heartbeat_interval
+                    shutdown_event.wait(), timeout=interval
                 )
             except asyncio.TimeoutError:
                 pass
@@ -214,7 +222,8 @@ async def heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_
                                          checkpoints=_CHECKPOINTS or None,
                                          fetchable_kinds=FETCHABLE_KINDS,
                                          daemon_commit=build_identity.DAEMON_COMMIT,
-                                         image_ref=build_identity.IMAGE_REF)
+                                         image_ref=build_identity.IMAGE_REF,
+                                         phase=phase.snapshot())
             beat_count += 1
 
             # Pick up renames from the registry
@@ -284,6 +293,9 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
     """Poll the queue for segments and execute them one at a time."""
     poll_count = 0
     parked = False
+    # Not before the background sync knows which LoRAs are pending (#189) -- one API call.
+    # Bounded, so a hung catalogue listing cannot stop the queue; nothing is pending then.
+    await lora_sync.wait_until_listed(timeout=60)
     while not shutdown_event.is_set():
         try:
             await asyncio.wait_for(
@@ -358,7 +370,10 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
             continue
 
         try:
-            segment = await queue.claim_next(worker_id, friendly_name_ref[0], kind="gpu")
+            # Segments naming a LoRA the background sync has not landed yet stay queued
+            # (#189): not claimed, not failed, not fetched twice.
+            segment = await queue.claim_next(worker_id, friendly_name_ref[0], kind="gpu",
+                                             pending_loras=lora_sync.pending_loras())
         except Exception as e:
             logger.error("Poll failed: %s: %s", type(e).__name__, e)
             continue
@@ -619,11 +634,6 @@ async def run():
         await queue.close()
         return
 
-    # Pre-flight: pull down any character LoRA this worker does not already hold.
-    #
-    # Before the GPU loop starts, so a fresh pod is useful on its first claim instead of
-    # failing the first character segment it is handed. Non-fatal by design — see
-    # sync_lora_catalog(): a restart loop is a worse failure than a missing LoRA.
     # Ask the engine what base models it can load, for the console's dropdown. Non-fatal:
     # a worker that cannot answer simply offers nothing, and the field falls back to the
     # stack default rather than blocking a render.
@@ -634,11 +644,6 @@ async def run():
         except Exception as e:
             logger.warning("Could not list checkpoints from ltx-engine (%s) — "
                            "the console will offer none from this worker", e)
-
-    if not await sync_lora_catalog(queue):
-        logger.warning(
-            "LoRA sync incomplete — this worker may fail segments that name a missing LoRA"
-        )
 
     # Pre-flight: clean up partial downloads
     cleaned = cleanup_partial_downloads(settings.comfyui_path)
@@ -679,6 +684,12 @@ async def run():
     system_info = await comfyui.get_system_info()
     _log_system_info(system_info)
 
+    # REGISTER FIRST, SYNC AFTER (#189). The LoRA sync used to sit here, before registration,
+    # and a 650 MB LoRA published since the last one kept the box off the Workers page for
+    # 10+ minutes -- on every mode switch into render, not only at boot -- while a training
+    # run waited for a worker row that did not exist yet. Now the row exists within seconds,
+    # says "syncing LoRAs", and only segments naming a LoRA still in flight wait.
+    phase.set_phase("syncing_loras", "Starting the LoRA sync")
     worker_id, registered_name = await register_with_retry(
         queue,
         friendly_name=settings.friendly_name,
@@ -698,6 +709,7 @@ async def run():
     friendly_name_ref = [registered_name]
     _announce_registered(worker_id)
 
+    sync_task = asyncio.create_task(_background_lora_sync(queue))
     try:
         heartbeat_task = asyncio.create_task(
             heartbeat_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event,
@@ -712,6 +724,8 @@ async def run():
 
         await asyncio.gather(heartbeat_task, job_task, holo_task)
     finally:
+        if not sync_task.done():
+            sync_task.cancel()
         # Graceful shutdown: wait for current segment if executing
         segment_abandoned = False
         if executing_event.is_set():
@@ -790,6 +804,23 @@ async def run():
 
         await queue.close()
         await comfyui.close()
+
+
+async def _background_lora_sync(queue) -> None:
+    """The catalogue sync, off the registration path (#189). Never raises: a sync problem is
+    reported in the log and the inventory, and must not take the heartbeat down with it."""
+    try:
+        if not await sync_lora_catalog(queue):
+            logger.warning(
+                "LoRA sync incomplete — this worker may fail segments that name a missing LoRA"
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("LoRA sync crashed — carrying on with what is on disk")
+    finally:
+        lora_sync._LISTED.set()
+        phase.ready()
 
 
 async def _wait_for_clear(event: asyncio.Event):
