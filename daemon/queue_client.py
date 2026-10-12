@@ -169,16 +169,24 @@ class QueueClient:
             )
 
     async def claim_next(
-        self, worker_id: uuid.UUID, worker_name: str | None = None, kind: str | None = None
+        self, worker_id: uuid.UUID, worker_name: str | None = None, kind: str | None = None,
+        pending_loras: list[str] | None = None,
     ) -> Optional[SegmentClaim]:
         """Claim the next available segment. Returns None if no work available.
 
         kind="gpu" claims generations only, kind="hologram" claims CPU-only hologram carriers
         only (so the two can run concurrently); None claims either.
+
+        `pending_loras` names LoRAs the background sync has not landed yet (#189); the API
+        skips segments that need any of them, so they wait in the queue instead of being
+        claimed by a worker without the file. An older API ignores the parameter, and
+        ensure_named_loras_present() then waits for the sync instead.
         """
         params = {"worker_id": str(worker_id), "worker_name": worker_name or settings.friendly_name}
         if kind:
             params["kind"] = kind
+        if pending_loras:
+            params["pending_loras"] = ",".join(pending_loras)
         resp = await self._request_with_retry("GET", "/segments/next", params=params)
         if not resp.is_success:
             _raise_with_details(resp, "claim_next")
@@ -318,7 +326,8 @@ class QueueClient:
             _raise_with_details(resp, "checkpoint_catalog")
         return resp.json().get("sources") or {}
 
-    async def stream_file(self, s3_path: str, dest: str, on_progress=None, total: int = 0) -> str:
+    async def stream_file(self, s3_path: str, dest: str, on_progress=None, total: int = 0,
+                          step: int = 0) -> str:
         """Download to `dest`, returning the md5 of what actually landed.
 
         Streams rather than using download_file(): that returns bytes, and a 700 MB LoRA
@@ -342,7 +351,11 @@ class QueueClient:
                 # Report at quarters, not per chunk. Each callback is an API write on the
                 # segment's progress log, so per-chunk would post hundreds of rows for one
                 # download; quarters are enough to show it is moving and not wedged.
-                step = max(total // 4, 1) if total else 0
+                #
+                # `step` overrides that for a caller whose callback is local and cheap: the
+                # background sync's only updates the in-memory phase (#189), and a quarter of
+                # 650 MB at 0.4 MB/s is seven minutes between updates.
+                step = step or (max(total // 4, 1) if total else 0)
                 next_mark = step
                 done = 0
                 async for chunk in resp.aiter_bytes(1024 * 1024):
@@ -361,6 +374,7 @@ class QueueClient:
         hostname: str,
         ip_address: str,
         comfyui_running: bool,
+        phase: dict | None = None,
     ) -> tuple[uuid.UUID, str]:
         # The pod id is how the console pairs this worker with the RunPod pod behind it.
         # Pairing on name only worked for pods the console launcher created; a pod started from
@@ -384,6 +398,10 @@ class QueueClient:
             payload["kinds"] = kinds
         if provides:
             payload["provides"] = provides
+        # Sent at registration too, so the row says "syncing LoRAs" from its first second
+        # rather than after the first heartbeat (#189).
+        if phase is not None:
+            payload["phase"] = phase
 
         resp = await self.client.post(
             "/workers",
@@ -406,6 +424,7 @@ class QueueClient:
         fetchable_kinds: list[str] | None = None,
         daemon_commit: str | None = None,
         image_ref: str | None = None,
+        phase: dict | None = None,
     ) -> dict:
         """Send heartbeat. Returns full worker data including current friendly_name."""
         payload: dict = {"comfyui_running": comfyui_running}
@@ -440,6 +459,10 @@ class QueueClient:
         # opens, with no API change and no coordinated deploy.
         if fetchable_kinds is not None:
             payload["fetchable_kinds"] = fetchable_kinds
+        # What the worker is doing right now (#189): syncing LoRAs with file / MB / ETA, or
+        # ready. An API that predates the field ignores it.
+        if phase is not None:
+            payload["phase"] = phase
         resp = await self._request_with_retry(
             "POST", f"/workers/{worker_id}/heartbeat", json=payload
         )

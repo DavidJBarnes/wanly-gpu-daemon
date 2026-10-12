@@ -41,7 +41,9 @@ def test_it_does_not_spin_once_shutdown_is_set():
     the interval instead or this becomes a hot loop for the length of a render."""
     src = inspect.getsource(mod.heartbeat_loop)
     drain = src.index("if shutdown_event.is_set():", src.index("while True:"))
-    assert "asyncio.sleep(settings.heartbeat_interval)" in src[drain:drain + 400]
+    # `interval` is heartbeat_interval, or PHASE_HEARTBEAT_S while mid-phase (#189).
+    assert "asyncio.sleep(interval)" in src[drain:drain + 400]
+    assert "settings.heartbeat_interval" in src[:drain]
 
 
 def test_the_call_site_passes_it():
