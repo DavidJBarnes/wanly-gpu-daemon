@@ -289,8 +289,14 @@ async def _ltx_healthy() -> bool:
         await client.close()
 
 
-async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event):
-    """Poll the queue for segments and execute them one at a time."""
+async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event,
+                        work_lock=None):
+    """Poll the queue for segments and execute them one at a time.
+
+    `work_lock` is shared with hologram_poll_loop: a render and a hologram never run at the
+    same time on one worker (#192). See hologram_poll_loop for why.
+    """
+    work_lock = work_lock or asyncio.Lock()
     poll_count = 0
     parked = False
     # Not before the background sync knows which LoRAs are pending (#189) -- one API call.
@@ -369,17 +375,29 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
             poll_count += 1
             continue
 
+        # A hologram is running: wait for it rather than render beside it (#192).
+        if work_lock.locked():
+            if poll_count == 0 or poll_count % 60 == 0:
+                logger.info("AR hologram running — waiting for it before claiming a render")
+            poll_count += 1
+            continue
+
+        # Held from BEFORE the claim to the end of the segment. Taking it only after a claim
+        # returns would leave the claim's await open for the hologram loop to claim too.
+        await work_lock.acquire()
         try:
             # Segments naming a LoRA the background sync has not landed yet stay queued
             # (#189): not claimed, not failed, not fetched twice.
             segment = await queue.claim_next(worker_id, friendly_name_ref[0], kind="gpu",
                                              pending_loras=lora_sync.pending_loras())
         except Exception as e:
+            work_lock.release()
             logger.error("Poll failed: %s: %s", type(e).__name__, e)
             continue
 
         poll_count += 1
         if segment is None:
+            work_lock.release()
             if poll_count == 1 or poll_count % 60 == 0:
                 logger.info("Waiting for work... (polled %d times)", poll_count)
             continue
@@ -421,6 +439,7 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
             except Exception:
                 pass
             executing_event.clear()
+            work_lock.release()
             # If draining: a pod shuts down; a box parks (see the top of the loop) and must
             # not be pushed back to idle here, which would undo the drain from our own side.
             if drain_event.is_set():
@@ -439,13 +458,22 @@ async def job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_e
                         logger.error("Failed to update status to idle: %s: %s", type(e).__name__, e)
 
 
-async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event):
-    """Poll for CPU-only AR hologram work and run it CONCURRENTLY with GPU generation.
+async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event,
+                             work_lock=None):
+    """Poll for CPU-only AR hologram work, and run it only while no render is in flight.
 
-    Holograms never touch ComfyUI/the GPU, so this loop skips the ComfyUI-busy gate and runs
-    alongside job_poll_loop. _execute_ar_hologram offloads its heavy numpy/RVM/ffmpeg work to a
-    thread, keeping the event loop free for the GPU loop + heartbeat.
+    Holograms never touch ComfyUI or the GPU, and this loop used to run them concurrently with
+    renders on that basis. RAM is the shared resource that breaks it (#192): on 2026-10-26 an
+    LTX render held 19.7 GiB of 3090b's 26 GiB container cap, a hologram claimed mid-render
+    took the daemon to 4.4 GiB matting 482 frames, and the kernel OOM-killed ComfyUI. A
+    hologram holds every frame and alpha in memory, so a longer clip only makes it worse.
+
+    So `work_lock`, shared with job_poll_loop, makes the two exclusive in either order. A
+    hologram is a few minutes and rare; waiting for a render to finish costs nothing.
+    _execute_ar_hologram still offloads its numpy/RVM/ffmpeg work to a thread, keeping the
+    event loop free for the heartbeat.
     """
+    work_lock = work_lock or asyncio.Lock()
     while not shutdown_event.is_set():
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=settings.poll_interval)
@@ -453,12 +481,18 @@ async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutd
             pass
         if shutdown_event.is_set():
             break
+        # A render is in flight (or claiming): leave the hologram queued until it is done.
+        if work_lock.locked():
+            continue
+        await work_lock.acquire()
         try:
             segment = await queue.claim_next(worker_id, friendly_name_ref[0], kind="hologram")
         except Exception as e:
+            work_lock.release()
             logger.error("Hologram poll failed: %s: %s", type(e).__name__, e)
             continue
         if segment is None:
+            work_lock.release()
             continue
         try:
             await execute_segment(segment, comfyui, queue)
@@ -472,6 +506,8 @@ async def hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutd
                 )
             except Exception as report_err:
                 logger.error("Failed to report hologram failure: %s", report_err)
+        finally:
+            work_lock.release()
 
 
 async def _terminate_runpod_pod() -> bool:
@@ -568,6 +604,8 @@ async def run():
     shutdown_event = asyncio.Event()
     executing_event = asyncio.Event()
     drain_event = asyncio.Event()
+    # One render OR one hologram at a time, never both: they share the container's RAM (#192).
+    work_lock = asyncio.Lock()
     loop = asyncio.get_running_loop()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -716,10 +754,12 @@ async def run():
                            drain_event, executing_event)
         )
         job_task = asyncio.create_task(
-            job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event)
+            job_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event, executing_event, drain_event,
+                          work_lock=work_lock)
         )
         holo_task = asyncio.create_task(
-            hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event)
+            hologram_poll_loop(queue, comfyui, worker_id, friendly_name_ref, shutdown_event,
+                               work_lock=work_lock)
         )
 
         await asyncio.gather(heartbeat_task, job_task, holo_task)
