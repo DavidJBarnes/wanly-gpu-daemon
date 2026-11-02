@@ -158,6 +158,10 @@ def build_submit_payload(
         # on its workflow default while the pose said otherwise.
         if recipe.get("img_compression") is not None:
             payload["img_compression"] = int(recipe["img_compression"])
+        # The Settings stage 2 schedule, which the API stamps here at claim only when one is
+        # set (console#717). Absent: the engine keeps its workflow's own.
+        if recipe.get("stage2_sigmas"):
+            payload["stage2_sigmas"] = str(recipe["stage2_sigmas"])
         # One `loras` entry per PERSON, in slot order (console#473). On this path the engine
         # reads every entry of `loras` as a character LoRA -- content LoRAs travel in their
         # own field below -- and chains them after the content chain, slot 0 then slot 1.
