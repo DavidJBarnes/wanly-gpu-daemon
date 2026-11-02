@@ -201,6 +201,14 @@ async def execute_ltx_segment(segment: SegmentClaim, queue: QueueClient) -> None
                 await progress.log(f"[2/6] WARNING character sheet is {ref.size[0]}x"
                                    f"{ref.size[1]}, not 1536x1024")
 
+        # Same reasoning as the identity reference above: an older engine would ignore the
+        # field and the clip would look fine on the wrong schedule (console#717).
+        if recipe.get("stage2_sigmas") and "stage2_sigmas" not in await client.features():
+            raise LtxEngineError(
+                "this worker's ltx-engine does not support stage 2 sigmas (console#717): "
+                "re-pin the worker to an image built after it, or clear Stage 2 sigmas in "
+                "Settings")
+
         await progress.log("[2/6] Submitting to ltx-engine...")
         job_id = await client.submit(
             image_bytes=image_bytes,

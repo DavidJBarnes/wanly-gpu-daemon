@@ -185,7 +185,7 @@ class _Stop(Exception):
     pass
 
 
-def _run(monkeypatch, identity, features=("identity_ref",), data=None):
+def _run(monkeypatch, identity, features=("identity_ref",), data=None, recipe_extra=None):
     """Drive execute_ltx_segment up to the engine submit and capture what it was sent."""
     seen = {"features_asked": 0, "logs": [], "failed": None}
 
@@ -229,7 +229,8 @@ def _run(monkeypatch, identity, features=("identity_ref",), data=None):
     seg = SimpleNamespace(
         id="seg-1", job_id="job-1", index=0, prompt="p", negative_prompt=None,
         width=832, height=1216, fps=24, duration_seconds=5, seed=1,
-        ltx_recipe={"recipe": "Turn", "char_lora": "k3lly2026_v2"}, reprocess_type=None,
+        ltx_recipe={"recipe": "Turn", "char_lora": "k3lly2026_v2", **(recipe_extra or {})},
+        reprocess_type=None,
         identity_ref=IdentityRef(**identity) if identity else None,
     )
     asyncio.run(ltx_executor.execute_ltx_segment(seg, queue=Queue()))
