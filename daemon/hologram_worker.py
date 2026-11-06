@@ -161,6 +161,8 @@ async def run() -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    # As in daemon.main: otherwise every 5 s poll logs a line (~17k a day).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     asyncio.run(run())
 
 
