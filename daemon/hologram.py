@@ -84,20 +84,32 @@ def chroma_key_despill(frame_rgb: np.ndarray, key_color: str) -> tuple[np.ndarra
     return rgb, alpha
 
 
-def union_alpha_bbox(alphas: list[np.ndarray], thresh: float = 0.5, pad_frac: float = 0.04) -> tuple[int, int, int, int]:
-    """One static crop rect (x, y, w, h) covering the subject across ALL frames.
+def alpha_extent(alpha: np.ndarray, thresh: float = 0.5) -> tuple[int, int, int, int] | None:
+    """One frame's subject extent (x0, y0, x1, y1), inclusive, or None when nothing is matted.
+
+    Per frame so the bbox can be accumulated one frame at a time: the streaming hologram pass
+    never holds every alpha at once (wanly-gpu-docker#228).
+    """
+    ys, xs = np.where(alpha > thresh)
+    if xs.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def bbox_from_extents(
+    extents: list[tuple[int, int, int, int] | None], h: int, w: int, pad_frac: float = 0.04
+) -> tuple[int, int, int, int]:
+    """One static crop rect (x, y, w, h) covering the subject across ALL frames' extents.
 
     A single static crop keeps the textured quad stable in 3D; per-frame crops would make
     it swim. Padded and snapped to even dimensions for h264.
     """
-    h, w = alphas[0].shape[:2]
     x0, y0, x1, y1 = w, h, 0, 0
-    for a in alphas:
-        ys, xs = np.where(a > thresh)
-        if xs.size == 0:
+    for e in extents:
+        if e is None:
             continue
-        x0, x1 = min(x0, int(xs.min())), max(x1, int(xs.max()))
-        y0, y1 = min(y0, int(ys.min())), max(y1, int(ys.max()))
+        x0, y0 = min(x0, e[0]), min(y0, e[1])
+        x1, y1 = max(x1, e[2]), max(y1, e[3])
     if x1 <= x0 or y1 <= y0:            # nothing matted — fall back to full even frame
         return (0, 0, w - (w % 2), h - (h % 2))
     pad = int(max(h, w) * pad_frac)
@@ -180,45 +192,62 @@ def ensure_rvm_model(path: str) -> str:
     return path
 
 
+def ort_session(model_path: str, providers: list[str]):
+    """An onnxruntime session, its threads capped by ONNX_THREADS when that is set.
+
+    The cap exists for the scene container (wanly-gpu-docker#228): holograms there share the
+    host's CPUs with the 3090's render, whose decode, RIFE and stitching are CPU work too.
+    0 leaves onnxruntime's default (every core).
+    """
+    import onnxruntime as ort
+
+    from daemon.config import settings
+
+    opts = ort.SessionOptions()
+    if settings.onnx_threads > 0:
+        opts.intra_op_num_threads = settings.onnx_threads
+        opts.inter_op_num_threads = 1
+    return ort.InferenceSession(model_path, sess_options=opts, providers=providers)
+
+
 def _rvm_session(model_path: str):
     global _RVM_SESSION
     if _RVM_SESSION is None:
-        import onnxruntime as ort
-
-        _RVM_SESSION = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        _RVM_SESSION = ort_session(model_path, ["CPUExecutionProvider"])
     return _RVM_SESSION
 
 
-def rvm_matte(
-    frames_rgb: list[np.ndarray], model_path: str
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Robust Video Matting (ONNX) — mattes arbitrary backgrounds, no green screen needed.
+class RvmMatter:
+    """Robust Video Matting (ONNX), one frame at a time — mattes arbitrary backgrounds.
 
     Sequential with carried recurrent state (r1..r4) for temporal stability; resetting the
-    state mid-clip causes visible alpha pops. Returns (decontaminated foreground RGB uint8,
-    straight alpha float32 0..1) per frame — same shape as chroma_key_despill so the crop +
-    pack stages are identical.
+    state mid-clip causes visible alpha pops, so one instance mattes one clip, in order.
+    `step` returns (decontaminated foreground RGB uint8, straight alpha float32 0..1) — the
+    same shape as chroma_key_despill so the crop + pack stages are identical.
     """
-    sess = _rvm_session(model_path)
-    rec: list[np.ndarray] = [np.zeros([1, 1, 1, 1], dtype=np.float32) for _ in range(4)]
-    h, w = frames_rgb[0].shape[:2]
-    ratio = float(np.clip(512.0 / max(h, w), 0.1, 1.0))  # RVM: downsample longer side to ~512px
-    downsample = np.array([ratio], dtype=np.float32)
-    rgbs: list[np.ndarray] = []
-    alphas: list[np.ndarray] = []
-    for frame in frames_rgb:
+
+    def __init__(self, model_path: str):
+        self._sess = _rvm_session(model_path)
+        self._rec: list[np.ndarray] = [np.zeros([1, 1, 1, 1], dtype=np.float32) for _ in range(4)]
+        self._downsample: np.ndarray | None = None
+
+    def step(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self._downsample is None:
+            h, w = frame.shape[:2]
+            ratio = float(np.clip(512.0 / max(h, w), 0.1, 1.0))  # RVM: longer side to ~512px
+            self._downsample = np.array([ratio], dtype=np.float32)
         src = (frame.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]  # [1,3,H,W]
-        fgr, pha, *rec = sess.run(
+        r = self._rec
+        fgr, pha, *self._rec = self._sess.run(
             ["fgr", "pha", "r1o", "r2o", "r3o", "r4o"],
             {
                 "src": src,
-                "r1i": rec[0], "r2i": rec[1], "r3i": rec[2], "r4i": rec[3],
-                "downsample_ratio": downsample,
+                "r1i": r[0], "r2i": r[1], "r3i": r[2], "r4i": r[3],
+                "downsample_ratio": self._downsample,
             },
         )
-        rgbs.append((np.clip(fgr[0].transpose(1, 2, 0), 0.0, 1.0) * 255).astype(np.uint8))
-        alphas.append(pha[0, 0].astype(np.float32))
-    return rgbs, alphas
+        rgb = (np.clip(fgr[0].transpose(1, 2, 0), 0.0, 1.0) * 255).astype(np.uint8)
+        return rgb, pha[0, 0].astype(np.float32)
 
 
 def build_manifest(packed_w: int, packed_h: int, color_w: int, guard_px: int, fps: float,

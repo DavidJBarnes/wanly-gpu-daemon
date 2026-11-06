@@ -36,6 +36,9 @@ from daemon.workflow_builder import build_workflow
 from daemon.config import settings
 from daemon.hologram import (
     GUARD_PX,
+    RvmMatter,
+    alpha_extent,
+    bbox_from_extents,
     build_manifest,
     chroma_key_despill,
     detect_greenscreen,
@@ -43,10 +46,8 @@ from daemon.hologram import (
     ensure_rvm_model,
     pack_sbs,
     pack_sbs_depth,
-    rvm_matte,
-    union_alpha_bbox,
 )
-from daemon.depth import ensure_depth_model, estimate_depth, normalize_depth_clip
+from daemon.depth import DepthNormalizer, depth_range, ensure_depth_model, estimate_depth
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,11 @@ async def _probe_has_audio(path: str) -> bool:
     return proc.returncode == 0 and bool(stdout.strip())
 
 
+def _load_rgb(path: str) -> np.ndarray:
+    with Image.open(path) as im:
+        return np.asarray(im.convert("RGB"))
+
+
 def _holo_process_frames_sync(
     frame_files: list[str], packed_dir: str, key_color: str,
     subject_height_m: float, rvm_model_path: str, fps: float,
@@ -219,53 +225,87 @@ def _holo_process_frames_sync(
     loop + heartbeat while a hologram builds. Writes packed frames to packed_dir; returns
     (matte_mode, packed_w, packed_h, poster_png_bytes, manifest_dict). For "2.5d_depth" each frame
     additionally carries a depth region (bright = near) for the player's displaced mesh.
+
+    TWO PASSES OVER DISK, ONE FRAME IN MEMORY (wanly-gpu-docker#228). This used to hold every
+    frame, its matted copy, its alpha and its depth at once -- ~9 MB a frame, 4.4 GiB for 482
+    frames, which is what OOM-killed ComfyUI on 3090b (#192) and what would not fit beside the
+    captioner in the scene container's 8 GiB. The crop is one static rect over the WHOLE clip,
+    so nothing can be packed until every frame is matted: pass 1 mattes each frame and spills
+    it to disk while accumulating the rect (and the depth range), pass 2 reads each one back,
+    crops and packs it. The output is the same as before (tests/test_hologram_streaming.py).
     """
-    arrs = [np.asarray(Image.open(ff).convert("RGB")) for ff in frame_files]
-    if detect_greenscreen(arrs[0], key_color):
-        mode = "chroma"
-        rgbs: list[np.ndarray] = []
-        alphas: list[np.ndarray] = []
-        for arr in arrs:
-            rgb, alpha = chroma_key_despill(arr, key_color)
-            rgbs.append(rgb)
-            alphas.append(alpha)
-    else:
-        mode = "rvm"
-        rgbs, alphas = rvm_matte(arrs, ensure_rvm_model(rvm_model_path))
-
-    x, y, cw, ch = union_alpha_bbox(alphas)
-
-    depth_u8: list[np.ndarray] = []
-    if flavor == "2.5d_depth":
-        mode += "+depth"
-        dpath = ensure_depth_model(depth_model_path, depth_model_url)
-        # Depth on the full frame with the backdrop neutralized via the matte (a flat chroma
-        # plate flattens the model's subject disparity); normalize_depth_clip crops to the bbox.
-        raw_depths = [estimate_depth(arr, dpath, alpha=a) for arr, a in zip(arrs, alphas)]
-        depth_u8 = normalize_depth_clip(raw_depths, alphas, (x, y, cw, ch))
-
-    packed_w = packed_h = 0
-    for i, (rgb, alpha) in enumerate(zip(rgbs, alphas)):
-        crgb = edge_extend_color(rgb[y:y + ch, x:x + cw], alpha[y:y + ch, x:x + cw])
-        acrop = alpha[y:y + ch, x:x + cw]
-        if flavor == "2.5d_depth":
-            packed = pack_sbs_depth(crgb, acrop, depth_u8[i])
+    spill = tempfile.mkdtemp(prefix="matted_", dir=os.path.dirname(os.path.abspath(packed_dir)))
+    try:
+        first = _load_rgb(frame_files[0])
+        h, w = first.shape[:2]
+        if detect_greenscreen(first, key_color):
+            mode = "chroma"
+            matte = lambda arr: chroma_key_despill(arr, key_color)  # noqa: E731
         else:
-            packed = pack_sbs(crgb, acrop)
-        if packed_w == 0:
-            packed_h, packed_w = packed.shape[0], packed.shape[1]
-        Image.fromarray(packed).save(os.path.join(packed_dir, f"{i:05d}.png"))
+            mode = "rvm"
+            matte = RvmMatter(ensure_rvm_model(rvm_model_path)).step
+        del first
 
-    pal = (np.clip(alphas[0][y:y + ch, x:x + cw], 0.0, 1.0) * 255).astype(np.uint8)
-    poster_rgba = np.dstack([rgbs[0][y:y + ch, x:x + cw], pal])
-    poster_buf = io.BytesIO()
-    Image.fromarray(poster_rgba, "RGBA").save(poster_buf, format="PNG")
+        depth = flavor == "2.5d_depth"
+        dpath = ensure_depth_model(depth_model_path, depth_model_url) if depth else ""
+        if depth:
+            mode += "+depth"
+
+        # Pass 1: matte, spill, accumulate the crop rect.
+        extents = []
+        for i, ff in enumerate(frame_files):
+            arr = _load_rgb(ff)
+            rgb, alpha = matte(arr)
+            extents.append(alpha_extent(alpha))
+            np.save(os.path.join(spill, f"{i:05d}.rgb.npy"), rgb)
+            np.save(os.path.join(spill, f"{i:05d}.a.npy"), alpha)
+            if depth:
+                # Depth on the full frame with the backdrop neutralized via the matte (a flat
+                # chroma plate flattens the model's subject disparity); cropped in pass 2.
+                raw = estimate_depth(arr, dpath, alpha=alpha)
+                np.save(os.path.join(spill, f"{i:05d}.d.npy"), raw)
+        x, y, cw, ch = bbox_from_extents(extents, h, w)
+
+        def subject_depths():
+            # Inside the crop, as the range always was: the even-width snap can drop the
+            # last column of a subject that touches the frame's edge.
+            for i in range(len(frame_files)):
+                raw = np.load(os.path.join(spill, f"{i:05d}.d.npy"))[y:y + ch, x:x + cw]
+                a = np.load(os.path.join(spill, f"{i:05d}.a.npy"))[y:y + ch, x:x + cw]
+                yield raw[a > 0.5]
+
+        norm = DepthNormalizer(*depth_range(subject_depths)) if depth else None
+
+        # Pass 2: crop, pack, write. Frame 0 also makes the poster.
+        packed_w = packed_h = 0
+        poster_bytes = b""
+        for i in range(len(frame_files)):
+            rgb = np.load(os.path.join(spill, f"{i:05d}.rgb.npy"))
+            alpha = np.load(os.path.join(spill, f"{i:05d}.a.npy"))
+            acrop = alpha[y:y + ch, x:x + cw]
+            crgb = edge_extend_color(rgb[y:y + ch, x:x + cw], acrop)
+            if norm is not None:
+                raw = np.load(os.path.join(spill, f"{i:05d}.d.npy"))
+                packed = pack_sbs_depth(crgb, acrop, norm.step(raw[y:y + ch, x:x + cw], acrop))
+            else:
+                packed = pack_sbs(crgb, acrop)
+            if packed_w == 0:
+                packed_h, packed_w = packed.shape[0], packed.shape[1]
+            Image.fromarray(packed).save(os.path.join(packed_dir, f"{i:05d}.png"))
+            if i == 0:
+                pal = (np.clip(acrop, 0.0, 1.0) * 255).astype(np.uint8)
+                poster_buf = io.BytesIO()
+                Image.fromarray(np.dstack([rgb[y:y + ch, x:x + cw], pal]), "RGBA").save(
+                    poster_buf, format="PNG")
+                poster_bytes = poster_buf.getvalue()
+    finally:
+        shutil.rmtree(spill, ignore_errors=True)
 
     manifest = build_manifest(
         packed_w, packed_h, cw, GUARD_PX, fps, (x, y, cw, ch), subject_height_m,
         flavor=flavor, depth_scale_m=depth_scale_m, has_audio=has_audio,
     )
-    return mode, packed_w, packed_h, poster_buf.getvalue(), manifest
+    return mode, packed_w, packed_h, poster_bytes, manifest
 
 
 async def _execute_ar_hologram(

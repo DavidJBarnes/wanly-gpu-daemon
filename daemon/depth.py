@@ -12,6 +12,7 @@ vertices toward the viewer.
 from __future__ import annotations
 
 import os
+from typing import Callable, Iterable
 
 import cv2
 import numpy as np
@@ -42,11 +43,11 @@ def ensure_depth_model(path: str, url: str) -> str:
 
 def _session(model_path: str):
     if model_path not in _SESSIONS:
-        import onnxruntime as ort
+        from daemon.hologram import ort_session
 
         # Prefer GPU; onnxruntime silently falls back to CPU when CUDA isn't available.
-        _SESSIONS[model_path] = ort.InferenceSession(
-            model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        _SESSIONS[model_path] = ort_session(
+            model_path, ["CUDAExecutionProvider", "CPUExecutionProvider"]
         )
     return _SESSIONS[model_path]
 
@@ -96,44 +97,86 @@ def estimate_depth(
     return cv2.resize(out.astype(np.float32), (W, H), interpolation=cv2.INTER_CUBIC)
 
 
-def normalize_depth_clip(
-    depths: list[np.ndarray],
-    alphas: list[np.ndarray],
-    crop_rect: tuple[int, int, int, int],
-    ema: float = 0.85,
-) -> list[np.ndarray]:
-    """Crop each depth to the subject bbox and normalize the whole clip to uint8 (bright = near).
+def depth_range(
+    chunks: Callable[[], Iterable[np.ndarray]], q_lo: float = 2.0, q_hi: float = 98.0,
+    bins: int = 4096,
+) -> tuple[float, float]:
+    """The clip's robust depth range: the 2nd/98th percentile of its subject pixels (alpha>0.5).
 
-    Uses one robust per-clip range (2nd/98th percentile over subject pixels, alpha>0.5) so the
-    surface doesn't breathe frame-to-frame, pins background to far (0), and applies a light
-    temporal EMA to damp residual flicker.
+    Exactly np.percentile's (linear) answer over all of them concatenated, without ever
+    concatenating them -- that is ~0.8 MB a frame at 720x1056, held at once (wanly-gpu-docker#228).
+    `chunks` is called once per pass and yields each frame's subject values: pass 1 counts and
+    finds the extremes, pass 2 histograms them to find which bin each wanted rank falls in,
+    pass 3 keeps only the values in those bins and reads the ranks off them.
     """
-    x, y, cw, ch = crop_rect
-    cd = [d[y:y + ch, x:x + cw] for d in depths]
-    ca = [a[y:y + ch, x:x + cw] for a in alphas]
+    n, lo, hi = 0, np.inf, -np.inf
+    for c in chunks():
+        if c.size:
+            n += c.size
+            lo, hi = min(lo, float(c.min())), max(hi, float(c.max()))
+    if n == 0:
+        return 0.0, 1.0
+    if hi == lo:
+        return lo, hi
 
-    subj = [c[m > 0.5] for c, m in zip(cd, ca) if (m > 0.5).any()]
-    if subj:
-        allv = np.concatenate([s.ravel() for s in subj])
-        lo, hi = float(np.percentile(allv, 2)), float(np.percentile(allv, 98))
-    else:
-        lo, hi = 0.0, 1.0
-    rng = max(hi - lo, 1e-6)
+    def bin_of(c: np.ndarray) -> np.ndarray:
+        return np.minimum(((c.astype(np.float64) - lo) / (hi - lo) * bins).astype(np.int64),
+                          bins - 1)
 
-    out: list[np.ndarray] = []
-    prev: np.ndarray | None = None
-    for c, m in zip(cd, ca):
-        n = np.clip((c - lo) / rng, 0.0, 1.0)  # larger raw depth -> brighter -> nearer
-        if prev is not None:
+    counts = np.zeros(bins, dtype=np.int64)
+    for c in chunks():
+        if c.size:
+            counts += np.bincount(bin_of(c), minlength=bins)
+    cum = np.cumsum(counts)
+
+    positions = [q / 100.0 * (n - 1) for q in (q_lo, q_hi)]
+    ranks = sorted({r for pos in positions for r in (int(np.floor(pos)), int(np.ceil(pos)))})
+    rank_bin = {r: int(np.searchsorted(cum, r, side="right")) for r in ranks}
+    kept: dict[int, list[np.ndarray]] = {b: [] for b in rank_bin.values()}
+    for c in chunks():
+        if c.size:
+            cb = bin_of(c)
+            for b in kept:
+                kept[b].append(c[cb == b])
+    in_bin = {b: np.sort(np.concatenate(v)) for b, v in kept.items()}
+
+    def at(r: int) -> float:
+        b = rank_bin[r]
+        return float(in_bin[b][r - (int(cum[b - 1]) if b else 0)])
+
+    out = []
+    for pos in positions:
+        f, c = int(np.floor(pos)), int(np.ceil(pos))
+        out.append(at(f) + (at(c) - at(f)) * (pos - f))
+    return out[0], out[1]
+
+
+class DepthNormalizer:
+    """Turns one cropped raw depth at a time into uint8 (bright = near), in clip order.
+
+    One robust per-clip range (depth_range) so the surface doesn't breathe frame-to-frame,
+    background pinned to far (0), and a light temporal EMA carried between frames to damp
+    residual flicker -- so one instance per clip, fed in order. Per frame so the streaming
+    hologram pass never holds every depth map at once (wanly-gpu-docker#228).
+    """
+
+    def __init__(self, lo: float, hi: float, ema: float = 0.85):
+        self.lo = lo
+        self.rng = max(hi - lo, 1e-6)
+        self.ema = ema
+        self._prev: np.ndarray | None = None
+
+    def step(self, depth_crop: np.ndarray, alpha_crop: np.ndarray) -> np.ndarray:
+        n = np.clip((depth_crop - self.lo) / self.rng, 0.0, 1.0)  # larger raw -> brighter -> nearer
+        if self._prev is not None:
             # Light EMA only: a heavier blend makes depth visibly lag the color frames,
             # which reads as waves rippling across the subject during motion.
-            n = ema * n + (1.0 - ema) * prev
-        prev = n
+            n = self.ema * n + (1.0 - self.ema) * self._prev
+        self._prev = n
         # Spatial smoothing kills model speckle + quantization banding that the player's
         # depth-gradient shading would otherwise amplify into contour streaks.
         n = cv2.GaussianBlur(n, (5, 5), 1.2)
         # Pin background AFTER the EMA: pinning first leaks (1-ema) of the previous frame's
         # subject depth into background pixels, displacing a ghost skirt around motion.
-        n = np.where(m > 0.5, n, 0.0)
-        out.append((n * 255.0).astype(np.uint8))
-    return out
+        n = np.where(alpha_crop > 0.5, n, 0.0)
+        return (n * 255.0).astype(np.uint8)

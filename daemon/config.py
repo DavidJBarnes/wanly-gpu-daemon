@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     # in the displaced mesh. Fallback only — the per-request value from the claim
     # (hologram_depth_scale_m, set in the console dialog) wins when present.
     depth_scale_m: float = 0.30
+    # onnxruntime threads for hologram matting and depth (wanly-gpu-docker#228). 0 = its default,
+    # every core. The scene container caps it: there a hologram shares the host's CPUs with the
+    # 3090's render.
+    onnx_threads: int = 0
 
 
 
